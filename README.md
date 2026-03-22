@@ -81,7 +81,7 @@ Never commit `.env` or share your client secret. `.gitignore` excludes `.env`, `
 
 ### Performance (when many streams are open)
 
-- **Tab hidden**: video embeds and chat are unloaded while the tab is in the background; restoring the tab rebuilds the grid.
+- **Background tab**: embeds and chat stay loaded so audio/video can keep playing while you use another tab (the browser may still throttle background tabs).
 - **Scrollable grid**: cells that scroll off-screen unload embeds (iframes blanked; HLS uses `stopLoad` / `startLoad` when visible again).
 - **Lazy loading** for Twitch/YouTube iframes where supported.
 - **CSS** `content-visibility` hints on cells to reduce off-screen work.
@@ -89,6 +89,7 @@ Never commit `.env` or share your client secret. `.gitignore` excludes `.env`, `
 
 ### Notes
 
+- **Twitch embed autoplay**: Browsers only allow **muted** autoplay in third-party frames after **user activation** on your page; Twitch has also said embed **autoplay is not always honored** ([developer forums](https://discuss.dev.twitch.com/t/embed-video-autoplay-is-not-honored/15795)). This app loads the Twitch player **after** a gesture (overlay click, toolbar action, or adding a Twitch channel). If autoplay still fails, use **HLS** (`m3u8` / `transcode:`) for that stream — it uses `<video>` and is usually more reliable than the iframe player.
 - **Channel points**: Twitch does not guarantee that **embedded** players earn channel points the same way as watching on **twitch.tv**. For reliable channel points, watch on Twitch directly.
 - **Same host for OAuth**: use either **`localhost`** or **`127.0.0.1`** consistently; cookies are per-host.
 

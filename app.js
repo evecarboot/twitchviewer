@@ -10,9 +10,30 @@
   }
 
   const STORAGE_KEY = 'twitchviewer:v1';
-  /** sessionStorage: one click per tab session unlocks Twitch embeds after user activation */
+  /**
+   * sessionStorage: after a user gesture we load Twitch iframes (see twitchEmbedsDeferredUntilGesture).
+   * Chromium autoplay policy + Twitch’s embed both expect activation before the player URL loads.
+   */
   const PLAYBACK_OK_KEY = 'twitchviewer-playback-ok';
   const POLL_MS = 45_000;
+
+  function recordPlaybackGesture() {
+    try {
+      sessionStorage.setItem(PLAYBACK_OK_KEY, '1');
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /** When true, Twitch cells use about:blank until recordPlaybackGesture() — do not load player.twitch.tv yet. */
+  function twitchEmbedsDeferredUntilGesture() {
+    if (!state.autoplayStreams) return false;
+    try {
+      return sessionStorage.getItem(PLAYBACK_OK_KEY) !== '1';
+    } catch {
+      return true;
+    }
+  }
   const FETCH_OPTS = { credentials: 'same-origin' };
 
   const defaultState = () => ({
@@ -307,12 +328,18 @@
     iframe.title = `Twitch: ${login}`;
     iframe.setAttribute('width', '400');
     iframe.setAttribute('height', '300');
+    /* `*` delegates autoplay to the embedded player origin (Chromium autoplay policy). */
     iframe.setAttribute(
       'allow',
-      'autoplay; fullscreen; picture-in-picture; encrypted-media; clipboard-write'
+      'autoplay *; fullscreen *; picture-in-picture *; encrypted-media *; clipboard-write *'
     );
     iframe.allowFullscreen = true;
-    iframe.src = playerSrc(login);
+    if (twitchEmbedsDeferredUntilGesture()) {
+      iframe.src = 'about:blank';
+      iframe.dataset.pendingTwitchLogin = login;
+    } else {
+      iframe.src = playerSrc(login);
+    }
     cell.appendChild(iframe);
   }
 
@@ -728,36 +755,6 @@
     });
   }
 
-  function suspendMediaWhenTabHidden() {
-    disconnectCellObservers();
-    destroyGridHls();
-    els.grid.querySelectorAll('iframe').forEach((fr) => {
-      if (fr.src && fr.src !== 'about:blank') {
-        fr.dataset._tabSuspendSrc = fr.src;
-        fr.src = 'about:blank';
-      }
-    });
-    els.grid.querySelectorAll('video.cell-video').forEach((v) => {
-      v.pause();
-      if (v._hls) {
-        v._hls.destroy();
-        v._hls = null;
-      }
-      v.removeAttribute('src');
-      try {
-        v.load();
-      } catch {
-        /* ignore */
-      }
-    });
-    const chatIframe =
-      els.chatIframeWrap && els.chatIframeWrap.querySelector('iframe');
-    if (chatIframe && chatIframe.src && chatIframe.src !== 'about:blank') {
-      chatIframe.dataset._tabSuspendSrc = chatIframe.src;
-      chatIframe.src = 'about:blank';
-    }
-  }
-
   function renderGrid() {
     disconnectCellObservers();
     destroyGridHls();
@@ -1068,6 +1065,9 @@
     els.channelInput.value = '';
     saveState();
     setMeta('', false);
+    if (getChannelType(newCh) === 'twitch') {
+      recordPlaybackGesture();
+    }
     tick().then(() => {
       fullRender();
       schedulePoll();
@@ -1075,6 +1075,7 @@
   });
 
   els.hideOffline.addEventListener('change', () => {
+    recordPlaybackGesture();
     state.hideOffline = els.hideOffline.checked;
     saveState();
     tick().then(() => {
@@ -1085,6 +1086,7 @@
 
   if (els.autoplayStreams) {
     els.autoplayStreams.addEventListener('change', () => {
+      recordPlaybackGesture();
       state.autoplayStreams = els.autoplayStreams.checked;
       saveState();
       fullRender();
@@ -1094,9 +1096,13 @@
   if (els.refreshStreams) {
     els.refreshStreams.addEventListener('click', async () => {
       if (!state.channels.length) return;
+      recordPlaybackGesture();
       els.refreshStreams.disabled = true;
       try {
-        await tick();
+        /* Always rebuild after a manual refresh: tick() skips renderGrid() when the
+           visible channel list is unchanged, which feels like “nothing happened”. */
+        await refreshOnline();
+        fullRender();
       } finally {
         updateRefreshStreamsButton();
       }
@@ -1171,14 +1177,6 @@
       applyChatLayout();
     });
   }
-
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') {
-      suspendMediaWhenTabHidden();
-    } else {
-      fullRender();
-    }
-  });
 
   els.hideOffline.checked = state.hideOffline;
   if (els.autoplayStreams) els.autoplayStreams.checked = state.autoplayStreams;
@@ -1284,7 +1282,7 @@
     if (els.playbackGate) {
       els.playbackGate.addEventListener('click', () => {
         if (sessionStorage.getItem(PLAYBACK_OK_KEY) === '1') return;
-        sessionStorage.setItem(PLAYBACK_OK_KEY, '1');
+        recordPlaybackGesture();
         els.playbackGate.hidden = true;
         fullRender();
       });
