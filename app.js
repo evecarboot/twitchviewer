@@ -326,8 +326,23 @@
   }
 
   /**
-   * Cell is ready for Twitch (size + ancestors). Do not require overlap with #grid’s
-   * bounding rect — that rejected valid cells at scroll edges (false “style visibility”).
+   * Twitch’s embed checks the *browser viewport*, not a scroll container’s box.
+   * Require meaningful overlap with the viewport (not necessarily fully inside — grid can scroll).
+   */
+  function cellIntersectsViewportForTwitchAutoplay(cell) {
+    const r = cell.getBoundingClientRect();
+    if (r.width < 400 || r.height < 300) return false;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const overlapW = Math.min(r.right, vw) - Math.max(r.left, 0);
+    const overlapH = Math.min(r.bottom, vh) - Math.max(r.top, 0);
+    if (overlapW < 200 || overlapH < 150) return false;
+    return overlapW * overlapH > 0;
+  }
+
+  /**
+   * Cell is ready for Twitch (size + ancestors + viewport presence).
+   * Twitch rejects autoplay with “style visibility” if the iframe loads before paint/layout settle.
    */
   function twitchEmbedHostReady(cell) {
     if (document.visibilityState !== 'visible' || document.hidden) return false;
@@ -336,6 +351,7 @@
     if (cw < 400 || ch < 300) return false;
     const r = cell.getBoundingClientRect();
     if (r.width < 400 || r.height < 300) return false;
+    if (!cellIntersectsViewportForTwitchAutoplay(cell)) return false;
     let el = cell;
     while (el && el.nodeType === 1) {
       const cs = window.getComputedStyle(el);
@@ -345,6 +361,22 @@
       el = el.parentElement;
     }
     return true;
+  }
+
+  /** Let the browser paint and settle flex/grid before Twitch measures “style visibility”. */
+  function afterLayoutStableForTwitch(cell, run) {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        window.setTimeout(() => {
+          try {
+            void cell.getBoundingClientRect();
+          } catch {
+            /* ignore */
+          }
+          run();
+        }, 150);
+      });
+    });
   }
 
   /** Twitch.Player expects parent: string[] with real hostnames (not query strings). */
@@ -443,11 +475,7 @@
       if (done) return;
       done = true;
       cleanup();
-      requestAnimationFrame(() => {
-        requestAnimationFrame(() => {
-          onReady();
-        });
-      });
+      onReady();
     };
 
     const tryMount = () => {
@@ -471,12 +499,12 @@
       ro.observe(cell);
     }
 
-    if (els.grid && typeof IntersectionObserver !== 'undefined') {
+    if (typeof IntersectionObserver !== 'undefined') {
       io = new IntersectionObserver(
         () => {
           tryMount();
         },
-        { root: els.grid, rootMargin: '0px', threshold: [0, 0.01, 0.05, 0.1, 0.25] }
+        { root: null, rootMargin: '0px', threshold: [0, 0.1, 0.25] }
       );
       io.observe(cell);
     }
@@ -499,7 +527,9 @@
   }
 
   function waitThenMountTwitchPlayer(cell, iframe, login) {
-    waitForCellMount(cell, () => mountTwitchPlayerSrc(iframe, login));
+    waitForCellMount(cell, () => {
+      afterLayoutStableForTwitch(cell, () => mountTwitchPlayerSrc(iframe, login));
+    });
   }
 
   function iframeFallback(cell, login, wrap) {
@@ -509,8 +539,33 @@
     waitThenMountTwitchPlayer(cell, iframe, login);
   }
 
+  function removeTwitchPlayerFromRegistry(player) {
+    const idx = twitchPlayerInstances.indexOf(player);
+    if (idx >= 0) twitchPlayerInstances.splice(idx, 1);
+  }
+
+  /** Browsers sometimes defer muted autoplay; retry a few times after READY. */
+  function pokeTwitchPlayerPlay(player) {
+    const run = () => {
+      try {
+        if (player && typeof player.play === 'function') player.play();
+      } catch {
+        /* ignore */
+      }
+    };
+    run();
+    window.setTimeout(run, 0);
+    window.setTimeout(run, 250);
+    window.setTimeout(run, 800);
+  }
+
   function initTwitchEmbed(cell, login, wrap, id) {
     if (!cell.isConnected || !wrap.isConnected) return;
+    try {
+      void cell.getBoundingClientRect();
+    } catch {
+      /* ignore */
+    }
     if (!twitchEmbedHostReady(cell)) {
       iframeFallback(cell, login, wrap);
       return;
@@ -529,16 +584,13 @@
           autoplay: true,
         });
         twitchPlayerInstances.push(player);
+        cell._twitchPlayer = player;
         const readyEv =
           window.Twitch.Player && window.Twitch.Player.READY
             ? window.Twitch.Player.READY
             : 'ready';
         player.addEventListener(readyEv, () => {
-          try {
-            if (typeof player.play === 'function') player.play();
-          } catch {
-            /* ignore */
-          }
+          pokeTwitchPlayerPlay(player);
         });
         return;
       } catch {
@@ -556,9 +608,11 @@
     cell.appendChild(wrap);
 
     waitForCellMount(cell, () => {
-      queueTwitchMount(() => {
-        if (!cell.isConnected || !wrap.isConnected) return;
-        initTwitchEmbed(cell, login, wrap, id);
+      afterLayoutStableForTwitch(cell, () => {
+        queueTwitchMount(() => {
+          if (!cell.isConnected || !wrap.isConnected) return;
+          initTwitchEmbed(cell, login, wrap, id);
+        });
       });
     });
   }
@@ -964,21 +1018,26 @@
     els.chatIframeWrap.appendChild(iframe);
   }
 
-  function destroyGridTwitchPlayers() {
-    twitchPlayerInstances.forEach((player) => {
+  function destroyCellMedia(cell) {
+    if (!cell) return;
+    if (cell._twitchPlayer) {
       try {
-        if (player && typeof player.destroy === 'function') player.destroy();
+        if (typeof cell._twitchPlayer.destroy === 'function') {
+          cell._twitchPlayer.destroy();
+        }
       } catch {
         /* ignore */
       }
-    });
-    twitchPlayerInstances = [];
-  }
-
-  function destroyGridHls() {
-    els.grid.querySelectorAll('video.cell-video').forEach((video) => {
+      removeTwitchPlayerFromRegistry(cell._twitchPlayer);
+      cell._twitchPlayer = null;
+    }
+    cell.querySelectorAll('video.cell-video').forEach((video) => {
       if (video._hls) {
-        video._hls.destroy();
+        try {
+          video._hls.destroy();
+        } catch {
+          /* ignore */
+        }
         video._hls = null;
       }
     });
@@ -1056,7 +1115,7 @@
             }
           });
         },
-        { root: els.grid, rootMargin: '120px', threshold: 0.01 }
+        { root: null, rootMargin: '120px', threshold: 0.1 }
       );
       obs.observe(cell);
       cellObservers.push(obs);
@@ -1148,145 +1207,201 @@
     els.grid.addEventListener('pointerdown', onGridPointerDown);
   }
 
+  /**
+   * Build one grid cell. Sets data-channel-key so we can reuse DOM across polls
+   * (avoids tearing down Twitch embeds when hide-offline toggles other channels).
+   */
+  function buildCellForChannel(ch, cellIndex) {
+    const cell = document.createElement('div');
+    cell.className = 'cell';
+    cell.dataset.cellIndex = String(cellIndex);
+    cell.dataset.channelKey = channelKey(ch);
+    const dragHandle = document.createElement('div');
+    dragHandle.className = 'cell-drag-handle';
+    dragHandle.title = 'Drag (hold) along the right edge to reorder';
+    cell.appendChild(dragHandle);
+    const t = getChannelType(ch);
+
+    if (t === 'twitch') {
+      const login = getTwitchLogin(ch);
+      attachTwitchEmbedCell(cell, login);
+      const lab = document.createElement('div');
+      lab.className = 'cell-label';
+      lab.textContent = login;
+      cell.appendChild(lab);
+    } else if (t === 'youtube') {
+      const iframe = document.createElement('iframe');
+      iframe.src = youtubeEmbedSrc(ch.id);
+      iframe.title = `YouTube: ${ch.id}`;
+      iframe.setAttribute('loading', 'lazy');
+      iframe.setAttribute(
+        'allow',
+        'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share'
+      );
+      iframe.setAttribute('referrerpolicy', 'strict-origin-when-cross-origin');
+      iframe.allowFullscreen = true;
+      cell.appendChild(iframe);
+      const lab = document.createElement('div');
+      lab.className = 'cell-label';
+      lab.textContent = `YT: ${ch.id}`;
+      cell.appendChild(lab);
+    } else if (t === 'hls') {
+      const url = ch.url;
+      if (ch.transcode && !ch.transcodeHash) {
+        const err = document.createElement('div');
+        err.className = 'cell-hls-error';
+        err.textContent =
+          'Transcode: missing hash — refresh the page or re-add as transcode:URL';
+        cell.appendChild(err);
+        const labEarly = document.createElement('div');
+        labEarly.className = 'cell-label';
+        labEarly.textContent = formatChannelLabel(ch);
+        cell.appendChild(labEarly);
+        return cell;
+      }
+
+      const playbackUrl = ch.transcode
+        ? `${location.origin}/api/transcode/${ch.transcodeHash}/playlist.m3u8?source=${encodeURIComponent(url)}`
+        : url;
+
+      const video = document.createElement('video');
+      video.className = 'cell-video';
+      video.controls = true;
+      video.muted = true;
+      video.playsInline = true;
+      video.setAttribute('playsinline', '');
+      video.autoplay = true;
+
+      const fail = (msg) => {
+        if (cell.querySelector('.cell-hls-error')) return;
+        const errEl = document.createElement('div');
+        errEl.className = 'cell-hls-error';
+        errEl.textContent = msg;
+        cell.appendChild(errEl);
+      };
+
+      function formatHlsFatalError(data) {
+        const details = data && data.details ? String(data.details) : '';
+        const typ = data && data.type != null ? String(data.type) : '';
+        if (
+          details.includes('bufferAppendError') ||
+          details.includes('fragParsingError') ||
+          details.includes('bufferAddCodecError')
+        ) {
+          if (ch.transcode) {
+            return 'Transcoded stream failed — check the server console for ffmpeg errors.';
+          }
+          return 'Browser cannot decode this stream (often MPEG-2 or AC3 in .ts). Try transcode:URL (needs ffmpeg) or Safari.';
+        }
+        if (
+          details.includes('manifestLoadError') ||
+          details.includes('levelLoadError') ||
+          details.includes('fragLoadError') ||
+          typ === 'networkError'
+        ) {
+          return 'Could not load playlist or segments (network, 403, or CORS). Check the URL.';
+        }
+        return `Playback failed: ${details || typ || 'unknown'}.`;
+      }
+
+      if (typeof Hls !== 'undefined' && Hls.isSupported()) {
+        const hls = new Hls({
+          enableWorker: false,
+        });
+        hls.loadSource(playbackUrl);
+        hls.attachMedia(video);
+        video._hls = hls;
+        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+          video.play().catch(() => {});
+        });
+        hls.on(Hls.Events.ERROR, (_, data) => {
+          if (data.fatal) fail(formatHlsFatalError(data));
+        });
+      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        video.src = playbackUrl;
+        video.play().catch(() => {});
+      } else {
+        fail('HLS not supported in this browser.');
+      }
+
+      cell.appendChild(video);
+      const lab = document.createElement('div');
+      lab.className = 'cell-label';
+      lab.textContent = formatChannelLabel(ch);
+      cell.appendChild(lab);
+    }
+
+    return cell;
+  }
+
   function renderGrid() {
     disconnectCellObservers();
-    destroyGridTwitchPlayers();
-    destroyGridHls();
     const visible = visibleChannels();
+    const desiredKeys = visible.map(channelKey);
     const n = visible.length;
     const { cols, rows } = gridDimensions(n, gridViewportSize());
     els.grid.style.setProperty('--cols', String(Math.max(1, cols)));
     els.grid.style.setProperty('--rows', String(Math.max(1, rows)));
     els.grid.classList.toggle('one-col', n === 1);
 
-    els.grid.innerHTML = '';
-    twitchEmbedQueue = Promise.resolve();
-    twitchEmbedSeq = 0;
-    visible.forEach((ch, cellIndex) => {
-      const cell = document.createElement('div');
-      cell.className = 'cell';
-      cell.dataset.cellIndex = String(cellIndex);
-      const dragHandle = document.createElement('div');
-      dragHandle.className = 'cell-drag-handle';
-      dragHandle.title = 'Drag (hold) along the right edge to reorder';
-      cell.appendChild(dragHandle);
-      const t = getChannelType(ch);
-
-      if (t === 'twitch') {
-        const login = getTwitchLogin(ch);
-        attachTwitchEmbedCell(cell, login);
-        const lab = document.createElement('div');
-        lab.className = 'cell-label';
-        lab.textContent = login;
-        cell.appendChild(lab);
-      } else if (t === 'youtube') {
-        const iframe = document.createElement('iframe');
-        iframe.src = youtubeEmbedSrc(ch.id);
-        iframe.title = `YouTube: ${ch.id}`;
-        iframe.setAttribute('loading', 'lazy');
-        iframe.setAttribute(
-          'allow',
-          'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share'
-        );
-        iframe.setAttribute('referrerpolicy', 'strict-origin-when-cross-origin');
-        iframe.allowFullscreen = true;
-        cell.appendChild(iframe);
-        const lab = document.createElement('div');
-        lab.className = 'cell-label';
-        lab.textContent = `YT: ${ch.id}`;
-        cell.appendChild(lab);
-      } else if (t === 'hls') {
-        const url = ch.url;
-        if (ch.transcode && !ch.transcodeHash) {
-          const err = document.createElement('div');
-          err.className = 'cell-hls-error';
-          err.textContent =
-            'Transcode: missing hash — refresh the page or re-add as transcode:URL';
-          cell.appendChild(err);
-          const labEarly = document.createElement('div');
-          labEarly.className = 'cell-label';
-          labEarly.textContent = formatChannelLabel(ch);
-          cell.appendChild(labEarly);
-          els.grid.appendChild(cell);
-          return;
-        }
-
-        const playbackUrl = ch.transcode
-          ? `${location.origin}/api/transcode/${ch.transcodeHash}/playlist.m3u8?source=${encodeURIComponent(url)}`
-          : url;
-
-        const video = document.createElement('video');
-        video.className = 'cell-video';
-        video.controls = true;
-        video.muted = true;
-        video.playsInline = true;
-        video.setAttribute('playsinline', '');
-        video.autoplay = true;
-
-        const fail = (msg) => {
-          if (cell.querySelector('.cell-hls-error')) return;
-          const err = document.createElement('div');
-          err.className = 'cell-hls-error';
-          err.textContent = msg;
-          cell.appendChild(err);
-        };
-
-        function formatHlsFatalError(data) {
-          const details = data && data.details ? String(data.details) : '';
-          const typ = data && data.type != null ? String(data.type) : '';
-          if (
-            details.includes('bufferAppendError') ||
-            details.includes('fragParsingError') ||
-            details.includes('bufferAddCodecError')
-          ) {
-            if (ch.transcode) {
-              return 'Transcoded stream failed — check the server console for ffmpeg errors.';
-            }
-            return 'Browser cannot decode this stream (often MPEG-2 or AC3 in .ts). Try transcode:URL (needs ffmpeg) or Safari.';
-          }
-          if (
-            details.includes('manifestLoadError') ||
-            details.includes('levelLoadError') ||
-            details.includes('fragLoadError') ||
-            typ === 'networkError'
-          ) {
-            return 'Could not load playlist or segments (network, 403, or CORS). Check the URL.';
-          }
-          return `Playback failed: ${details || typ || 'unknown'}.`;
-        }
-
-        // Prefer MSE + hls.js when available. Some browsers report a truthy
-        // canPlayType for application/vnd.apple.mpegurl but cannot play HLS
-        // via <video src> (e.g. Chromium), which breaks raw m3u8 URLs.
-        if (typeof Hls !== 'undefined' && Hls.isSupported()) {
-          const hls = new Hls({
-            enableWorker: false,
-          });
-          hls.loadSource(playbackUrl);
-          hls.attachMedia(video);
-          video._hls = hls;
-          hls.on(Hls.Events.MANIFEST_PARSED, () => {
-            video.play().catch(() => {});
-          });
-          hls.on(Hls.Events.ERROR, (_, data) => {
-            if (data.fatal) fail(formatHlsFatalError(data));
-          });
-        } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-          video.src = playbackUrl;
-          video.play().catch(() => {});
-        } else {
-          fail('HLS not supported in this browser.');
-        }
-
-        cell.appendChild(video);
-        const lab = document.createElement('div');
-        lab.className = 'cell-label';
-        lab.textContent = formatChannelLabel(ch);
-        cell.appendChild(lab);
+    if (n === 0) {
+      for (const cell of [...els.grid.querySelectorAll('.cell')]) {
+        destroyCellMedia(cell);
       }
+      els.grid.innerHTML = '';
+      twitchPlayerInstances = [];
+      twitchEmbedQueue = Promise.resolve();
+      twitchEmbedSeq = 0;
+      updateOfflineBar();
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => attachCellObserversToGrid());
+      });
+      return;
+    }
 
-      els.grid.appendChild(cell);
-    });
+    const desiredSet = new Set(desiredKeys);
+    for (const cell of [...els.grid.querySelectorAll('.cell')]) {
+      if (!desiredSet.has(cell.dataset.channelKey)) {
+        destroyCellMedia(cell);
+        cell.remove();
+      }
+    }
+
+    let cells = Array.from(els.grid.querySelectorAll('.cell'));
+    const keysMatch =
+      cells.length === desiredKeys.length &&
+      desiredKeys.every((k, i) => cells[i]?.dataset?.channelKey === k);
+
+    if (keysMatch) {
+      cells.forEach((cell, i) => {
+        cell.dataset.cellIndex = String(i);
+      });
+      updateOfflineBar();
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => attachCellObserversToGrid());
+      });
+      return;
+    }
+
+    for (let i = 0; i < desiredKeys.length; i++) {
+      const wantKey = desiredKeys[i];
+      const ch = visible[i];
+      const el = els.grid.children[i];
+      if (el && el.dataset.channelKey === wantKey) {
+        el.dataset.cellIndex = String(i);
+        continue;
+      }
+      const found = Array.from(els.grid.querySelectorAll('.cell')).find(
+        (c) => c.dataset.channelKey === wantKey
+      );
+      if (found) {
+        els.grid.insertBefore(found, el || null);
+        found.dataset.cellIndex = String(i);
+        continue;
+      }
+      const newCell = buildCellForChannel(ch, i);
+      els.grid.insertBefore(newCell, els.grid.children[i] || null);
+    }
 
     updateOfflineBar();
 
