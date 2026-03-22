@@ -360,21 +360,29 @@
   /**
    * Twitch rejects muted autoplay unless the embed meets size + “style visibility” +
    * viewport visibility. Wait until the cell is laid out and on-screen before Player().
+   * TWITCH_VIS_EPS: overlap/size checks use 1px slack for subpixel layout (e.g. 399.7px).
    */
+  const TWITCH_VIS_EPS = 1;
+
   function twitchCellReadyForEmbed(cell) {
     if (!cell || !cell.isConnected) return false;
     if (document.visibilityState !== 'visible' || document.hidden) return false;
     if (cell.clientWidth < GRID_MIN_CELL_W || cell.clientHeight < GRID_MIN_CELL_H)
       return false;
     const r = cell.getBoundingClientRect();
-    if (r.width < GRID_MIN_CELL_W || r.height < GRID_MIN_CELL_H) return false;
+    if (r.width + TWITCH_VIS_EPS < GRID_MIN_CELL_W || r.height + TWITCH_VIS_EPS < GRID_MIN_CELL_H)
+      return false;
     const vw = window.innerWidth;
     const vh = window.innerHeight;
     const overlapW = Math.max(0, Math.min(r.right, vw) - Math.max(r.left, 0));
     const overlapH = Math.max(0, Math.min(r.bottom, vh) - Math.max(r.top, 0));
     const needW = Math.min(GRID_MIN_CELL_W, vw);
     const needH = Math.min(GRID_MIN_CELL_H, vh);
-    if (overlapW < needW || overlapH < needH) return false;
+    if (
+      overlapW + TWITCH_VIS_EPS < needW ||
+      overlapH + TWITCH_VIS_EPS < needH
+    )
+      return false;
     let el = cell;
     while (el && el.nodeType === 1) {
       const cs = window.getComputedStyle(el);
@@ -421,7 +429,7 @@
       cleanup();
       requestAnimationFrame(() => {
         requestAnimationFrame(() => {
-          window.setTimeout(onReady, 140);
+          window.setTimeout(onReady, 280);
         });
       });
     };
@@ -476,6 +484,33 @@
    * iframe element; the JS API’s injected iframe often omits it, so muted autoplay fails.
    * https://dev.twitch.tv/docs/embed/video-and-clips/
    */
+  function applyTwitchIframePixelSize(wrap, iframe) {
+    const r = wrap.getBoundingClientRect();
+    const w = Math.max(GRID_MIN_CELL_W, Math.round(r.width));
+    const h = Math.max(GRID_MIN_CELL_H, Math.round(r.height));
+    iframe.setAttribute('width', String(w));
+    iframe.setAttribute('height', String(h));
+  }
+
+  function wireTwitchIframeResize(wrap, iframe, cell) {
+    if (cell._twitchIframeResizeObserver) {
+      try {
+        cell._twitchIframeResizeObserver.disconnect();
+      } catch {
+        /* ignore */
+      }
+      cell._twitchIframeResizeObserver = null;
+    }
+    applyTwitchIframePixelSize(wrap, iframe);
+    if (typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(() => {
+      if (!wrap.isConnected || !iframe.isConnected) return;
+      applyTwitchIframePixelSize(wrap, iframe);
+    });
+    ro.observe(wrap);
+    cell._twitchIframeResizeObserver = ro;
+  }
+
   function createTwitchIframeEmbed(cell, login, wrap) {
     if (!cell.isConnected || !wrap.isConnected) return;
 
@@ -497,6 +532,7 @@
       iframe.src = `https://player.twitch.tv/?${params.toString()}`;
       iframe.loading = 'eager';
       wrap.appendChild(iframe);
+      wireTwitchIframeResize(wrap, iframe, cell);
       cell._twitchPlayer = iframe;
     } catch {
       showTwitchEmbedError(wrap, login, `Twitch embed error (${login}).`);
@@ -511,7 +547,19 @@
     whenTwitchCellPaintable(cell, () => {
       queueTwitchMount(() => {
         if (!cell.isConnected || !wrap.isConnected) return;
-        createTwitchIframeEmbed(cell, login, wrap);
+        /* Grids can scroll horizontally; a cell may be barely off-screen. Nudge into view
+           before mount so Twitch’s viewport-visibility check sees ≥400×300 (same as public multiviews that keep tiles in view). */
+        if (!twitchCellReadyForEmbed(cell)) {
+          cell.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+        }
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            window.setTimeout(() => {
+              if (!cell.isConnected || !wrap.isConnected) return;
+              createTwitchIframeEmbed(cell, login, wrap);
+            }, 60);
+          });
+        });
       });
     });
   }
@@ -919,6 +967,14 @@
 
   function destroyCellMedia(cell) {
     if (!cell) return;
+    if (cell._twitchIframeResizeObserver) {
+      try {
+        cell._twitchIframeResizeObserver.disconnect();
+      } catch {
+        /* ignore */
+      }
+      cell._twitchIframeResizeObserver = null;
+    }
     if (cell._twitchPlayer) {
       try {
         const t = cell._twitchPlayer;
@@ -1721,7 +1777,7 @@
     fullRender();
     schedulePoll();
     console.info(
-      '[twitchviewer] Reading the console: (1) "runtime.lastError", "background.js", "disconnected port" = a Chrome extension, not this app — disable extensions on 127.0.0.1 or use a clean profile. (2) "hookWorkerFetch", "Replaced player type with popout" = an extension rewriting Twitch’s player and can cause "style visibility" autoplay errors — disable it. (3) 429 on gql/passport.twitch.tv = too many embeds; we stagger loads (~900ms); try fewer streams. (4) ERR_BLOCKED_BY_CLIENT = ad blocker. (5) Twitch "style visibility" = Twitch embed rules: https://dev.twitch.tv/docs/embed/ — Run twitchviewerAutoplayDiagnostics() for cell sizes.'
+      '[twitchviewer] Twitch "style visibility" / "viewport visibility" come from player.twitch.tv (see https://dev.twitch.tv/docs/embed/). This app matches parent= to your URL, pixel-sized iframes, and nudges cells into view when the grid scrolls. Run twitchviewerAutoplayDiagnostics() for per-cell sizes.'
     );
     window.addEventListener('resize', scheduleLayoutGridToViewport);
     if (window.visualViewport) {
