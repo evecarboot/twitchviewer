@@ -332,6 +332,99 @@
     );
   }
 
+  /**
+   * Twitch’s embed refuses muted autoplay if the host isn’t “visible enough”:
+   * tab visible, ≥400×300, no display:none / visibility:hidden / opacity≈0 on ancestors,
+   * and overlap with the grid viewport (scroll container).
+   */
+  function twitchCellMeetsEmbedVisibility(cell) {
+    if (!cell) return false;
+    if (document.visibilityState !== 'visible' || document.hidden) return false;
+    const cw = cell.clientWidth;
+    const ch = cell.clientHeight;
+    if (cw < 400 || ch < 300) return false;
+    const rect = cell.getBoundingClientRect();
+    if (rect.width < 400 || rect.height < 300) return false;
+    let el = cell;
+    while (el && el.nodeType === 1) {
+      const cs = window.getComputedStyle(el);
+      if (cs.display === 'none') return false;
+      if (cs.visibility === 'hidden') return false;
+      if (parseFloat(cs.opacity) < 0.01) return false;
+      el = el.parentElement;
+    }
+    if (els.grid) {
+      const gr = els.grid.getBoundingClientRect();
+      const overlaps =
+        rect.bottom > gr.top &&
+        rect.top < gr.bottom &&
+        rect.right > gr.left &&
+        rect.left < gr.right;
+      if (!overlaps) return false;
+    }
+    return true;
+  }
+
+  /**
+   * Wait until the tab is visible and the cell passes twitchCellMeetsEmbedVisibility,
+   * then double-rAF so layout has settled. If it never becomes ready, call onGiveUp().
+   */
+  function whenTwitchEmbedHostReady(cell, onReady, onGiveUp) {
+    let frames = 0;
+    const maxFrames = 360;
+    let visBound = false;
+
+    const finishOk = () => {
+      if (visBound) {
+        document.removeEventListener('visibilitychange', onVis);
+        visBound = false;
+      }
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          if (twitchCellMeetsEmbedVisibility(cell)) onReady();
+          else onGiveUp();
+        });
+      });
+    };
+
+    const tick = () => {
+      if (document.hidden) {
+        if (!visBound) {
+          visBound = true;
+          document.addEventListener('visibilitychange', onVis);
+        }
+        return;
+      }
+      if (twitchCellMeetsEmbedVisibility(cell)) {
+        finishOk();
+        return;
+      }
+      frames++;
+      if (frames >= maxFrames) {
+        if (visBound) {
+          document.removeEventListener('visibilitychange', onVis);
+          visBound = false;
+        }
+        onGiveUp();
+        return;
+      }
+      requestAnimationFrame(tick);
+    };
+
+    function onVis() {
+      if (!document.hidden) {
+        if (visBound) {
+          document.removeEventListener('visibilitychange', onVis);
+          visBound = false;
+        }
+        frames = 0;
+        requestAnimationFrame(tick);
+      }
+    }
+
+    requestAnimationFrame(tick);
+  }
+
   function attachTwitchIframeOnly(cell, login) {
     const iframe = document.createElement('iframe');
     iframe.dataset.twitchEmbed = '1';
@@ -359,13 +452,17 @@
     wrap.id = id;
     cell.appendChild(wrap);
 
-    const runInit = () => {
+    const fallbackIframe = () => {
+      wrap.remove();
+      attachTwitchIframeOnly(cell, login);
+    };
+
+    const runPlayerCore = () => {
       if (
         typeof window.Twitch === 'undefined' ||
         typeof window.Twitch.Player !== 'function'
       ) {
-        wrap.remove();
-        attachTwitchIframeOnly(cell, login);
+        fallbackIframe();
         return;
       }
       try {
@@ -390,9 +487,16 @@
           }
         });
       } catch {
-        wrap.remove();
-        attachTwitchIframeOnly(cell, login);
+        fallbackIframe();
       }
+    };
+
+    const queuePlayerAfterVisibilityGate = () => {
+      whenTwitchEmbedHostReady(
+        cell,
+        () => queueTwitchPlayerInit(runPlayerCore),
+        fallbackIframe
+      );
     };
 
     let loadScheduled = false;
@@ -407,19 +511,23 @@
         sizeObs.disconnect();
         sizeObs = null;
       }
-      queueTwitchPlayerInit(runInit);
+      queuePlayerAfterVisibilityGate();
     };
 
     if (!els.grid || typeof IntersectionObserver === 'undefined') {
+      const ro = new ResizeObserver(() => {
+        scheduleWhenSized();
+        if (loadScheduled) ro.disconnect();
+      });
+      ro.observe(cell);
       scheduleWhenSized();
-      if (!loadScheduled) queueTwitchPlayerInit(runInit);
       return;
     }
 
     const io = new IntersectionObserver(
       (entries) => {
         entries.forEach((entry) => {
-          if (!entry.isIntersecting) return;
+          if (!entry.isIntersecting || entry.intersectionRatio < 0.25) return;
           io.disconnect();
           scheduleWhenSized();
           if (!loadScheduled) {
@@ -434,13 +542,18 @@
               sizeObs = null;
             }
             if (!loadScheduled) {
-              loadScheduled = true;
-              queueTwitchPlayerInit(runInit);
+              if (cell.clientWidth >= 400 && cell.clientHeight >= 300) {
+                loadScheduled = true;
+                queuePlayerAfterVisibilityGate();
+              } else {
+                loadScheduled = true;
+                fallbackIframe();
+              }
             }
-          }, 5000);
+          }, 8000);
         });
       },
-      { root: els.grid, rootMargin: '240px', threshold: 0.15 }
+      { root: els.grid, rootMargin: '120px', threshold: [0, 0.1, 0.25, 0.5, 1] }
     );
     io.observe(cell);
   }
