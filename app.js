@@ -611,6 +611,11 @@
     cellObservers = [];
   }
 
+  function isTwitchPlayerIframe(iframe) {
+    const s = iframe && iframe.src ? iframe.src : '';
+    return s.includes('player.twitch.tv');
+  }
+
   function attachCellObserversToGrid() {
     if (!els.grid || typeof IntersectionObserver === 'undefined') return;
 
@@ -624,18 +629,22 @@
           entries.forEach((entry) => {
             const visible = entry.isIntersecting;
             if (iframe) {
-              if (!visible) {
-                if (
-                  iframe.src &&
-                  iframe.src !== 'about:blank' &&
-                  !iframe.dataset._offscreenSrc
-                ) {
-                  iframe.dataset._offscreenSrc = iframe.src;
-                  iframe.src = 'about:blank';
+              /* Never unload Twitch’s player by swapping src — reload breaks autoplay
+                 and Twitch re-checks minimum size/visibility on load. YouTube-only. */
+              if (!isTwitchPlayerIframe(iframe)) {
+                if (!visible) {
+                  if (
+                    iframe.src &&
+                    iframe.src !== 'about:blank' &&
+                    !iframe.dataset._offscreenSrc
+                  ) {
+                    iframe.dataset._offscreenSrc = iframe.src;
+                    iframe.src = 'about:blank';
+                  }
+                } else if (iframe.dataset._offscreenSrc) {
+                  iframe.src = iframe.dataset._offscreenSrc;
+                  delete iframe.dataset._offscreenSrc;
                 }
-              } else if (iframe.dataset._offscreenSrc) {
-                iframe.src = iframe.dataset._offscreenSrc;
-                delete iframe.dataset._offscreenSrc;
               }
             }
             if (video) {
@@ -855,7 +864,9 @@
       els.offlineBar.hidden = true;
     }
 
-    attachCellObserversToGrid();
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => attachCellObserversToGrid());
+    });
   }
 
   function applyToolbarLayout() {
