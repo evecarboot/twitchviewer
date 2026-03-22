@@ -319,12 +319,29 @@ body {
   background: #000;
 }
 
-.cell iframe {
+.cell iframe,
+.cell video.cell-video {
   position: absolute;
   inset: 0;
   width: 100%;
   height: 100%;
   border: 0;
+  background: #000;
+}
+
+.cell-hls-error {
+  position: absolute;
+  bottom: 8px;
+  left: 8px;
+  right: 8px;
+  z-index: 3;
+  padding: 0.35rem 0.5rem;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.85);
+  color: #f88;
+  font-size: 0.75rem;
+  line-height: 1.3;
+  pointer-events: none;
 }
 
 .cell-label {

@@ -84,7 +84,7 @@
       return {
         ...defaultState(),
         ...parsed,
-        channels: Array.isArray(parsed.channels) ? parsed.channels : [],
+        channels: migrateChannels(parsed.channels),
         importedFollows: Array.isArray(parsed.importedFollows)
           ? parsed.importedFollows
           : [],
@@ -96,6 +96,161 @@
 
   function saveState() {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  }
+
+  function migrateChannels(arr) {
+    if (!Array.isArray(arr)) return [];
+    const out = [];
+    for (const c of arr) {
+      const n = normalizeChannelEntry(c);
+      if (n) out.push(n);
+    }
+    return out;
+  }
+
+  function normalizeChannelEntry(c) {
+    if (typeof c === 'string') {
+      const login = normalizeLogin(c);
+      return login ? { type: 'twitch', login } : null;
+    }
+    if (!c || typeof c !== 'object') return null;
+    if (c.type === 'twitch' && c.login) {
+      const login = normalizeLogin(c.login);
+      return login ? { type: 'twitch', login } : null;
+    }
+    if (c.type === 'youtube' && c.id && typeof c.id === 'string') {
+      const id = String(c.id);
+      if (/^[a-zA-Z0-9_-]{11}$/.test(id)) return { type: 'youtube', id };
+      return null;
+    }
+    if (c.type === 'hls' && c.url && typeof c.url === 'string') {
+      const url = String(c.url).trim();
+      if (/^https?:\/\//i.test(url)) return { type: 'hls', url };
+      return null;
+    }
+    return null;
+  }
+
+  function getChannelType(ch) {
+    if (typeof ch === 'string') return 'twitch';
+    return ch && ch.type ? ch.type : 'twitch';
+  }
+
+  function getTwitchLogin(ch) {
+    if (typeof ch === 'string') return normalizeLogin(ch);
+    if (ch && ch.type === 'twitch' && ch.login) return normalizeLogin(ch.login);
+    return '';
+  }
+
+  function channelKey(ch) {
+    const t = getChannelType(ch);
+    if (t === 'twitch') return `t:${getTwitchLogin(ch)}`;
+    if (t === 'youtube') return `y:${ch.id}`;
+    if (t === 'hls') return `h:${ch.url}`;
+    return '';
+  }
+
+  function formatChannelLabel(ch) {
+    const t = getChannelType(ch);
+    if (t === 'twitch') return getTwitchLogin(ch);
+    if (t === 'youtube') return `YT: ${ch.id}`;
+    if (t === 'hls') return `HLS: ${hlsShortLabel(ch.url)}`;
+    return '?';
+  }
+
+  function hlsShortLabel(url) {
+    try {
+      const u = new URL(url);
+      const tail = u.pathname.split('/').filter(Boolean).pop() || u.hostname;
+      return tail.length > 24 ? `${tail.slice(0, 22)}…` : tail;
+    } catch {
+      return url.length > 28 ? `${url.slice(0, 26)}…` : url;
+    }
+  }
+
+  function isLikelyHlsUrl(s) {
+    return /\.m3u8(\?|$)/i.test(s) || /\/hls\//i.test(s) || /\/manifest\//i.test(s);
+  }
+
+  function extractYoutubeId(input) {
+    const s = String(input).trim();
+    if (/^[a-zA-Z0-9_-]{11}$/.test(s)) return s;
+    try {
+      const u = new URL(s);
+      const host = u.hostname.replace(/^www\./, '');
+      if (host === 'youtu.be') {
+        const id = u.pathname.slice(1).split('/')[0];
+        if (/^[a-zA-Z0-9_-]{11}$/.test(id)) return id;
+      }
+      if (
+        host === 'youtube.com' ||
+        host === 'youtube-nocookie.com' ||
+        host === 'm.youtube.com' ||
+        host === 'music.youtube.com'
+      ) {
+        const v = u.searchParams.get('v');
+        if (v && /^[a-zA-Z0-9_-]{11}$/.test(v)) return v;
+        const embed = u.pathname.match(/\/embed\/([a-zA-Z0-9_-]{11})/);
+        if (embed) return embed[1];
+        const live = u.pathname.match(/\/live\/([a-zA-Z0-9_-]{11})/);
+        if (live) return live[1];
+        const sh = u.pathname.match(/\/shorts\/([a-zA-Z0-9_-]{11})/);
+        if (sh) return sh[1];
+      }
+    } catch {
+      /* ignore */
+    }
+    return null;
+  }
+
+  function parseAddInput(raw) {
+    const s = String(raw).trim();
+    if (!s) return null;
+
+    if (/^twitch:/i.test(s)) {
+      const login = normalizeLogin(s.replace(/^twitch:/i, ''));
+      return login ? { type: 'twitch', login } : null;
+    }
+    if (/^(?:yt|youtube):/i.test(s)) {
+      const rest = s.replace(/^(?:yt|youtube):/i, '').trim();
+      const url = /^https?:\/\//i.test(rest)
+        ? rest
+        : `https://youtu.be/${rest}`;
+      const yt = extractYoutubeId(url);
+      return yt ? { type: 'youtube', id: yt } : null;
+    }
+    if (/^hls:/i.test(s)) {
+      const rest = s.replace(/^hls:/i, '').trim();
+      if (/^https?:\/\//i.test(rest)) return { type: 'hls', url: rest };
+      return null;
+    }
+
+    if (/^https?:\/\//i.test(s)) {
+      const yt = extractYoutubeId(s);
+      if (yt) return { type: 'youtube', id: yt };
+      if (isLikelyHlsUrl(s)) return { type: 'hls', url: s };
+      return null;
+    }
+
+    const login = normalizeLogin(s);
+    return login ? { type: 'twitch', login } : null;
+  }
+
+  function twitchChannelsForChat() {
+    return state.channels
+      .filter((c) => getChannelType(c) === 'twitch')
+      .map((c) => getTwitchLogin(c));
+  }
+
+  function youtubeEmbedSrc(id) {
+    const params = new URLSearchParams({
+      autoplay: '1',
+      mute: '1',
+      playsinline: '1',
+    });
+    return `https://www.youtube.com/embed/${encodeURIComponent(
+      id
+    )}?${params.toString()}`;
   }
 
   function normalizeLogin(s) {
@@ -138,19 +293,29 @@
     return { cols, rows };
   }
 
-  function visibleLogins() {
-    if (!state.hideOffline || !apiConfigured || pollFailed) return [...state.channels];
-    return state.channels.filter((c) => onlineSet.has(c));
+  function visibleChannels() {
+    return state.channels.filter((ch) => {
+      if (getChannelType(ch) !== 'twitch') return true;
+      if (!state.hideOffline || !apiConfigured || pollFailed) return true;
+      return onlineSet.has(getTwitchLogin(ch));
+    });
+  }
+
+  function twitchLoginsForPoll() {
+    return state.channels
+      .filter((c) => getChannelType(c) === 'twitch')
+      .map((c) => getTwitchLogin(c));
   }
 
   async function refreshOnline() {
-    if (!state.channels.length) {
+    const twitchList = twitchLoginsForPoll();
+    if (!twitchList.length) {
       onlineSet = new Set();
       pollFailed = false;
       return;
     }
     try {
-      const q = state.channels.join(',');
+      const q = twitchList.join(',');
       const res = await fetch(
         `/api/streams?login=${encodeURIComponent(q)}`,
         FETCH_OPTS
@@ -214,7 +379,13 @@
 
   function syncFollowModalFromState() {
     followModalSelection = new Set(
-      state.channels.filter((c) => state.importedFollows.includes(c))
+      state.channels
+        .filter(
+          (c) =>
+            getChannelType(c) === 'twitch' &&
+            state.importedFollows.includes(getTwitchLogin(c))
+        )
+        .map((c) => getTwitchLogin(c))
     );
   }
 
@@ -268,15 +439,28 @@
   }
 
   function applyFollowModalSave() {
-    const manual = state.channels.filter((c) => !state.importedFollows.includes(c));
-    const importing = state.importedFollows.filter((c) => followModalSelection.has(c));
-    const kept = state.channels.filter(
-      (c) => manual.includes(c) || importing.includes(c)
+    const importing = state.importedFollows.filter((c) =>
+      followModalSelection.has(c)
     );
-    const added = importing.filter((c) => !kept.includes(c));
+    const kept = state.channels.filter((c) => {
+      if (getChannelType(c) !== 'twitch') return true;
+      const login = getTwitchLogin(c);
+      if (!state.importedFollows.includes(login)) return true;
+      return importing.includes(login);
+    });
+    const added = importing
+      .filter(
+        (login) =>
+          !state.channels.some(
+            (c) =>
+              getChannelType(c) === 'twitch' && getTwitchLogin(c) === login
+          )
+      )
+      .map((login) => ({ type: 'twitch', login }));
     state.channels = [...kept, ...added];
-    if (state.chatForLogin && !state.channels.includes(state.chatForLogin)) {
-      state.chatForLogin = state.channels[0] || null;
+    const twitchChat = twitchChannelsForChat();
+    if (state.chatForLogin && !twitchChat.includes(state.chatForLogin)) {
+      state.chatForLogin = twitchChat[0] || null;
     }
     saveState();
     closeFollowModal();
@@ -298,32 +482,36 @@
 
   function renderChannelChips() {
     els.channelList.innerHTML = '';
-    state.channels.forEach((login, index) => {
+    state.channels.forEach((ch, index) => {
+      const key = channelKey(ch);
+      const lbl = formatChannelLabel(ch);
       const chip = document.createElement('span');
       chip.className = 'chip';
       chip.draggable = true;
       chip.dataset.index = String(index);
-      chip.dataset.login = login;
+      chip.dataset.key = key;
       if (
+        getChannelType(ch) === 'twitch' &&
         state.hideOffline &&
         apiConfigured &&
         !pollFailed &&
-        !onlineSet.has(login)
+        !onlineSet.has(getTwitchLogin(ch))
       ) {
         chip.classList.add('offline-badge');
       }
       const label = document.createElement('span');
-      label.textContent = login;
+      label.textContent = lbl;
       chip.appendChild(label);
       const rm = document.createElement('button');
       rm.type = 'button';
       rm.className = 'remove';
-      rm.setAttribute('aria-label', `Remove ${login}`);
+      rm.setAttribute('aria-label', `Remove ${lbl}`);
       rm.textContent = '×';
       rm.addEventListener('click', () => {
-        state.channels = state.channels.filter((c) => c !== login);
-        if (state.chatForLogin === login) {
-          state.chatForLogin = state.channels[0] || null;
+        state.channels = state.channels.filter((c) => channelKey(c) !== key);
+        const twitchChat = twitchChannelsForChat();
+        if (state.chatForLogin && !twitchChat.includes(state.chatForLogin)) {
+          state.chatForLogin = twitchChat[0] || null;
         }
         saveState();
         fullRender();
@@ -359,19 +547,20 @@
 
   function renderChatSelect() {
     const prev = state.chatForLogin;
+    const twitchList = twitchChannelsForChat();
     const selects = [els.chatChannel, els.chatChannelPanel].filter(Boolean);
     for (const sel of selects) {
       sel.innerHTML = '';
-      state.channels.forEach((login) => {
+      twitchList.forEach((login) => {
         const opt = document.createElement('option');
         opt.value = login;
         opt.textContent = login;
         sel.appendChild(opt);
       });
     }
-    if (state.channels.length) {
-      if (!state.channels.includes(prev)) state.chatForLogin = state.channels[0];
-      const v = state.chatForLogin || state.channels[0];
+    if (twitchList.length) {
+      if (!twitchList.includes(prev)) state.chatForLogin = twitchList[0];
+      const v = state.chatForLogin || twitchList[0];
       state.chatForLogin = v;
       for (const sel of selects) {
         sel.value = v;
@@ -391,8 +580,18 @@
     els.chatIframeWrap.appendChild(iframe);
   }
 
+  function destroyGridHls() {
+    els.grid.querySelectorAll('video.cell-video').forEach((video) => {
+      if (video._hls) {
+        video._hls.destroy();
+        video._hls = null;
+      }
+    });
+  }
+
   function renderGrid() {
-    const visible = visibleLogins();
+    destroyGridHls();
+    const visible = visibleChannels();
     const n = visible.length;
     const { cols, rows } = gridDimensions(n);
     els.grid.style.setProperty('--cols', String(Math.max(1, cols)));
@@ -400,28 +599,100 @@
     els.grid.classList.toggle('one-col', n === 1);
 
     els.grid.innerHTML = '';
-    visible.forEach((login) => {
+    visible.forEach((ch) => {
       const cell = document.createElement('div');
       cell.className = 'cell';
-      const iframe = document.createElement('iframe');
-      iframe.src = playerSrc(login);
-      iframe.title = `Twitch: ${login}`;
-      iframe.setAttribute('loading', 'eager');
-      iframe.setAttribute(
-        'allow',
-        'autoplay; fullscreen; picture-in-picture; encrypted-media; clipboard-write'
-      );
-      iframe.setAttribute('referrerpolicy', 'strict-origin-when-cross-origin');
-      iframe.allowFullscreen = true;
-      cell.appendChild(iframe);
-      const lab = document.createElement('div');
-      lab.className = 'cell-label';
-      lab.textContent = login;
-      cell.appendChild(lab);
+      const t = getChannelType(ch);
+
+      if (t === 'twitch') {
+        const login = getTwitchLogin(ch);
+        const iframe = document.createElement('iframe');
+        iframe.src = playerSrc(login);
+        iframe.title = `Twitch: ${login}`;
+        iframe.setAttribute('loading', 'eager');
+        iframe.setAttribute(
+          'allow',
+          'autoplay; fullscreen; picture-in-picture; encrypted-media; clipboard-write'
+        );
+        iframe.setAttribute('referrerpolicy', 'strict-origin-when-cross-origin');
+        iframe.allowFullscreen = true;
+        cell.appendChild(iframe);
+        const lab = document.createElement('div');
+        lab.className = 'cell-label';
+        lab.textContent = login;
+        cell.appendChild(lab);
+      } else if (t === 'youtube') {
+        const iframe = document.createElement('iframe');
+        iframe.src = youtubeEmbedSrc(ch.id);
+        iframe.title = `YouTube: ${ch.id}`;
+        iframe.setAttribute('loading', 'eager');
+        iframe.setAttribute(
+          'allow',
+          'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share'
+        );
+        iframe.setAttribute('referrerpolicy', 'strict-origin-when-cross-origin');
+        iframe.allowFullscreen = true;
+        cell.appendChild(iframe);
+        const lab = document.createElement('div');
+        lab.className = 'cell-label';
+        lab.textContent = `YT: ${ch.id}`;
+        cell.appendChild(lab);
+      } else if (t === 'hls') {
+        const video = document.createElement('video');
+        video.className = 'cell-video';
+        video.controls = true;
+        video.muted = true;
+        video.playsInline = true;
+        video.setAttribute('playsinline', '');
+        video.autoplay = true;
+        const url = ch.url;
+
+        const fail = (msg) => {
+          if (cell.querySelector('.cell-hls-error')) return;
+          const err = document.createElement('div');
+          err.className = 'cell-hls-error';
+          err.textContent = msg;
+          cell.appendChild(err);
+        };
+
+        if (video.canPlayType('application/vnd.apple.mpegurl')) {
+          video.src = url;
+          video.play().catch(() => {});
+        } else if (typeof Hls !== 'undefined' && Hls.isSupported()) {
+          const hls = new Hls({ enableWorker: true });
+          hls.loadSource(url);
+          hls.attachMedia(video);
+          video._hls = hls;
+          hls.on(Hls.Events.MANIFEST_PARSED, () => {
+            video.play().catch(() => {});
+          });
+          hls.on(Hls.Events.ERROR, (_, data) => {
+            if (data.fatal) {
+              fail(
+                'Stream failed (often CORS or dead URL). Try another source.'
+              );
+            }
+          });
+        } else {
+          fail('HLS not supported in this browser.');
+        }
+
+        cell.appendChild(video);
+        const lab = document.createElement('div');
+        lab.className = 'cell-label';
+        lab.textContent = formatChannelLabel(ch);
+        cell.appendChild(lab);
+      }
+
       els.grid.appendChild(cell);
     });
 
-    const offline = state.channels.filter((c) => !onlineSet.has(c));
+    const offline = state.channels
+      .filter(
+        (c) =>
+          getChannelType(c) === 'twitch' && !onlineSet.has(getTwitchLogin(c))
+      )
+      .map((c) => getTwitchLogin(c));
     if (state.hideOffline && apiConfigured && !pollFailed && offline.length) {
       els.offlineBar.hidden = false;
       els.offlineBar.textContent = `Offline (hidden): ${offline.join(', ')}`;
@@ -436,9 +707,10 @@
   }
 
   function applyChatLayout() {
+    const hasTwitchChat = twitchChannelsForChat().length > 0;
     els.showChat.checked = state.showChat;
     els.hideOffline.checked = state.hideOffline;
-    els.chatChannelWrap.hidden = !state.showChat || !state.channels.length;
+    els.chatChannelWrap.hidden = !state.showChat || !hasTwitchChat;
     if (els.hideChatPanelWrap) {
       els.hideChatPanelWrap.hidden = !state.showChat;
     }
@@ -452,9 +724,7 @@
       els.chatOnLeft.checked = state.chatOnLeft;
     }
     const panelVisible =
-      state.showChat &&
-      state.channels.length > 0 &&
-      !state.hideChatPanel;
+      state.showChat && hasTwitchChat && !state.hideChatPanel;
     els.chatPanel.hidden = !panelVisible;
     if (els.main) {
       els.main.classList.toggle(
@@ -472,10 +742,17 @@
       els.peekChat.hidden = !(
         state.showChat &&
         state.hideChatPanel &&
-        state.channels.length
+        hasTwitchChat
       );
     }
     renderChatIframe();
+  }
+
+  function updateRefreshStreamsButton() {
+    if (!els.refreshStreams) return;
+    const hasAny = state.channels.length > 0;
+    els.refreshStreams.hidden = !hasAny;
+    els.refreshStreams.disabled = !hasAny;
   }
 
   function fullRender() {
@@ -485,6 +762,7 @@
     applyChatLayout();
     applyToolbarLayout();
     updateFollowImportButtonsVisibility();
+    updateRefreshStreamsButton();
   }
 
   async function tick() {
@@ -500,19 +778,30 @@
   function schedulePoll() {
     if (pollTimer) clearInterval(pollTimer);
     pollTimer = null;
-    if (state.hideOffline && state.channels.length) {
+    if (state.hideOffline && twitchLoginsForPoll().length) {
       pollTimer = setInterval(tick, POLL_MS);
     }
   }
 
   els.addForm.addEventListener('submit', (e) => {
     e.preventDefault();
-    const login = normalizeLogin(els.channelInput.value);
-    if (!login) return;
-    if (!state.channels.includes(login)) state.channels.push(login);
-    if (!state.chatForLogin) state.chatForLogin = login;
+    const newCh = parseAddInput(els.channelInput.value);
+    if (!newCh) {
+      setMeta(
+        'Use a Twitch name, YouTube watch/live URL, or m3u8 URL (prefix yt: or hls: optional).',
+        true
+      );
+      return;
+    }
+    if (!state.channels.some((c) => channelKey(c) === channelKey(newCh))) {
+      state.channels.push(newCh);
+    }
+    if (!state.chatForLogin && getChannelType(newCh) === 'twitch') {
+      state.chatForLogin = getTwitchLogin(newCh);
+    }
     els.channelInput.value = '';
     saveState();
+    setMeta('', false);
     tick().then(() => {
       fullRender();
       schedulePoll();
@@ -629,7 +918,13 @@
         if (!newList) return;
         state.importedFollows = newList;
         followModalSelection = new Set(
-          state.channels.filter((c) => newList.includes(c))
+          state.channels
+            .filter(
+              (c) =>
+                getChannelType(c) === 'twitch' &&
+                newList.includes(getTwitchLogin(c))
+            )
+            .map((c) => getTwitchLogin(c))
         );
         saveState();
         openFollowModal();
