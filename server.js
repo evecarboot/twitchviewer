@@ -612,6 +612,10 @@ app.get('/styles.css', (_req, res) => {
 app.get('/app.js', (_req, res) => {
   res.sendFile(path.join(root, 'app.js'));
 });
+app.get('/hls.min.js', (_req, res) => {
+  res.type('application/javascript');
+  res.sendFile(path.join(root, 'node_modules', 'hls.js', 'dist', 'hls.min.js'));
+});
 
 const port = getPort();
 

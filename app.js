@@ -31,6 +31,11 @@
   let pollTimer = null;
   /** @type {IntersectionObserver[]} */
   let cellObservers = [];
+  /** Serial gap between Twitch player inits (reduces 429 + visibility races). */
+  let twitchEmbedQueue = Promise.resolve();
+  /** @type {any[]} */
+  let twitchPlayerInstances = [];
+  let twitchEmbedSeq = 0;
   /** @type {Set<string>} */
   let followModalSelection = new Set();
 
@@ -290,8 +295,8 @@
   }
 
   /**
-   * Non-interactive iframe embed per https://dev.twitch.tv/docs/embed/video-and-clips/
-   * (channel + parent + muted=true + autoplay=true; cells are ≥400×300 in CSS).
+   * Plain iframe fallback (same URL params as non-interactive embed docs).
+   * https://dev.twitch.tv/docs/embed/video-and-clips/
    */
   function playerSrc(login) {
     const params = embedParents();
@@ -301,13 +306,33 @@
     return `https://player.twitch.tv/?${params.toString()}`;
   }
 
-  /**
-   * Twitch’s player refuses autoplay unless “Embedded Experiences” visibility checks pass
-   * (see console: style visibility / viewport visibility). Loading every embed at once also
-   * hits passport/gql with 429. We assign player.twitch.tv only when the cell is in (or near)
-   * the scrollable grid, after layout, with a small stagger between embeds.
-   */
-  function attachTwitchIframe(cell, login, loadIndex) {
+  function parentDomainsForTwitch() {
+    const h = window.location.hostname;
+    const parent = [h];
+    if (h === '127.0.0.1') parent.push('localhost');
+    if (h === 'localhost') parent.push('127.0.0.1');
+    return parent;
+  }
+
+  function queueTwitchPlayerInit(run) {
+    twitchEmbedQueue = twitchEmbedQueue.then(
+      () =>
+        new Promise((resolve) => {
+          requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+              try {
+                run();
+              } catch {
+                /* ignore */
+              }
+              window.setTimeout(resolve, 600);
+            });
+          });
+        })
+    );
+  }
+
+  function attachTwitchIframeOnly(cell, login) {
     const iframe = document.createElement('iframe');
     iframe.dataset.twitchEmbed = '1';
     iframe.title = `Twitch: ${login}`;
@@ -317,40 +342,107 @@
       'allow',
       'autoplay; fullscreen; picture-in-picture; encrypted-media; clipboard-write'
     );
-    iframe.src = 'about:blank';
+    iframe.style.cssText =
+      'position:absolute;inset:0;width:100%;height:100%;min-width:400px;min-height:300px;border:0;visibility:visible;opacity:1;display:block;background:#000';
+    iframe.src = playerSrc(login);
     cell.appendChild(iframe);
+  }
 
-    const url = playerSrc(login);
-    const idx = loadIndex || 0;
-    const startLoad = () => {
-      if (iframe.dataset.twitchLoadStarted === '1') return;
-      iframe.dataset.twitchLoadStarted = '1';
-      const staggerMs = Math.min(idx * 120, 4000);
-      window.setTimeout(() => {
-        requestAnimationFrame(() => {
-          requestAnimationFrame(() => {
-            iframe.src = url;
-          });
+  /**
+   * Interactive embed via Twitch.Player (embed v1.js): explicit autoplay + muted in options.
+   * https://dev.twitch.tv/docs/embed/video-and-clips/ — Interactive Frames
+   */
+  function attachTwitchEmbedCell(cell, login) {
+    const wrap = document.createElement('div');
+    wrap.className = 'twitch-embed-host';
+    const id = `twitch-embed-${++twitchEmbedSeq}`;
+    wrap.id = id;
+    cell.appendChild(wrap);
+
+    const runInit = () => {
+      if (
+        typeof window.Twitch === 'undefined' ||
+        typeof window.Twitch.Player !== 'function'
+      ) {
+        wrap.remove();
+        attachTwitchIframeOnly(cell, login);
+        return;
+      }
+      try {
+        const player = new window.Twitch.Player(id, {
+          width: '100%',
+          height: '100%',
+          channel: login,
+          parent: parentDomainsForTwitch(),
+          muted: true,
+          autoplay: true,
         });
-      }, staggerMs);
+        twitchPlayerInstances.push(player);
+        const readyEv =
+          window.Twitch.Player && window.Twitch.Player.READY
+            ? window.Twitch.Player.READY
+            : 'ready';
+        player.addEventListener(readyEv, () => {
+          try {
+            if (typeof player.play === 'function') player.play();
+          } catch {
+            /* ignore */
+          }
+        });
+      } catch {
+        wrap.remove();
+        attachTwitchIframeOnly(cell, login);
+      }
+    };
+
+    let loadScheduled = false;
+    /** @type {ResizeObserver | null} */
+    let sizeObs = null;
+
+    const scheduleWhenSized = () => {
+      if (loadScheduled) return;
+      if (cell.clientWidth < 400 || cell.clientHeight < 300) return;
+      loadScheduled = true;
+      if (sizeObs) {
+        sizeObs.disconnect();
+        sizeObs = null;
+      }
+      queueTwitchPlayerInit(runInit);
     };
 
     if (!els.grid || typeof IntersectionObserver === 'undefined') {
-      startLoad();
+      scheduleWhenSized();
+      if (!loadScheduled) queueTwitchPlayerInit(runInit);
       return;
     }
 
-    const obs = new IntersectionObserver(
+    const io = new IntersectionObserver(
       (entries) => {
         entries.forEach((entry) => {
           if (!entry.isIntersecting) return;
-          obs.disconnect();
-          startLoad();
+          io.disconnect();
+          scheduleWhenSized();
+          if (!loadScheduled) {
+            sizeObs = new ResizeObserver(() => {
+              scheduleWhenSized();
+            });
+            sizeObs.observe(cell);
+          }
+          window.setTimeout(() => {
+            if (sizeObs) {
+              sizeObs.disconnect();
+              sizeObs = null;
+            }
+            if (!loadScheduled) {
+              loadScheduled = true;
+              queueTwitchPlayerInit(runInit);
+            }
+          }, 5000);
         });
       },
-      { root: els.grid, rootMargin: '200px', threshold: 0.02 }
+      { root: els.grid, rootMargin: '240px', threshold: 0.15 }
     );
-    obs.observe(cell);
+    io.observe(cell);
   }
 
   function chatSrc(login) {
@@ -677,6 +769,17 @@
     els.chatIframeWrap.appendChild(iframe);
   }
 
+  function destroyGridTwitchPlayers() {
+    twitchPlayerInstances.forEach((player) => {
+      try {
+        if (player && typeof player.destroy === 'function') player.destroy();
+      } catch {
+        /* ignore */
+      }
+    });
+    twitchPlayerInstances = [];
+  }
+
   function destroyGridHls() {
     els.grid.querySelectorAll('video.cell-video').forEach((video) => {
       if (video._hls) {
@@ -767,6 +870,7 @@
 
   function renderGrid() {
     disconnectCellObservers();
+    destroyGridTwitchPlayers();
     destroyGridHls();
     const visible = visibleChannels();
     const n = visible.length;
@@ -776,7 +880,8 @@
     els.grid.classList.toggle('one-col', n === 1);
 
     els.grid.innerHTML = '';
-    let twitchLoadIndex = 0;
+    twitchEmbedQueue = Promise.resolve();
+    twitchEmbedSeq = 0;
     visible.forEach((ch) => {
       const cell = document.createElement('div');
       cell.className = 'cell';
@@ -784,7 +889,7 @@
 
       if (t === 'twitch') {
         const login = getTwitchLogin(ch);
-        attachTwitchIframe(cell, login, twitchLoadIndex++);
+        attachTwitchEmbedCell(cell, login);
         const lab = document.createElement('div');
         lab.className = 'cell-label';
         lab.textContent = login;

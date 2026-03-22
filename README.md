@@ -89,7 +89,7 @@ Never commit `.env` or share your client secret. `.gitignore` excludes `.env`, `
 
 ### Notes
 
-- **Twitch embeds** use the [documented iframe URL](https://dev.twitch.tv/docs/embed/video-and-clips/) (`channel`, `parent`, `muted=true`, `autoplay=true`; cells are at least **400×300** px). Twitch’s player also enforces [embedded visibility rules](https://dev.twitch.tv/docs/embed/) — if the console says **style visibility** / **viewport visibility**, the embed wasn’t considered visible yet; this app loads each Twitch iframe only when its cell is in (or near) the grid viewport and staggers loads to reduce **429** errors from opening many embeds at once. **HLS** (`m3u8` / `transcode:`) avoids Twitch’s iframe entirely if you need the most reliable playback.
+- **Twitch embeds** use the [documented iframe URL](https://dev.twitch.tv/docs/embed/video-and-clips/) (`channel`, `parent`, `muted=true`, `autoplay=true`; cells are at least **400×300** px). Twitch enforces [embedded visibility](https://dev.twitch.tv/docs/embed/); this app waits for each cell to be in view and sized, then assigns `player.twitch.tv` **serially** (with a short gap) to limit **429** errors. **HLS** is loaded from this server (`/hls.min.js`) so strict tracking prevention (e.g. Edge) does not block the script. Console lines mentioning **`chrome-extension://`**, **`background.js`**, or **disconnected port** are almost always **browser extensions**, not this app.
 - **Channel points**: Twitch does not guarantee that **embedded** players earn channel points the same way as watching on **twitch.tv**. For reliable channel points, watch on Twitch directly.
 - **Same host for OAuth**: use either **`localhost`** or **`127.0.0.1`** consistently; cookies are per-host.
 
@@ -113,7 +113,7 @@ Never commit `.env` or share your client secret. `.gitignore` excludes `.env`, `
 
 | Path | Role |
 |------|------|
-| `server.js` | Express: static files, Twitch OAuth, Helix proxy, sessions, HLS transcode endpoints |
+| `server.js` | Express: `index.html`, `app.js`, `styles.css`, `/hls.min.js`, OAuth, Helix, transcode |
 | `index.html`, `styles.css`, `app.js` | Front end |
 | `View Twitch Viewer.bat` | Windows helper to install deps, run the server, open the browser |
 | `.sessions/` | File-based login sessions (created at runtime; gitignored) |
@@ -121,6 +121,7 @@ Never commit `.env` or share your client secret. `.gitignore` excludes `.env`, `
 
 ## Troubleshooting
 
+- **Console spam from `background.js`, `chrome-extension://…`, disconnected ports**: Disable extensions (or use an InPrivate/Incognito window with extensions off) to confirm they are not from this app.
 - **Blank / blocked embeds**: Use `https://127.0.0.1:3000` or `https://localhost:3000`, not `file://`.
 - **Browser warns about certificate / “not secure”**: Expected for the built-in **self-signed** certificate. For local use only, use **Advanced → Continue** (wording varies by browser).
 - **`ERR_SSL_PROTOCOL_ERROR` when opening `http://`**: The default server listens for **HTTPS** only. Either open **`https://127.0.0.1:3000`**, or set **`USE_HTTP=true`** in `.env` and use **`http://`** everywhere (including Twitch OAuth URLs).
