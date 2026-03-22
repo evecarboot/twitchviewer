@@ -498,7 +498,13 @@ process.on('exit', killAllTranscoders);
 process.on('SIGINT', killAllTranscoders);
 process.on('SIGTERM', killAllTranscoders);
 
-function startFfmpegIfNeeded(hash, url) {
+/**
+ * @param {string} hash
+ * @param {string} url
+ * @param {{ twitch?: boolean }} [options] — twitch: lighter defaults (multi-stream CPU load)
+ */
+function startFfmpegIfNeeded(hash, url, options) {
+  const twitchMode = Boolean(options && options.twitch);
   const existing = transcodeState.get(hash);
   if (existing && existing.proc && !existing.error) return;
   if (existing && existing.error) transcodeState.delete(hash);
@@ -508,12 +514,41 @@ function startFfmpegIfNeeded(hash, url) {
   const segPattern = path.join(dir, 'seg_%03d.ts').replace(/\\/g, '/');
   const playlistArg = playlist.replace(/\\/g, '/');
 
-  const preset = (process.env.FFMPEG_PRESET || 'veryfast').trim() || 'veryfast';
+  const preset = twitchMode
+    ? (process.env.TWITCH_FFMPEG_PRESET || 'ultrafast').trim() || 'ultrafast'
+    : (process.env.FFMPEG_PRESET || 'veryfast').trim() || 'veryfast';
+
   const vfArgs = [];
-  const maxH = process.env.FFMPEG_MAX_HEIGHT;
-  if (maxH && /^\d+$/.test(String(maxH).trim())) {
-    vfArgs.push('-vf', `scale=-2:${String(maxH).trim()}`);
+  if (twitchMode) {
+    const noScale =
+      process.env.TWITCH_FFMPEG_NO_SCALE === '1' ||
+      process.env.TWITCH_FFMPEG_NO_SCALE === 'true';
+    if (!noScale) {
+      const mh = process.env.TWITCH_FFMPEG_MAX_HEIGHT?.trim();
+      if (mh === '0') {
+        /* no scale */
+      } else if (mh && /^\d+$/.test(mh)) {
+        vfArgs.push('-vf', `scale=-2:${mh}`);
+      } else {
+        vfArgs.push('-vf', 'scale=-2:720');
+      }
+    }
+  } else {
+    const maxH = process.env.FFMPEG_MAX_HEIGHT;
+    if (maxH && /^\d+$/.test(String(maxH).trim())) {
+      vfArgs.push('-vf', `scale=-2:${String(maxH).trim()}`);
+    }
   }
+
+  const hlsTime = twitchMode
+    ? Math.min(10, Math.max(2, parseInt(process.env.TWITCH_HLS_TIME || '4', 10) || 4))
+    : 2;
+  const hlsListSize = twitchMode ? 12 : 8;
+
+  /** Pace network input so ffmpeg doesn’t decode faster than realtime (helps many streams). */
+  const beforeInput = twitchMode
+    ? ['-fflags', '+genpts', '-re']
+    : ['-fflags', '+genpts'];
 
   const proc = spawn(
     'ffmpeg',
@@ -521,8 +556,7 @@ function startFfmpegIfNeeded(hash, url) {
       '-y',
       '-loglevel',
       'warning',
-      '-fflags',
-      '+genpts',
+      ...beforeInput,
       '-i',
       url,
       ...vfArgs,
@@ -532,18 +566,20 @@ function startFfmpegIfNeeded(hash, url) {
       preset,
       '-tune',
       'zerolatency',
+      '-crf',
+      '23',
       '-c:a',
       'aac',
       '-b:a',
-      '128k',
+      twitchMode ? '96k' : '128k',
       '-ar',
       '48000',
       '-f',
       'hls',
       '-hls_time',
-      '2',
+      String(hlsTime),
       '-hls_list_size',
-      '8',
+      String(hlsListSize),
       '-hls_flags',
       'delete_segments+append_list',
       '-hls_segment_filename',
@@ -679,12 +715,17 @@ function twitchLiveSourceKey(login) {
   return `twitch://live/${login}`;
 }
 
+function streamlinkQualityArg() {
+  const raw = (process.env.TWITCH_STREAMLINK_QUALITY || '720p').trim() || '720p';
+  return /^[a-zA-Z0-9][a-zA-Z0-9_+-]*$/.test(raw) ? raw : '720p';
+}
+
 function resolveStreamlinkStreamUrl(login) {
   return new Promise((resolve, reject) => {
     const proc = spawn(streamlinkExecutable(), [
       '--stream-url',
       `https://www.twitch.tv/${login}`,
-      'best',
+      streamlinkQualityArg(),
     ], { windowsHide: true });
     let out = '';
     let errBuf = '';
@@ -748,7 +789,7 @@ app.get('/api/twitch-live/:login/:file', async (req, res) => {
     if (!transcodeState.has(hash)) {
       try {
         const streamUrl = await resolveStreamlinkStreamUrl(login);
-        startFfmpegIfNeeded(hash, streamUrl);
+        startFfmpegIfNeeded(hash, streamUrl, { twitch: true });
       } catch (e) {
         return res.status(503).type('text').send(String(e.message));
       }

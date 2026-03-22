@@ -1226,6 +1226,16 @@
     if (typeof Hls !== 'undefined' && Hls.isSupported()) {
       const hls = new Hls({
         enableWorker: false,
+        ...(twitchHls
+          ? {
+              maxBufferLength: 45,
+              maxMaxBufferLength: 120,
+              backBufferLength: 60,
+              liveSyncDurationCount: 4,
+              liveMaxLatencyDurationCount: 12,
+              maxLiveSyncPlaybackRate: 1.5,
+            }
+          : {}),
       });
       hls.loadSource(playbackUrl);
       hls.attachMedia(video);
