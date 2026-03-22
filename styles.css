@@ -333,6 +333,7 @@ body {
   overflow: hidden;
   visibility: visible;
   opacity: 1;
+  contain: none;
   /* Avoid content-visibility: auto here — it can defer layout so Twitch’s embed
      mis-reads size/visibility and refuses autoplay (HLS <video> is unaffected). */
 }

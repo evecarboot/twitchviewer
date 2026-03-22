@@ -320,7 +320,40 @@
     return `https://player.twitch.tv/?${params.toString()}`;
   }
 
-  function attachTwitchIframeOnly(cell, login) {
+  /**
+   * Twitch’s player runs a visibility check when the iframe navigates; if the cell
+   * is still 0×0 or clipped/hidden in the tree, you get “style visibility” (Embedded
+   * Experiences Requirements). Static HTML pages paint before load; JS appends often
+   * assign src before layout — defer setting src until the cell is measurable.
+   */
+  function twitchEmbedHostReady(cell) {
+    if (document.visibilityState !== 'visible' || document.hidden) return false;
+    const cw = cell.clientWidth;
+    const ch = cell.clientHeight;
+    if (cw < 400 || ch < 300) return false;
+    const r = cell.getBoundingClientRect();
+    if (r.width < 400 || r.height < 300) return false;
+    let el = cell;
+    while (el && el.nodeType === 1) {
+      const cs = window.getComputedStyle(el);
+      if (cs.display === 'none') return false;
+      if (cs.visibility === 'hidden') return false;
+      if (parseFloat(cs.opacity) < 0.01) return false;
+      el = el.parentElement;
+    }
+    if (els.grid) {
+      const gr = els.grid.getBoundingClientRect();
+      const overlaps =
+        r.bottom > gr.top &&
+        r.top < gr.bottom &&
+        r.right > gr.left &&
+        r.left < gr.right;
+      if (!overlaps) return false;
+    }
+    return true;
+  }
+
+  function createTwitchIframeElement(login) {
     const iframe = document.createElement('iframe');
     iframe.dataset.twitchEmbed = '1';
     iframe.title = `Twitch: ${login}`;
@@ -333,16 +366,108 @@
     );
     iframe.style.cssText =
       'position:absolute;inset:0;width:100%;height:100%;min-width:400px;min-height:300px;border:0;visibility:visible;opacity:1;display:block;background:#000';
-    iframe.src = playerSrc(login);
-    cell.appendChild(iframe);
+    return iframe;
   }
 
-  /**
-   * Assign src in the same turn as DOM insert (multitwitch uses static HTML iframes).
-   * Deferred rAF loads miss the same navigation/autoplay timing as a plain embed.
-   */
+  function mountTwitchPlayerSrc(iframe, login) {
+    iframe.src = playerSrc(login);
+  }
+
+  function waitThenMountTwitchPlayer(cell, iframe, login) {
+    let done = false;
+    let ro = null;
+    let io = null;
+    let pollFrames = 0;
+    const maxPollFrames = 240;
+    let timeoutId = 0;
+
+    const cleanup = () => {
+      if (ro) {
+        try {
+          ro.disconnect();
+        } catch {
+          /* ignore */
+        }
+        ro = null;
+      }
+      if (io) {
+        try {
+          io.disconnect();
+        } catch {
+          /* ignore */
+        }
+        io = null;
+      }
+      document.removeEventListener('visibilitychange', onVis);
+      if (timeoutId) {
+        window.clearTimeout(timeoutId);
+        timeoutId = 0;
+      }
+    };
+
+    const mount = () => {
+      if (done) return;
+      done = true;
+      cleanup();
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          mountTwitchPlayerSrc(iframe, login);
+        });
+      });
+    };
+
+    const tryMount = () => {
+      if (done) return;
+      if (twitchEmbedHostReady(cell)) mount();
+    };
+
+    function onVis() {
+      if (document.visibilityState === 'visible') tryMount();
+    }
+
+    if (twitchEmbedHostReady(cell)) {
+      mount();
+      return;
+    }
+
+    document.addEventListener('visibilitychange', onVis);
+
+    if (typeof ResizeObserver !== 'undefined') {
+      ro = new ResizeObserver(() => tryMount());
+      ro.observe(cell);
+    }
+
+    if (els.grid && typeof IntersectionObserver !== 'undefined') {
+      io = new IntersectionObserver(
+        () => {
+          tryMount();
+        },
+        { root: els.grid, rootMargin: '0px', threshold: [0, 0.01, 0.05, 0.1, 0.25] }
+      );
+      io.observe(cell);
+    }
+
+    const poll = () => {
+      if (done) return;
+      pollFrames++;
+      tryMount();
+      if (!done && pollFrames < maxPollFrames) {
+        requestAnimationFrame(poll);
+      } else if (!done) {
+        mount();
+      }
+    };
+    requestAnimationFrame(poll);
+
+    timeoutId = window.setTimeout(() => {
+      if (!done) mount();
+    }, 6000);
+  }
+
   function attachTwitchEmbedCell(cell, login) {
-    attachTwitchIframeOnly(cell, login);
+    const iframe = createTwitchIframeElement(login);
+    cell.appendChild(iframe);
+    waitThenMountTwitchPlayer(cell, iframe, login);
   }
 
   function chatSrc(login) {
