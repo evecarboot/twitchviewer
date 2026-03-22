@@ -622,7 +622,85 @@ app.get('/hls.min.js', (_req, res) => {
 
 const port = getPort();
 
+/** Resolve TLS file paths relative to the project directory (not process.cwd()). */
+function resolveTlsFilePath(p) {
+  const trimmed = typeof p === 'string' ? p.trim() : '';
+  if (!trimmed) return '';
+  return path.isAbsolute(trimmed) ? trimmed : path.join(root, trimmed);
+}
+
+/**
+ * Auto-find mkcert-style key + cert under project root (folder name is often wrong: cert vs certs).
+ * @returns {{ keyPath: string, certPath: string, label: string } | null}
+ */
+function discoverLocalTlsFiles() {
+  /** @type {readonly [string, string, string][]} */
+  const pairs = [
+    ['certs', 'localhost-key.pem', 'localhost.pem'],
+    ['cert', 'localhost-key.pem', 'localhost.pem'],
+    ['certs', 'localhost.key', 'localhost.crt'],
+    ['cert', 'localhost.key', 'localhost.crt'],
+  ];
+  for (const [dir, keyFile, certFile] of pairs) {
+    const keyPath = path.join(root, dir, keyFile);
+    const certPath = path.join(root, dir, certFile);
+    if (fs.existsSync(keyPath) && fs.existsSync(certPath)) {
+      return {
+        keyPath,
+        certPath,
+        label: `${dir}/${keyFile} + ${dir}/${certFile}`,
+      };
+    }
+  }
+  return null;
+}
+
+/**
+ * TLS for local HTTPS. Default: in-memory self-signed (browser shows "Not secure").
+ * Trusted: mkcert files — set HTTPS_KEY_PATH / HTTPS_CERT_PATH, or place key+cert in
+ * certs/ or cert/ (see discoverLocalTlsFiles).
+ * @returns {Promise<{ key: Buffer | string, cert: Buffer | string, source: 'custom' | 'selfsigned', label: string }>}
+ */
 async function createTlsOptions() {
+  const envKey = process.env.HTTPS_KEY_PATH?.trim();
+  const envCert = process.env.HTTPS_CERT_PATH?.trim();
+
+  let keyPath = '';
+  let certPath = '';
+  let label = '';
+
+  if (envKey && envCert) {
+    keyPath = resolveTlsFilePath(envKey);
+    certPath = resolveTlsFilePath(envCert);
+    label = `HTTPS_KEY_PATH / HTTPS_CERT_PATH → ${path.relative(root, keyPath)}`;
+  } else if (envKey || envCert) {
+    throw new Error(
+      'Set both HTTPS_KEY_PATH and HTTPS_CERT_PATH, or omit both for self-signed HTTPS.'
+    );
+  } else {
+    const found = discoverLocalTlsFiles();
+    if (found) {
+      keyPath = found.keyPath;
+      certPath = found.certPath;
+      label = found.label;
+    }
+  }
+
+  if (keyPath && certPath) {
+    if (!fs.existsSync(keyPath)) {
+      throw new Error(`HTTPS key not found: ${keyPath}`);
+    }
+    if (!fs.existsSync(certPath)) {
+      throw new Error(`HTTPS cert not found: ${certPath}`);
+    }
+    return {
+      key: fs.readFileSync(keyPath),
+      cert: fs.readFileSync(certPath),
+      source: 'custom',
+      label,
+    };
+  }
+
   const attrs = [{ name: 'commonName', value: 'localhost' }];
   const pems = await selfsigned.generate(attrs, {
     algorithm: 'sha256',
@@ -640,10 +718,19 @@ async function createTlsOptions() {
       },
     ],
   });
-  return { key: pems.private, cert: pems.cert };
+  return {
+    key: pems.private,
+    cert: pems.cert,
+    source: 'selfsigned',
+    label: 'built-in self-signed (browser will show Not secure)',
+  };
 }
 
-function printStartupTips(scheme) {
+/**
+ * @param {'http' | 'https'} scheme
+ * @param {{ source: 'custom' | 'selfsigned', label?: string } | undefined} [tlsInfo]
+ */
+function printStartupTips(scheme, tlsInfo) {
   console.log(
     `OAuth redirect URLs to register in Twitch (must match scheme ${scheme}://):`
   );
@@ -652,10 +739,23 @@ function printStartupTips(scheme) {
   console.log(
     `Or set TWITCH_REDIRECT_URI in .env to one exact URL and add that same URL in Twitch.`
   );
-  if (scheme === 'https') {
-    console.log(
-      `Browser certificate warning: Advanced → Continue (self-signed cert, local dev only).`
-    );
+  if (scheme === 'https' && tlsInfo) {
+    if (tlsInfo.source === 'selfsigned') {
+      console.log(
+        `TLS: ${tlsInfo.label || 'self-signed'} — browser will show "Not secure" until trusted certs load.`
+      );
+      console.log(
+        `     Expected files (same folder as server.js): certs/localhost-key.pem + certs/localhost.pem`
+      );
+      console.log(
+        `     or cert/ with the same names — or set HTTPS_KEY_PATH + HTTPS_CERT_PATH in .env.`
+      );
+      console.log(
+        `     Run mkcert-local.bat, or: mkcert -install (as Admin^), then restart the server.`
+      );
+    } else {
+      console.log(`TLS: trusted (${tlsInfo.label || 'custom key + cert'})`);
+    }
   }
   if (!process.env.TWITCH_CLIENT_ID) {
     console.log(
@@ -683,10 +783,10 @@ async function startServer() {
 
   const tls = await createTlsOptions();
   https
-    .createServer(tls, app)
+    .createServer({ key: tls.key, cert: tls.cert }, app)
     .listen(port, () => {
       console.log(`Twitch viewer (HTTPS): https://localhost:${port}`);
-      printStartupTips('https');
+      printStartupTips('https', tls);
     });
 }
 

@@ -90,7 +90,7 @@ Never commit `.env` or share your client secret. `.gitignore` excludes `.env`, `
 
 ### Notes
 
-- **Twitch embeds** use the [documented iframe URL](https://dev.twitch.tv/docs/embed/video-and-clips/) (`channel`, `parent`, `muted=true`, `autoplay=true`; cells are at least **400×300** px). Twitch enforces [embedded visibility](https://dev.twitch.tv/docs/embed/); this app waits for each cell to be in view and sized, then assigns `player.twitch.tv` **serially** (with a short gap) to limit **429** errors. **HLS** is loaded from this server (`/hls.min.js`) so strict tracking prevention (e.g. Edge) does not block the script. Console lines mentioning **`chrome-extension://`**, **`background.js`**, or **disconnected port** are almost always **browser extensions**, not this app.
+- **Twitch** uses the official [embed script](https://dev.twitch.tv/docs/embed/video-and-clips/) (`player.twitch.tv/js/embed/v1.js`) and **`Twitch.Player`** with `channel`, `parent`, **`muted: true`**, **`autoplay: true`** (grid cells stay at least **400×300** CSS px via CSS). Players are created **serially** (short gap between inits) to limit **429** errors. **HLS** is loaded from this server (`/hls.min.js`) so strict tracking prevention (e.g. Edge) does not block the script. Console lines mentioning **`chrome-extension://`**, **`background.js`**, or **disconnected port** are almost always **browser extensions**, not this app.
 - **Channel points**: Twitch does not guarantee that **embedded** players earn channel points the same way as watching on **twitch.tv**. For reliable channel points, watch on Twitch directly.
 - **Same host for OAuth**: use either **`localhost`** or **`127.0.0.1`** consistently; cookies are per-host.
 

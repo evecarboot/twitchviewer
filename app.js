@@ -31,11 +31,8 @@
   let pollTimer = null;
   /** @type {IntersectionObserver[]} */
   let cellObservers = [];
-  /** Serial Twitch embed inits (Player + iframe) to limit 429s. */
+  /** Stagger Twitch iframe mounts (Helix + browser load). */
   let twitchEmbedQueue = Promise.resolve();
-  /** @type {any[]} */
-  let twitchPlayerInstances = [];
-  let twitchEmbedSeq = 0;
   /** @type {Set<string>} */
   let followModalSelection = new Set();
 
@@ -64,7 +61,6 @@
     chatIframeWrap: document.getElementById('chat-iframe-wrap'),
     chatChannelPanel: document.getElementById('chat-channel-panel'),
     closeChat: document.getElementById('close-chat'),
-    offlineBar: document.getElementById('offline-bar'),
     authLogin: document.getElementById('auth-login'),
     authUserWrap: document.getElementById('auth-user-wrap'),
     authAvatar: document.getElementById('auth-avatar'),
@@ -313,81 +309,7 @@
     return qs;
   }
 
-  /**
-   * player.twitch.tv embed URL (muted + autoplay per Twitch docs; parent list like multitwitch).
-   */
-  function playerSrc(login) {
-    const params = new URLSearchParams();
-    params.set('muted', 'true');
-    params.set('autoplay', 'true');
-    params.set('channel', login);
-    appendParentDomains(params);
-    return `https://player.twitch.tv/?${params.toString()}`;
-  }
-
-  /**
-   * Twitch’s “style visibility” requires the embed’s visible area to meet the same ~400×300
-   * minimum as the layout size — not just “some pixels” in the viewport.
-   * Intersection with the viewport must cover at least that (capped when the window is smaller).
-   */
-  function cellIntersectsViewportForTwitchAutoplay(cell) {
-    const r = cell.getBoundingClientRect();
-    if (r.width < 400 || r.height < 300) return false;
-    const vw = window.innerWidth;
-    const vh = window.innerHeight;
-    const overlapW = Math.max(
-      0,
-      Math.min(r.right, vw) - Math.max(r.left, 0)
-    );
-    const overlapH = Math.max(
-      0,
-      Math.min(r.bottom, vh) - Math.max(r.top, 0)
-    );
-    const needW = Math.min(400, vw);
-    const needH = Math.min(300, vh);
-    return overlapW >= needW && overlapH >= needH;
-  }
-
-  /**
-   * Cell is ready for Twitch (size + ancestors + viewport presence).
-   * Twitch rejects autoplay with “style visibility” if the iframe loads before paint/layout settle.
-   */
-  function twitchEmbedHostReady(cell) {
-    if (document.visibilityState !== 'visible' || document.hidden) return false;
-    const cw = cell.clientWidth;
-    const ch = cell.clientHeight;
-    if (cw < 400 || ch < 300) return false;
-    const r = cell.getBoundingClientRect();
-    if (r.width < 400 || r.height < 300) return false;
-    if (!cellIntersectsViewportForTwitchAutoplay(cell)) return false;
-    let el = cell;
-    while (el && el.nodeType === 1) {
-      const cs = window.getComputedStyle(el);
-      if (cs.display === 'none') return false;
-      if (cs.visibility === 'hidden') return false;
-      if (parseFloat(cs.opacity) < 0.01) return false;
-      el = el.parentElement;
-    }
-    return true;
-  }
-
-  /** Let the browser paint and settle flex/grid before Twitch measures “style visibility”. */
-  function afterLayoutStableForTwitch(cell, run) {
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        window.setTimeout(() => {
-          try {
-            void cell.getBoundingClientRect();
-          } catch {
-            /* ignore */
-          }
-          run();
-        }, 280);
-      });
-    });
-  }
-
-  /** Twitch.Player expects parent: string[] with real hostnames (not query strings). */
+  /** player.twitch.tv `parent` query params — real hostnames (see embed docs). */
   function parentDomainsForTwitch() {
     const h = window.location.hostname;
     /** @type {string[]} */
@@ -411,6 +333,11 @@
     return parents;
   }
 
+  /** Must match .grid minmax(400px,…) / minmax(300px,…) — Twitch embed minimum. */
+  const GRID_MIN_CELL_W = 400;
+  const GRID_MIN_CELL_H = 300;
+
+  /** Space embeds apart: Helix limits + fewer simultaneous WebGL contexts in the browser. */
   function queueTwitchMount(run) {
     twitchEmbedQueue = twitchEmbedQueue.then(
       () =>
@@ -421,40 +348,48 @@
             } catch {
               /* ignore */
             }
-            window.setTimeout(resolve, 650);
+            window.setTimeout(resolve, 450);
           }, 0);
         })
     );
   }
 
-  function createTwitchIframeElement(login) {
-    const iframe = document.createElement('iframe');
-    iframe.dataset.twitchEmbed = '1';
-    iframe.title = `Twitch: ${login}`;
-    iframe.setAttribute('width', '400');
-    iframe.setAttribute('height', '300');
-    iframe.setAttribute(
-      'allow',
-      'autoplay; fullscreen; picture-in-picture; encrypted-media; clipboard-write'
-    );
-    iframe.style.cssText =
-      'position:absolute;inset:0;width:100%;height:100%;min-width:400px;min-height:300px;border:0;visibility:visible;opacity:1;display:block;background:#000';
-    return iframe;
+  /**
+   * Twitch rejects muted autoplay unless the embed meets size + “style visibility” +
+   * viewport visibility. Wait until the cell is laid out and on-screen before Player().
+   */
+  function twitchCellReadyForEmbed(cell) {
+    if (!cell || !cell.isConnected) return false;
+    if (document.visibilityState !== 'visible' || document.hidden) return false;
+    if (cell.clientWidth < GRID_MIN_CELL_W || cell.clientHeight < GRID_MIN_CELL_H)
+      return false;
+    const r = cell.getBoundingClientRect();
+    if (r.width < GRID_MIN_CELL_W || r.height < GRID_MIN_CELL_H) return false;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const overlapW = Math.max(0, Math.min(r.right, vw) - Math.max(r.left, 0));
+    const overlapH = Math.max(0, Math.min(r.bottom, vh) - Math.max(r.top, 0));
+    const needW = Math.min(GRID_MIN_CELL_W, vw);
+    const needH = Math.min(GRID_MIN_CELL_H, vh);
+    if (overlapW < needW || overlapH < needH) return false;
+    let el = cell;
+    while (el && el.nodeType === 1) {
+      const cs = window.getComputedStyle(el);
+      if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+      if (parseFloat(cs.opacity) < 0.01) return false;
+      el = el.parentElement;
+    }
+    return true;
   }
 
-  function mountTwitchPlayerSrc(iframe, login) {
-    iframe.src = playerSrc(login);
-  }
-
-  function waitForCellMount(cell, onReady) {
+  function whenTwitchCellPaintable(cell, onReady) {
     let done = false;
     let ro = null;
     let io = null;
-    let pollFrames = 0;
-    const maxPollFrames = 240;
     let timeoutId = 0;
 
     const cleanup = () => {
+      document.removeEventListener('visibilitychange', onVis);
       if (ro) {
         try {
           ro.disconnect();
@@ -471,155 +406,109 @@
         }
         io = null;
       }
-      document.removeEventListener('visibilitychange', onVis);
       if (timeoutId) {
         window.clearTimeout(timeoutId);
         timeoutId = 0;
       }
     };
 
-    const mount = () => {
+    const fire = () => {
       if (done) return;
       done = true;
       cleanup();
-      onReady();
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          window.setTimeout(onReady, 140);
+        });
+      });
     };
 
-    const tryMount = () => {
+    const tryNow = () => {
       if (done) return;
-      if (twitchEmbedHostReady(cell)) mount();
+      if (twitchCellReadyForEmbed(cell)) fire();
     };
 
     function onVis() {
-      if (document.visibilityState === 'visible') tryMount();
+      if (document.visibilityState === 'visible') tryNow();
     }
 
-    if (twitchEmbedHostReady(cell)) {
-      mount();
+    if (twitchCellReadyForEmbed(cell)) {
+      fire();
       return;
     }
 
     document.addEventListener('visibilitychange', onVis);
-
     if (typeof ResizeObserver !== 'undefined') {
-      ro = new ResizeObserver(() => tryMount());
+      ro = new ResizeObserver(() => tryNow());
       ro.observe(cell);
     }
-
     if (typeof IntersectionObserver !== 'undefined') {
-      io = new IntersectionObserver(
-        () => {
-          tryMount();
-        },
-        { root: null, rootMargin: '0px', threshold: [0, 0.1, 0.25, 0.45, 0.6, 0.75, 1] }
-      );
+      io = new IntersectionObserver(() => tryNow(), {
+        root: null,
+        rootMargin: '0px',
+        threshold: [0, 0.1, 0.25, 0.5, 0.75, 1],
+      });
       io.observe(cell);
     }
-
-    const poll = () => {
-      if (done) return;
-      pollFrames++;
-      tryMount();
-      if (!done && pollFrames < maxPollFrames) {
-        requestAnimationFrame(poll);
-      } else if (!done) {
-        mount();
-      }
-    };
-    requestAnimationFrame(poll);
-
     timeoutId = window.setTimeout(() => {
-      if (!done) mount();
-    }, 6000);
+      if (!done) fire();
+    }, 9000);
   }
 
-  function waitThenMountTwitchPlayer(cell, iframe, login) {
-    waitForCellMount(cell, () => {
-      afterLayoutStableForTwitch(cell, () => mountTwitchPlayerSrc(iframe, login));
-    });
-  }
-
-  function iframeFallback(cell, login, wrap) {
-    if (wrap && wrap.parentNode) wrap.remove();
-    const iframe = createTwitchIframeElement(login);
-    cell.appendChild(iframe);
-    waitThenMountTwitchPlayer(cell, iframe, login);
-  }
-
-  function removeTwitchPlayerFromRegistry(player) {
-    const idx = twitchPlayerInstances.indexOf(player);
-    if (idx >= 0) twitchPlayerInstances.splice(idx, 1);
-  }
-
-  /** Browsers sometimes defer muted autoplay; retry a few times after READY. */
-  function pokeTwitchPlayerPlay(player) {
-    const run = () => {
-      try {
-        if (player && typeof player.play === 'function') player.play();
-      } catch {
-        /* ignore */
-      }
-    };
-    run();
-    window.setTimeout(run, 0);
-    window.setTimeout(run, 250);
-    window.setTimeout(run, 800);
-  }
-
-  function initTwitchEmbed(cell, login, wrap, id) {
-    if (!cell.isConnected || !wrap.isConnected) return;
+  function showTwitchEmbedError(wrap, login, msg) {
     try {
-      void cell.getBoundingClientRect();
+      wrap.innerHTML = '';
     } catch {
       /* ignore */
     }
-    if (!twitchEmbedHostReady(cell)) {
-      iframeFallback(cell, login, wrap);
-      return;
-    }
-    if (
-      typeof window.Twitch !== 'undefined' &&
-      typeof window.Twitch.Player === 'function'
-    ) {
-      try {
-        const player = new window.Twitch.Player(id, {
-          width: '100%',
-          height: '100%',
-          channel: login,
-          parent: parentDomainsForTwitch(),
-          muted: true,
-          autoplay: true,
-        });
-        twitchPlayerInstances.push(player);
-        cell._twitchPlayer = player;
-        const readyEv =
-          window.Twitch.Player && window.Twitch.Player.READY
-            ? window.Twitch.Player.READY
-            : 'ready';
-        player.addEventListener(readyEv, () => {
-          pokeTwitchPlayerPlay(player);
-        });
-        return;
-      } catch {
-        /* fall through to iframe */
+    const err = document.createElement('div');
+    err.className = 'cell-hls-error';
+    err.style.pointerEvents = 'auto';
+    err.textContent = msg || `Could not load Twitch (${login}).`;
+    wrap.appendChild(err);
+  }
+
+  /**
+   * Direct iframe embed (not Twitch.Player). Chrome/Edge need `allow="autoplay"` on the
+   * iframe element; the JS API’s injected iframe often omits it, so muted autoplay fails.
+   * https://dev.twitch.tv/docs/embed/video-and-clips/
+   */
+  function createTwitchIframeEmbed(cell, login, wrap) {
+    if (!cell.isConnected || !wrap.isConnected) return;
+
+    try {
+      wrap.innerHTML = '';
+      const iframe = document.createElement('iframe');
+      iframe.dataset.twitchEmbed = '1';
+      iframe.title = `Twitch: ${login}`;
+      iframe.setAttribute('allowfullscreen', '');
+      iframe.allow =
+        'autoplay; fullscreen; picture-in-picture; clipboard-write; encrypted-media; web-share';
+      const params = new URLSearchParams();
+      params.set('channel', login);
+      params.set('muted', 'true');
+      params.set('autoplay', 'true');
+      for (const p of parentDomainsForTwitch()) {
+        params.append('parent', p);
       }
+      iframe.src = `https://player.twitch.tv/?${params.toString()}`;
+      iframe.loading = 'eager';
+      wrap.appendChild(iframe);
+      cell._twitchPlayer = iframe;
+    } catch {
+      showTwitchEmbedError(wrap, login, `Twitch embed error (${login}).`);
     }
-    iframeFallback(cell, login, wrap);
   }
 
   function attachTwitchEmbedCell(cell, login) {
     const wrap = document.createElement('div');
     wrap.className = 'twitch-embed-host';
-    const id = `twitch-embed-${++twitchEmbedSeq}`;
-    wrap.id = id;
     cell.appendChild(wrap);
 
-    waitForCellMount(cell, () => {
-      afterLayoutStableForTwitch(cell, () => {
-        queueTwitchMount(() => {
-          if (!cell.isConnected || !wrap.isConnected) return;
-          initTwitchEmbed(cell, login, wrap, id);
-        });
+    whenTwitchCellPaintable(cell, () => {
+      queueTwitchMount(() => {
+        if (!cell.isConnected || !wrap.isConnected) return;
+        createTwitchIframeEmbed(cell, login, wrap);
       });
     });
   }
@@ -647,22 +536,23 @@
   }
 
   /**
-   * Choose cols × rows so tiles are as large as possible for the current window shape:
-   * prefer layouts with no empty grid cells, then maximize min(cell width, cell height).
-   * A plain sqrt(n) grid wastes slots on many counts (e.g. 8 → 3×3) and ignores ultra-wide.
+   * Choose cols × rows so tiles fit the viewport without a single ultra-wide row of
+   * skinny cells. We only consider layouts where w/cols ≥ 400 and h/rows ≥ 300 (same
+   * as CSS); otherwise 5 streams would pick 5×1 and force ~2000px width + horizontal scroll.
    */
   function gridDimensions(count, vp) {
     if (count <= 0) return { cols: 1, rows: 1 };
     if (count === 1) return { cols: 1, rows: 1 };
     const { w, h } = vp;
-    let bestCols = Math.ceil(Math.sqrt(count));
-    let bestRows = Math.ceil(count / bestCols);
+    let bestCols = 1;
+    let bestRows = Math.ceil(count);
     let bestScore = -Infinity;
     for (let cols = 1; cols <= count; cols++) {
       const rows = Math.ceil(count / cols);
       const waste = cols * rows - count;
       const cw = w / cols;
       const ch = h / rows;
+      if (cw < GRID_MIN_CELL_W || ch < GRID_MIN_CELL_H) continue;
       const minSide = Math.min(cw, ch);
       const score = minSide * minSide - waste * 1_000_000;
       if (score > bestScore) {
@@ -670,6 +560,12 @@
         bestCols = cols;
         bestRows = rows;
       }
+    }
+    if (bestScore === -Infinity) {
+      let cols = Math.max(1, Math.min(count, Math.floor(w / GRID_MIN_CELL_W)));
+      if (cols < 1) cols = 1;
+      const rows = Math.ceil(count / cols);
+      return { cols, rows };
     }
     return { cols: bestCols, rows: bestRows };
   }
@@ -729,21 +625,6 @@
     return visibleChannels()
       .map((ch) => channelKey(ch))
       .join('\x1e');
-  }
-
-  function updateOfflineBar() {
-    const offline = state.channels
-      .filter(
-        (c) =>
-          getChannelType(c) === 'twitch' && !onlineSet.has(getTwitchLogin(c))
-      )
-      .map((c) => getTwitchLogin(c));
-    if (state.hideOffline && apiConfigured && !pollFailed && offline.length) {
-      els.offlineBar.hidden = false;
-      els.offlineBar.textContent = `Offline (hidden): ${offline.join(', ')}`;
-    } else {
-      els.offlineBar.hidden = true;
-    }
   }
 
   function twitchLoginsForPoll() {
@@ -1029,13 +910,15 @@
     if (!cell) return;
     if (cell._twitchPlayer) {
       try {
-        if (typeof cell._twitchPlayer.destroy === 'function') {
-          cell._twitchPlayer.destroy();
+        const t = cell._twitchPlayer;
+        if (t instanceof HTMLIFrameElement) {
+          t.remove();
+        } else if (typeof t.destroy === 'function') {
+          t.destroy();
         }
       } catch {
         /* ignore */
       }
-      removeTwitchPlayerFromRegistry(cell._twitchPlayer);
       cell._twitchPlayer = null;
     }
     cell.querySelectorAll('video.cell-video').forEach((video) => {
@@ -1356,10 +1239,7 @@
         destroyCellMedia(cell);
       }
       els.grid.innerHTML = '';
-      twitchPlayerInstances = [];
       twitchEmbedQueue = Promise.resolve();
-      twitchEmbedSeq = 0;
-      updateOfflineBar();
       requestAnimationFrame(() => {
         requestAnimationFrame(() => attachCellObserversToGrid());
       });
@@ -1383,7 +1263,6 @@
       cells.forEach((cell, i) => {
         cell.dataset.cellIndex = String(i);
       });
-      updateOfflineBar();
       requestAnimationFrame(() => {
         requestAnimationFrame(() => attachCellObserversToGrid());
       });
@@ -1409,8 +1288,6 @@
       const newCell = buildCellForChannel(ch, i);
       els.grid.insertBefore(newCell, els.grid.children[i] || null);
     }
-
-    updateOfflineBar();
 
     requestAnimationFrame(() => {
       requestAnimationFrame(() => attachCellObserversToGrid());
@@ -1468,9 +1345,9 @@
 
   function updateRefreshStreamsButton() {
     if (!els.refreshStreams) return;
-    const hasAny = state.channels.length > 0;
-    els.refreshStreams.hidden = !hasAny;
-    els.refreshStreams.disabled = !hasAny;
+    const hasTwitchToPoll = twitchLoginsForPoll().length > 0;
+    els.refreshStreams.hidden = !hasTwitchToPoll;
+    els.refreshStreams.disabled = !hasTwitchToPoll;
   }
 
   function fullRender() {
@@ -1490,7 +1367,6 @@
     const before = visibleChannelsSignature();
     await refreshOnline();
     renderChannelChips();
-    updateOfflineBar();
     /* Rebuilding the grid nukes every iframe — only do it when hide-offline / live
        state actually changes who is shown. Otherwise polls every 45s would restart
        all Twitch players and feel like streams “died” for no reason. */
@@ -1595,13 +1471,12 @@
 
   if (els.refreshStreams) {
     els.refreshStreams.addEventListener('click', async () => {
-      if (!state.channels.length) return;
+      if (!twitchLoginsForPoll().length) return;
       els.refreshStreams.disabled = true;
       try {
-        /* Always rebuild after a manual refresh: tick() skips renderGrid() when the
-           visible channel list is unchanged, which feels like “nothing happened”. */
         await refreshOnline();
         fullRender();
+        schedulePoll();
       } finally {
         updateRefreshStreamsButton();
       }
