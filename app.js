@@ -10,6 +10,8 @@
   }
 
   const STORAGE_KEY = 'twitchviewer:v1';
+  /** One-time user gesture so browsers allow muted Twitch embed autoplay. */
+  const PLAYBACK_UNLOCK_KEY = 'twitchviewer:playbackUnlock';
   const POLL_MS = 45_000;
   const FETCH_OPTS = { credentials: 'same-origin' };
 
@@ -1148,6 +1150,64 @@
     els.grid.addEventListener('pointerdown', onGridPointerDown);
   }
 
+  function isPlaybackUnlocked() {
+    try {
+      return localStorage.getItem(PLAYBACK_UNLOCK_KEY) === '1';
+    } catch {
+      return true;
+    }
+  }
+
+  function setPlaybackUnlocked() {
+    try {
+      localStorage.setItem(PLAYBACK_UNLOCK_KEY, '1');
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function removePlaybackUnlockBar() {
+    const b = document.getElementById('playback-unlock-bar');
+    if (b) b.remove();
+  }
+
+  function ensurePlaybackUnlockBar() {
+    const parent = els.grid && els.grid.parentElement;
+    if (!parent) return;
+    const needsTwitch =
+      visibleChannels().some((ch) => getChannelType(ch) === 'twitch') &&
+      !isPlaybackUnlocked();
+    if (!needsTwitch) {
+      removePlaybackUnlockBar();
+      return;
+    }
+    if (document.getElementById('playback-unlock-bar')) return;
+    const bar = document.createElement('div');
+    bar.id = 'playback-unlock-bar';
+    bar.className = 'playback-unlock-bar';
+    bar.setAttribute('role', 'region');
+    bar.setAttribute('aria-label', 'Start Twitch playback');
+    const inner = document.createElement('div');
+    inner.className = 'playback-unlock-inner';
+    const msg = document.createElement('p');
+    msg.className = 'playback-unlock-text';
+    msg.textContent =
+      'Browsers often block embedded video until you interact with the page. Click once to load Twitch players.';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'playback-unlock-btn';
+    btn.textContent = 'Start Twitch streams';
+    btn.addEventListener('click', () => {
+      setPlaybackUnlocked();
+      removePlaybackUnlockBar();
+      fullRender();
+    });
+    inner.appendChild(msg);
+    inner.appendChild(btn);
+    bar.appendChild(inner);
+    parent.insertBefore(bar, els.grid);
+  }
+
   function renderGrid() {
     disconnectCellObservers();
     destroyGridTwitchPlayers();
@@ -1174,7 +1234,15 @@
 
       if (t === 'twitch') {
         const login = getTwitchLogin(ch);
-        attachTwitchEmbedCell(cell, login);
+        if (isPlaybackUnlocked()) {
+          attachTwitchEmbedCell(cell, login);
+        } else {
+          const pending = document.createElement('div');
+          pending.className = 'cell-twitch-pending';
+          pending.innerHTML =
+            '<span class="cell-twitch-pending-msg">Use the button above to start</span>';
+          cell.appendChild(pending);
+        }
         const lab = document.createElement('div');
         lab.className = 'cell-label';
         lab.textContent = login;
@@ -1289,6 +1357,7 @@
     });
 
     updateOfflineBar();
+    ensurePlaybackUnlockBar();
 
     requestAnimationFrame(() => {
       requestAnimationFrame(() => attachCellObserversToGrid());
