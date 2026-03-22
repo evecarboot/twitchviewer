@@ -26,6 +26,8 @@
 
   let state = loadState();
   let apiConfigured = false;
+  /** 'hls' = Twitch via streamlink+ffmpeg on server; 'iframe' = official embed */
+  let twitchPlayback = 'iframe';
   let pollFailed = false;
   let onlineSet = new Set();
   let pollTimer = null;
@@ -1165,6 +1167,90 @@
   }
 
   /**
+   * HLS playback in a cell (hls.js). Used for raw m3u8 URLs and for Twitch when server uses streamlink.
+   * @param {{ twitchHls?: boolean }} opts
+   */
+  function mountHlsVideoInCell(cell, ch, playbackUrl, opts) {
+    const twitchHls = Boolean(opts && opts.twitchHls);
+    const video = document.createElement('video');
+    video.className = 'cell-video';
+    video.controls = true;
+    video.muted = true;
+    video.playsInline = true;
+    video.setAttribute('playsinline', '');
+    video.autoplay = true;
+
+    const fail = (msg) => {
+      if (cell.querySelector('.cell-hls-error')) return;
+      const errEl = document.createElement('div');
+      errEl.className = 'cell-hls-error';
+      errEl.textContent = msg;
+      cell.appendChild(errEl);
+    };
+
+    function formatHlsFatalError(data) {
+      const details = data && data.details ? String(data.details) : '';
+      const typ = data && data.type != null ? String(data.type) : '';
+      if (twitchHls) {
+        if (
+          details.includes('manifestLoadError') ||
+          details.includes('levelLoadError') ||
+          details.includes('fragLoadError') ||
+          typ === 'networkError'
+        ) {
+          return 'Twitch HLS: could not load playlist (offline stream, or install streamlink + ffmpeg on the server — see server log).';
+        }
+        return `Twitch HLS failed: ${details || typ || 'unknown'}.`;
+      }
+      if (
+        details.includes('bufferAppendError') ||
+        details.includes('fragParsingError') ||
+        details.includes('bufferAddCodecError')
+      ) {
+        if (ch.transcode) {
+          return 'Transcoded stream failed — check the server console for ffmpeg errors.';
+        }
+        return 'Browser cannot decode this stream (often MPEG-2 or AC3 in .ts). Try transcode:URL (needs ffmpeg) or Safari.';
+      }
+      if (
+        details.includes('manifestLoadError') ||
+        details.includes('levelLoadError') ||
+        details.includes('fragLoadError') ||
+        typ === 'networkError'
+      ) {
+        return 'Could not load playlist or segments (network, 403, or CORS). Check the URL.';
+      }
+      return `Playback failed: ${details || typ || 'unknown'}.`;
+    }
+
+    if (typeof Hls !== 'undefined' && Hls.isSupported()) {
+      const hls = new Hls({
+        enableWorker: false,
+      });
+      hls.loadSource(playbackUrl);
+      hls.attachMedia(video);
+      video._hls = hls;
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        video.play().catch(() => {});
+      });
+      hls.on(Hls.Events.ERROR, (_, data) => {
+        if (data.fatal) fail(formatHlsFatalError(data));
+      });
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = playbackUrl;
+      video.play().catch(() => {});
+    } else {
+      fail('HLS not supported in this browser.');
+    }
+
+    cell.appendChild(video);
+    const lab = document.createElement('div');
+    lab.className = 'cell-label';
+    lab.textContent = formatChannelLabel(ch);
+    cell.appendChild(lab);
+  }
+
+  /**
    * Build one grid cell. Sets data-channel-key so we can reuse DOM across polls
    * (avoids tearing down Twitch embeds when hide-offline toggles other channels).
    */
@@ -1181,11 +1267,16 @@
 
     if (t === 'twitch') {
       const login = getTwitchLogin(ch);
-      attachTwitchEmbedCell(cell, login);
-      const lab = document.createElement('div');
-      lab.className = 'cell-label';
-      lab.textContent = login;
-      cell.appendChild(lab);
+      if (twitchPlayback === 'hls') {
+        const playbackUrl = `${location.origin}/api/twitch-live/${encodeURIComponent(login)}/playlist.m3u8`;
+        mountHlsVideoInCell(cell, ch, playbackUrl, { twitchHls: true });
+      } else {
+        attachTwitchEmbedCell(cell, login);
+        const lab = document.createElement('div');
+        lab.className = 'cell-label';
+        lab.textContent = login;
+        cell.appendChild(lab);
+      }
     } else if (t === 'youtube') {
       const iframe = document.createElement('iframe');
       iframe.src = youtubeEmbedSrc(ch.id);
@@ -1221,71 +1312,7 @@
         ? `${location.origin}/api/transcode/${ch.transcodeHash}/playlist.m3u8?source=${encodeURIComponent(url)}`
         : url;
 
-      const video = document.createElement('video');
-      video.className = 'cell-video';
-      video.controls = true;
-      video.muted = true;
-      video.playsInline = true;
-      video.setAttribute('playsinline', '');
-      video.autoplay = true;
-
-      const fail = (msg) => {
-        if (cell.querySelector('.cell-hls-error')) return;
-        const errEl = document.createElement('div');
-        errEl.className = 'cell-hls-error';
-        errEl.textContent = msg;
-        cell.appendChild(errEl);
-      };
-
-      function formatHlsFatalError(data) {
-        const details = data && data.details ? String(data.details) : '';
-        const typ = data && data.type != null ? String(data.type) : '';
-        if (
-          details.includes('bufferAppendError') ||
-          details.includes('fragParsingError') ||
-          details.includes('bufferAddCodecError')
-        ) {
-          if (ch.transcode) {
-            return 'Transcoded stream failed — check the server console for ffmpeg errors.';
-          }
-          return 'Browser cannot decode this stream (often MPEG-2 or AC3 in .ts). Try transcode:URL (needs ffmpeg) or Safari.';
-        }
-        if (
-          details.includes('manifestLoadError') ||
-          details.includes('levelLoadError') ||
-          details.includes('fragLoadError') ||
-          typ === 'networkError'
-        ) {
-          return 'Could not load playlist or segments (network, 403, or CORS). Check the URL.';
-        }
-        return `Playback failed: ${details || typ || 'unknown'}.`;
-      }
-
-      if (typeof Hls !== 'undefined' && Hls.isSupported()) {
-        const hls = new Hls({
-          enableWorker: false,
-        });
-        hls.loadSource(playbackUrl);
-        hls.attachMedia(video);
-        video._hls = hls;
-        hls.on(Hls.Events.MANIFEST_PARSED, () => {
-          video.play().catch(() => {});
-        });
-        hls.on(Hls.Events.ERROR, (_, data) => {
-          if (data.fatal) fail(formatHlsFatalError(data));
-        });
-      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-        video.src = playbackUrl;
-        video.play().catch(() => {});
-      } else {
-        fail('HLS not supported in this browser.');
-      }
-
-      cell.appendChild(video);
-      const lab = document.createElement('div');
-      lab.className = 'cell-label';
-      lab.textContent = formatChannelLabel(ch);
-      cell.appendChild(lab);
+      mountHlsVideoInCell(cell, ch, playbackUrl, {});
     }
 
     return cell;
@@ -1731,7 +1758,7 @@
       }
       const cells = grid.querySelectorAll('.cell');
       console.log(
-        `[twitchviewer] ${cells.length} Twitch cell(s). Lines from player.twitch.tv are from Twitch’s embed, not this app.`
+        `[twitchviewer] ${cells.length} grid cell(s). Twitch mode: ${twitchPlayback} (hls = same-origin video via streamlink+ffmpeg; iframe = Twitch embed).`
       );
       cells.forEach((cell, i) => {
         const r = cell.getBoundingClientRect();
@@ -1739,17 +1766,23 @@
         const h = Math.round(r.height);
         const sizeOk = w >= GRID_MIN_CELL_W && h >= GRID_MIN_CELL_H;
         const iframe = cell.querySelector('iframe[src*="player.twitch.tv"]');
-        const allow = iframe ? iframe.getAttribute('allow') || '' : '';
-        const hasAllowAutoplay = /\bautoplay\b/i.test(allow);
-        const src = iframe ? iframe.getAttribute('src') || '' : '';
-        const parentOk = /[?&]parent=/.test(src);
-        console.log(
-          `  [${i}] ${w}×${h}px ${sizeOk ? 'OK' : 'BELOW min'} (${GRID_MIN_CELL_W}×${GRID_MIN_CELL_H}) | allow autoplay: ${hasAllowAutoplay ? 'yes' : 'MISSING'} | parent=: ${parentOk ? 'yes' : 'no'}`
-        );
+        const video = cell.querySelector('video.cell-video');
+        if (video) {
+          console.log(
+            `  [${i}] ${w}×${h}px ${sizeOk ? 'OK' : 'BELOW min'} | HLS <video> (muted autoplay path)`
+          );
+        } else if (iframe) {
+          const allow = iframe.getAttribute('allow') || '';
+          const hasAllowAutoplay = /\bautoplay\b/i.test(allow);
+          const src = iframe.getAttribute('src') || '';
+          const parentOk = /[?&]parent=/.test(src);
+          console.log(
+            `  [${i}] ${w}×${h}px ${sizeOk ? 'OK' : 'BELOW min'} | iframe allow autoplay: ${hasAllowAutoplay ? 'yes' : 'MISSING'} | parent=: ${parentOk ? 'yes' : 'no'}`
+          );
+        } else {
+          console.log(`  [${i}] ${w}×${h}px (no video/iframe yet)`);
+        }
       });
-      console.log(
-        '[twitchviewer] If Twitch still blocks autoplay: domain policy, offline stream, mobile (tap required), CSS transforms, or browser extensions that inject into player.twitch.tv (see console guide on load). Docs: https://dev.twitch.tv/docs/embed/'
-      );
     };
   }
 
@@ -1766,6 +1799,9 @@
       const st = await fetch('/api/status', FETCH_OPTS);
       const j = await st.json();
       apiConfigured = Boolean(j.configured);
+      if (j.twitchPlayback === 'hls' || j.twitchPlayback === 'iframe') {
+        twitchPlayback = j.twitchPlayback;
+      }
     } catch {
       apiConfigured = false;
     }
@@ -1777,7 +1813,7 @@
     fullRender();
     schedulePoll();
     console.info(
-      '[twitchviewer] Twitch "style visibility" / "viewport visibility" come from player.twitch.tv (see https://dev.twitch.tv/docs/embed/). This app matches parent= to your URL, pixel-sized iframes, and nudges cells into view when the grid scrolls. Run twitchviewerAutoplayDiagnostics() for per-cell sizes.'
+      `[twitchviewer] Twitch playback: ${twitchPlayback}. With streamlink+ffmpeg on the server, Twitch uses HLS (reliable muted autoplay). Otherwise the official iframe embed is used. Run twitchviewerAutoplayDiagnostics().`
     );
     window.addEventListener('resize', scheduleLayoutGridToViewport);
     if (window.visualViewport) {

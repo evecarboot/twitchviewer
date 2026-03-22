@@ -3,7 +3,7 @@ const fs = require('fs');
 const crypto = require('crypto');
 const http = require('http');
 const https = require('https');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const express = require('express');
 const session = require('express-session');
 const FileStore = require('session-file-store')(session);
@@ -163,11 +163,39 @@ app.use(
   })
 );
 
+function isStreamlinkAvailable() {
+  try {
+    const r = spawnSync('streamlink', ['--version'], {
+      encoding: 'utf8',
+      timeout: 10_000,
+      windowsHide: true,
+    });
+    return r.status === 0;
+  } catch {
+    return false;
+  }
+}
+
+/** @type {boolean | null} */
+let streamlinkCached = null;
+function streamlinkWorks() {
+  if (streamlinkCached === null) streamlinkCached = isStreamlinkAvailable();
+  return streamlinkCached;
+}
+
 app.get('/api/status', (req, res) => {
   const configured = Boolean(
     process.env.TWITCH_CLIENT_ID && process.env.TWITCH_CLIENT_SECRET
   );
-  res.json({ configured });
+  const forceIframe = process.env.TWITCH_PLAYBACK === 'iframe';
+  const sl = streamlinkWorks();
+  const twitchPlayback =
+    !forceIframe && sl ? 'hls' : 'iframe';
+  res.json({
+    configured,
+    twitchPlayback,
+    twitchHlsAvailable: sl,
+  });
 });
 
 app.get('/api/me', async (req, res) => {
@@ -606,6 +634,123 @@ app.get('/api/transcode/:hash/:segment', (req, res) => {
   });
 });
 
+function normalizeTwitchLoginParam(s) {
+  const t = String(s || '').trim().toLowerCase();
+  if (!/^[a-z0-9_]{3,25}$/.test(t)) return null;
+  return t;
+}
+
+function twitchLiveSourceKey(login) {
+  return `twitch://live/${login}`;
+}
+
+function resolveStreamlinkStreamUrl(login) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(
+      'streamlink',
+      ['--stream-url', `https://www.twitch.tv/${login}`, 'best'],
+      { windowsHide: true }
+    );
+    let out = '';
+    let errBuf = '';
+    proc.stdout.on('data', (d) => {
+      out += d.toString();
+    });
+    proc.stderr.on('data', (d) => {
+      errBuf += d.toString();
+    });
+    proc.on('error', (e) => {
+      reject(
+        new Error(
+          `streamlink: ${e.message}. Install from https://streamlink.github.io/ and ensure it is on PATH.`
+        )
+      );
+    });
+    proc.on('exit', (code) => {
+      if (code !== 0) {
+        const msg = (errBuf || out || '').trim() || `exit ${code}`;
+        reject(
+          new Error(
+            `streamlink failed (stream offline, wrong name, or error): ${msg.slice(0, 500)}`
+          )
+        );
+        return;
+      }
+      const lines = out.trim().split(/\r?\n/).filter(Boolean);
+      const url = lines[lines.length - 1];
+      if (!url || !/^https?:\/\//i.test(url)) {
+        reject(new Error('streamlink did not return a stream URL'));
+        return;
+      }
+      resolve(url);
+    });
+  });
+}
+
+/**
+ * Twitch → HLS in-browser: streamlink resolves a temporary CDN URL, ffmpeg re-segments
+ * to same-origin /api/twitch-live/:login/… (reliable muted autoplay vs iframe embed).
+ */
+app.get('/api/twitch-live/:login/:file', async (req, res) => {
+  const login = normalizeTwitchLoginParam(req.params.login);
+  const file = String(req.params.file || '');
+  if (!login) {
+    return res.status(400).type('text').send('Invalid login');
+  }
+  if (!streamlinkWorks()) {
+    return res
+      .status(503)
+      .type('text')
+      .send(
+        'streamlink is not available on the server PATH. Install: https://streamlink.github.io/ or set TWITCH_PLAYBACK=iframe in .env'
+      );
+  }
+
+  const sourceKey = twitchLiveSourceKey(login);
+  const hash = transcodeHash(sourceKey);
+
+  if (file === 'playlist.m3u8') {
+    if (!transcodeState.has(hash)) {
+      try {
+        const streamUrl = await resolveStreamlinkStreamUrl(login);
+        startFfmpegIfNeeded(hash, streamUrl);
+      } catch (e) {
+        return res.status(503).type('text').send(String(e.message));
+      }
+    }
+    const entry = transcodeState.get(hash);
+    if (entry && entry.error) {
+      return res.status(503).type('text').send(`ffmpeg: ${entry.error}`);
+    }
+    if (!entry) {
+      return res.status(503).type('text').send('Transcoder not running.');
+    }
+    const playlistPath = path.join(entry.dir, 'playlist.m3u8');
+    const ok = await waitForFile(playlistPath, 30000);
+    if (!ok) {
+      return res
+        .status(503)
+        .type('text')
+        .send(
+          'Playlist not ready. Check ffmpeg (PATH), streamlink, and that the channel is live.'
+        );
+    }
+    return res.sendFile(playlistPath);
+  }
+
+  if (!/^seg_\d+\.ts$/i.test(file)) {
+    return res.status(404).end();
+  }
+  const entry = transcodeState.get(hash);
+  if (!entry || entry.error) {
+    return res.status(404).end();
+  }
+  const filePath = path.join(entry.dir, file);
+  res.sendFile(filePath, (err) => {
+    if (err) res.status(404).end();
+  });
+});
+
 app.get('/', (_req, res) => {
   res.sendFile(path.join(root, 'index.html'));
 });
@@ -770,6 +915,15 @@ function printStartupTips(scheme, tlsInfo) {
   console.log(
     'HLS transcode: install ffmpeg and add to PATH, then add streams as transcode:https://…/playlist.m3u8'
   );
+  if (streamlinkWorks()) {
+    console.log(
+      'Twitch channels: streamlink detected — playback uses HLS (same-origin) for muted autoplay. Set TWITCH_PLAYBACK=iframe in .env to force the official embed instead.'
+    );
+  } else {
+    console.log(
+      'Twitch channels: streamlink not on PATH — using the official Twitch iframe embed. Install https://streamlink.github.io/ + ffmpeg for HLS-based autoplay.'
+    );
+  }
 }
 
 async function startServer() {
