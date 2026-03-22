@@ -49,6 +49,14 @@
             <input type="checkbox" id="hide-offline" />
             Hide offline
           </label>
+          <button
+            type="button"
+            class="ghost"
+            id="refresh-streams"
+            title="Check who is live now (same as the automatic check every 45s)"
+          >
+            Refresh streams
+          </button>
           <label class="check">
             <input type="checkbox" id="show-chat" />
             Show chat
@@ -62,8 +70,8 @@
             Chat on left
           </label>
           <label class="select-label" id="chat-channel-wrap" hidden>
-            Chat for
-            <select id="chat-channel" aria-label="Channel for chat panel"></select>
+            Chat channel
+            <select id="chat-channel" aria-label="Twitch channel for chat"></select>
           </label>
           <button type="button" class="ghost" id="toolbar-toggle" title="Hide toolbar">
             Hide bar
@@ -105,7 +113,14 @@
         <div class="grid" id="grid" aria-live="polite"></div>
         <aside class="chat-panel" id="chat-panel" hidden aria-label="Twitch chat">
           <div class="chat-panel-header">
-            <span id="chat-panel-title">Chat</span>
+            <div class="chat-panel-header-main">
+              <span class="chat-panel-heading">Chat</span>
+              <select
+                id="chat-channel-panel"
+                class="chat-channel-select"
+                aria-label="Twitch channel for chat"
+              ></select>
+            </div>
             <button type="button" class="ghost" id="close-chat" title="Hide chat panel">
               ×
             </button>

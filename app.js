@@ -36,6 +36,7 @@
     addForm: document.getElementById('add-form'),
     channelInput: document.getElementById('channel-input'),
     hideOffline: document.getElementById('hide-offline'),
+    refreshStreams: document.getElementById('refresh-streams'),
     showChat: document.getElementById('show-chat'),
     hideChatPanelWrap: document.getElementById('hide-chat-panel-wrap'),
     hideChatPanel: document.getElementById('hide-chat-panel'),
@@ -54,7 +55,7 @@
     grid: document.getElementById('grid'),
     chatPanel: document.getElementById('chat-panel'),
     chatIframeWrap: document.getElementById('chat-iframe-wrap'),
-    chatPanelTitle: document.getElementById('chat-panel-title'),
+    chatChannelPanel: document.getElementById('chat-channel-panel'),
     closeChat: document.getElementById('close-chat'),
     offlineBar: document.getElementById('offline-bar'),
     authLogin: document.getElementById('auth-login'),
@@ -326,6 +327,7 @@
         }
         saveState();
         fullRender();
+        schedulePoll();
       });
       chip.appendChild(rm);
 
@@ -357,17 +359,23 @@
 
   function renderChatSelect() {
     const prev = state.chatForLogin;
-    els.chatChannel.innerHTML = '';
-    state.channels.forEach((login) => {
-      const opt = document.createElement('option');
-      opt.value = login;
-      opt.textContent = login;
-      els.chatChannel.appendChild(opt);
-    });
+    const selects = [els.chatChannel, els.chatChannelPanel].filter(Boolean);
+    for (const sel of selects) {
+      sel.innerHTML = '';
+      state.channels.forEach((login) => {
+        const opt = document.createElement('option');
+        opt.value = login;
+        opt.textContent = login;
+        sel.appendChild(opt);
+      });
+    }
     if (state.channels.length) {
       if (!state.channels.includes(prev)) state.chatForLogin = state.channels[0];
-      els.chatChannel.value = state.chatForLogin || state.channels[0];
-      state.chatForLogin = els.chatChannel.value;
+      const v = state.chatForLogin || state.channels[0];
+      state.chatForLogin = v;
+      for (const sel of selects) {
+        sel.value = v;
+      }
     } else {
       state.chatForLogin = null;
     }
@@ -381,7 +389,6 @@
     iframe.src = chatSrc(state.chatForLogin);
     iframe.title = `Twitch chat: ${state.chatForLogin}`;
     els.chatIframeWrap.appendChild(iframe);
-    els.chatPanelTitle.textContent = `Chat — ${state.chatForLogin}`;
   }
 
   function renderGrid() {
@@ -521,6 +528,18 @@
     });
   });
 
+  if (els.refreshStreams) {
+    els.refreshStreams.addEventListener('click', async () => {
+      if (!state.channels.length) return;
+      els.refreshStreams.disabled = true;
+      try {
+        await tick();
+      } finally {
+        updateRefreshStreamsButton();
+      }
+    });
+  }
+
   els.showChat.addEventListener('change', () => {
     state.showChat = els.showChat.checked;
     if (!state.showChat) {
@@ -546,11 +565,23 @@
     });
   }
 
-  els.chatChannel.addEventListener('change', () => {
-    state.chatForLogin = els.chatChannel.value;
+  function onChatChannelPick(source) {
+    const v = source.value;
+    state.chatForLogin = v;
+    if (els.chatChannel && source !== els.chatChannel) els.chatChannel.value = v;
+    if (els.chatChannelPanel && source !== els.chatChannelPanel) {
+      els.chatChannelPanel.value = v;
+    }
     saveState();
     renderChatIframe();
-  });
+  }
+
+  els.chatChannel.addEventListener('change', () => onChatChannelPick(els.chatChannel));
+  if (els.chatChannelPanel) {
+    els.chatChannelPanel.addEventListener('change', () =>
+      onChatChannelPick(els.chatChannelPanel)
+    );
+  }
 
   els.toolbarToggle.addEventListener('click', () => {
     state.toolbarCollapsed = true;
@@ -686,9 +717,6 @@
       apiConfigured = false;
     }
     renderChatSelect();
-    if (state.chatForLogin && state.channels.includes(state.chatForLogin)) {
-      els.chatChannel.value = state.chatForLogin;
-    }
     await refreshOnly();
     await refreshAuth();
     fullRender();

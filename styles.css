@@ -360,9 +360,36 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 0.5rem;
   padding: 0.35rem 0.5rem;
   border-bottom: 1px solid var(--border);
   font-size: 0.9rem;
+}
+
+.chat-panel-header-main {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
+  flex: 1;
+}
+
+.chat-panel-heading {
+  flex-shrink: 0;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.chat-channel-select {
+  flex: 1;
+  min-width: 0;
+  max-width: 100%;
+  padding: 0.25rem 0.35rem;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 0.85rem;
 }
 
 .chat-iframe-wrap {
