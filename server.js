@@ -1,7 +1,9 @@
 const path = require('path');
+const fs = require('fs');
 const crypto = require('crypto');
 const http = require('http');
 const https = require('https');
+const { spawn } = require('child_process');
 const express = require('express');
 const session = require('express-session');
 const FileStore = require('session-file-store')(session);
@@ -382,6 +384,212 @@ app.get('/api/streams', async (req, res) => {
   }
 });
 
+/** --- HLS transcoding (ffmpeg → H.264/AAC for browsers that can't play MPEG-2 TS) --- */
+
+function isAllowedHttpUrl(s) {
+  try {
+    const u = new URL(s);
+    return u.protocol === 'http:' || u.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+function transcodeHash(url) {
+  return crypto.createHash('sha256').update(String(url)).digest('hex');
+}
+
+/** @type {Map<string, { url: string, dir: string, proc: import('child_process').ChildProcess | null, error?: string }>} */
+const transcodeState = new Map();
+
+function killAllTranscoders() {
+  for (const [, v] of transcodeState) {
+    if (v.proc && !v.proc.killed) {
+      try {
+        v.proc.kill('SIGKILL');
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+  transcodeState.clear();
+}
+
+process.on('exit', killAllTranscoders);
+process.on('SIGINT', killAllTranscoders);
+process.on('SIGTERM', killAllTranscoders);
+
+function startFfmpegIfNeeded(hash, url) {
+  const existing = transcodeState.get(hash);
+  if (existing && existing.proc && !existing.error) return;
+  if (existing && existing.error) transcodeState.delete(hash);
+  const dir = path.join(root, '.hls-transcode', hash);
+  fs.mkdirSync(dir, { recursive: true });
+  const playlist = path.join(dir, 'playlist.m3u8');
+  const segPattern = path.join(dir, 'seg_%03d.ts').replace(/\\/g, '/');
+  const playlistArg = playlist.replace(/\\/g, '/');
+
+  const preset = (process.env.FFMPEG_PRESET || 'veryfast').trim() || 'veryfast';
+  const vfArgs = [];
+  const maxH = process.env.FFMPEG_MAX_HEIGHT;
+  if (maxH && /^\d+$/.test(String(maxH).trim())) {
+    vfArgs.push('-vf', `scale=-2:${String(maxH).trim()}`);
+  }
+
+  const proc = spawn(
+    'ffmpeg',
+    [
+      '-y',
+      '-loglevel',
+      'warning',
+      '-fflags',
+      '+genpts',
+      '-i',
+      url,
+      ...vfArgs,
+      '-c:v',
+      'libx264',
+      '-preset',
+      preset,
+      '-tune',
+      'zerolatency',
+      '-c:a',
+      'aac',
+      '-b:a',
+      '128k',
+      '-ar',
+      '48000',
+      '-f',
+      'hls',
+      '-hls_time',
+      '2',
+      '-hls_list_size',
+      '8',
+      '-hls_flags',
+      'delete_segments+append_list',
+      '-hls_segment_filename',
+      segPattern,
+      playlistArg,
+    ],
+    { stdio: ['ignore', 'ignore', 'pipe'] }
+  );
+
+  const entry = { url, dir, proc };
+  transcodeState.set(hash, entry);
+
+  proc.stderr.on('data', (buf) => {
+    if (process.env.DEBUG_FFMPEG) {
+      process.stderr.write(buf);
+    }
+  });
+  proc.on('error', (err) => {
+    console.error(
+      '[transcode] ffmpeg not found or failed to start. Install ffmpeg and add it to PATH.',
+      err.message
+    );
+    entry.error = err.message;
+    entry.proc = null;
+  });
+  proc.on('exit', (code) => {
+    if (code !== 0 && code !== null) {
+      console.warn(
+        `[transcode] ffmpeg exited with code ${code} for ${hash.slice(0, 8)}…`
+      );
+    }
+    transcodeState.delete(hash);
+  });
+}
+
+async function waitForFile(filePath, timeoutMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      await fs.promises.access(filePath, fs.constants.R_OK);
+      const st = await fs.promises.stat(filePath);
+      if (st.size > 0) return true;
+    } catch {
+      /* not ready */
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  return false;
+}
+
+app.get('/api/transcode/hash', (req, res) => {
+  const url = req.query.url;
+  if (!url || !isAllowedHttpUrl(String(url))) {
+    return res.status(400).json({ error: 'Invalid or missing url' });
+  }
+  res.json({ hash: transcodeHash(String(url)) });
+});
+
+app.get('/api/transcode/status', (_req, res) => {
+  const p = spawn('ffmpeg', ['-version'], { stdio: 'ignore' });
+  let done = false;
+  const finish = (ok) => {
+    if (done) return;
+    done = true;
+    res.json({ ffmpeg: ok });
+  };
+  p.on('error', () => finish(false));
+  p.on('exit', (code) => finish(code === 0));
+});
+
+app.get('/api/transcode/:hash/playlist.m3u8', async (req, res) => {
+  const hash = req.params.hash;
+  const source = req.query.source ? String(req.query.source) : '';
+  if (source) {
+    if (!isAllowedHttpUrl(source)) {
+      return res.status(400).send('Invalid source URL');
+    }
+    if (transcodeHash(source) !== hash) {
+      return res.status(400).send('Hash does not match source URL');
+    }
+    startFfmpegIfNeeded(hash, source);
+  } else if (!transcodeState.has(hash)) {
+    return res
+      .status(400)
+      .send(
+        'Missing ?source= URL query (required the first time after server start).'
+      );
+  }
+
+  const entry = transcodeState.get(hash);
+  if (entry && entry.error) {
+    return res.status(503).type('text').send(`ffmpeg: ${entry.error}`);
+  }
+  if (!entry) {
+    return res.status(503).type('text').send('Transcoder not running.');
+  }
+
+  const playlistPath = path.join(entry.dir, 'playlist.m3u8');
+  const ok = await waitForFile(playlistPath, 30000);
+  if (!ok) {
+    return res
+      .status(503)
+      .type('text')
+      .send(
+        'Playlist not ready. Is ffmpeg installed? Check the server console for ffmpeg errors.'
+      );
+  }
+  res.sendFile(playlistPath);
+});
+
+app.get('/api/transcode/:hash/:segment', (req, res) => {
+  const { hash, segment } = req.params;
+  if (!/^seg_\d+\.ts$/i.test(segment)) {
+    return res.status(404).end();
+  }
+  const entry = transcodeState.get(hash);
+  if (!entry || entry.error) {
+    return res.status(404).end();
+  }
+  const filePath = path.join(entry.dir, segment);
+  res.sendFile(filePath, (err) => {
+    if (err) res.status(404).end();
+  });
+});
+
 app.get('/', (_req, res) => {
   res.sendFile(path.join(root, 'index.html'));
 });
@@ -439,6 +647,9 @@ function printStartupTips(scheme) {
       'Tip: set SESSION_SECRET in .env so login cookies stay valid after restarts.'
     );
   }
+  console.log(
+    'HLS transcode: install ffmpeg and add to PATH, then add streams as transcode:https://…/playlist.m3u8'
+  );
 }
 
 async function startServer() {

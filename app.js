@@ -29,6 +29,8 @@
   let pollFailed = false;
   let onlineSet = new Set();
   let pollTimer = null;
+  /** @type {IntersectionObserver[]} */
+  let cellObservers = [];
   /** @type {Set<string>} */
   let followModalSelection = new Set();
 
@@ -125,8 +127,13 @@
     }
     if (c.type === 'hls' && c.url && typeof c.url === 'string') {
       const url = String(c.url).trim();
-      if (/^https?:\/\//i.test(url)) return { type: 'hls', url };
-      return null;
+      if (!/^https?:\/\//i.test(url)) return null;
+      const out = { type: 'hls', url };
+      if (c.transcode) out.transcode = true;
+      if (typeof c.transcodeHash === 'string' && c.transcodeHash) {
+        out.transcodeHash = c.transcodeHash;
+      }
+      return out;
     }
     return null;
   }
@@ -146,7 +153,7 @@
     const t = getChannelType(ch);
     if (t === 'twitch') return `t:${getTwitchLogin(ch)}`;
     if (t === 'youtube') return `y:${ch.id}`;
-    if (t === 'hls') return `h:${ch.url}`;
+    if (t === 'hls') return ch.transcode ? `ht:${ch.url}` : `h:${ch.url}`;
     return '';
   }
 
@@ -154,7 +161,10 @@
     const t = getChannelType(ch);
     if (t === 'twitch') return getTwitchLogin(ch);
     if (t === 'youtube') return `YT: ${ch.id}`;
-    if (t === 'hls') return `HLS: ${hlsShortLabel(ch.url)}`;
+    if (t === 'hls') {
+      const short = hlsShortLabel(ch.url);
+      return ch.transcode ? `HLS (ffmpeg): ${short}` : `HLS: ${short}`;
+    }
     return '?';
   }
 
@@ -218,6 +228,13 @@
         : `https://youtu.be/${rest}`;
       const yt = extractYoutubeId(url);
       return yt ? { type: 'youtube', id: yt } : null;
+    }
+    if (/^transcode:/i.test(s)) {
+      const rest = s.replace(/^transcode:/i, '').trim();
+      if (/^https?:\/\//i.test(rest)) {
+        return { type: 'hls', url: rest, transcode: true };
+      }
+      return null;
     }
     if (/^hls:/i.test(s)) {
       const rest = s.replace(/^hls:/i, '').trim();
@@ -589,7 +606,101 @@
     });
   }
 
+  function disconnectCellObservers() {
+    cellObservers.forEach((o) => o.disconnect());
+    cellObservers = [];
+  }
+
+  function attachCellObserversToGrid() {
+    if (!els.grid || typeof IntersectionObserver === 'undefined') return;
+
+    els.grid.querySelectorAll('.cell').forEach((cell) => {
+      const iframe = cell.querySelector('iframe');
+      const video = cell.querySelector('video.cell-video');
+      if (!iframe && !video) return;
+
+      const obs = new IntersectionObserver(
+        (entries) => {
+          entries.forEach((entry) => {
+            const visible = entry.isIntersecting;
+            if (iframe) {
+              if (!visible) {
+                if (
+                  iframe.src &&
+                  iframe.src !== 'about:blank' &&
+                  !iframe.dataset._offscreenSrc
+                ) {
+                  iframe.dataset._offscreenSrc = iframe.src;
+                  iframe.src = 'about:blank';
+                }
+              } else if (iframe.dataset._offscreenSrc) {
+                iframe.src = iframe.dataset._offscreenSrc;
+                delete iframe.dataset._offscreenSrc;
+              }
+            }
+            if (video) {
+              const hls = video._hls;
+              if (!visible) {
+                video.pause();
+                if (hls && typeof hls.stopLoad === 'function') {
+                  try {
+                    hls.stopLoad();
+                  } catch {
+                    /* ignore */
+                  }
+                }
+              } else {
+                if (hls && typeof hls.startLoad === 'function') {
+                  try {
+                    hls.startLoad();
+                  } catch {
+                    /* ignore */
+                  }
+                }
+                video.play().catch(() => {});
+              }
+            }
+          });
+        },
+        { root: els.grid, rootMargin: '120px', threshold: 0.01 }
+      );
+      obs.observe(cell);
+      cellObservers.push(obs);
+    });
+  }
+
+  function suspendMediaWhenTabHidden() {
+    disconnectCellObservers();
+    destroyGridHls();
+    els.grid.querySelectorAll('iframe').forEach((fr) => {
+      if (fr.src && fr.src !== 'about:blank') {
+        fr.dataset._tabSuspendSrc = fr.src;
+        fr.src = 'about:blank';
+      }
+    });
+    els.grid.querySelectorAll('video.cell-video').forEach((v) => {
+      v.pause();
+      if (v._hls) {
+        v._hls.destroy();
+        v._hls = null;
+      }
+      v.removeAttribute('src');
+      try {
+        v.load();
+      } catch {
+        /* ignore */
+      }
+    });
+    const chatIframe =
+      els.chatIframeWrap && els.chatIframeWrap.querySelector('iframe');
+    if (chatIframe && chatIframe.src && chatIframe.src !== 'about:blank') {
+      chatIframe.dataset._tabSuspendSrc = chatIframe.src;
+      chatIframe.src = 'about:blank';
+    }
+  }
+
   function renderGrid() {
+    disconnectCellObservers();
     destroyGridHls();
     const visible = visibleChannels();
     const n = visible.length;
@@ -611,7 +722,6 @@
         iframe.title = `Twitch: ${login}`;
         iframe.setAttribute('width', '400');
         iframe.setAttribute('height', '300');
-        iframe.setAttribute('loading', 'eager');
         iframe.setAttribute(
           'allow',
           'autoplay; fullscreen; picture-in-picture; encrypted-media; clipboard-write'
@@ -627,7 +737,7 @@
         const iframe = document.createElement('iframe');
         iframe.src = youtubeEmbedSrc(ch.id);
         iframe.title = `YouTube: ${ch.id}`;
-        iframe.setAttribute('loading', 'eager');
+        iframe.setAttribute('loading', 'lazy');
         iframe.setAttribute(
           'allow',
           'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share'
@@ -640,6 +750,25 @@
         lab.textContent = `YT: ${ch.id}`;
         cell.appendChild(lab);
       } else if (t === 'hls') {
+        const url = ch.url;
+        if (ch.transcode && !ch.transcodeHash) {
+          const err = document.createElement('div');
+          err.className = 'cell-hls-error';
+          err.textContent =
+            'Transcode: missing hash — refresh the page or re-add as transcode:URL';
+          cell.appendChild(err);
+          const labEarly = document.createElement('div');
+          labEarly.className = 'cell-label';
+          labEarly.textContent = formatChannelLabel(ch);
+          cell.appendChild(labEarly);
+          els.grid.appendChild(cell);
+          return;
+        }
+
+        const playbackUrl = ch.transcode
+          ? `${location.origin}/api/transcode/${ch.transcodeHash}/playlist.m3u8?source=${encodeURIComponent(url)}`
+          : url;
+
         const video = document.createElement('video');
         video.className = 'cell-video';
         video.controls = true;
@@ -647,7 +776,6 @@
         video.playsInline = true;
         video.setAttribute('playsinline', '');
         video.autoplay = true;
-        const url = ch.url;
 
         const fail = (msg) => {
           if (cell.querySelector('.cell-hls-error')) return;
@@ -665,7 +793,10 @@
             details.includes('fragParsingError') ||
             details.includes('bufferAddCodecError')
           ) {
-            return 'Browser cannot decode this stream (often MPEG-2 or AC3 in .ts). Chrome/Edge usually need H.264/AAC HLS. Try Safari or another m3u8.';
+            if (ch.transcode) {
+              return 'Transcoded stream failed — check the server console for ffmpeg errors.';
+            }
+            return 'Browser cannot decode this stream (often MPEG-2 or AC3 in .ts). Try transcode:URL (needs ffmpeg) or Safari.';
           }
           if (
             details.includes('manifestLoadError') ||
@@ -685,7 +816,7 @@
           const hls = new Hls({
             enableWorker: false,
           });
-          hls.loadSource(url);
+          hls.loadSource(playbackUrl);
           hls.attachMedia(video);
           video._hls = hls;
           hls.on(Hls.Events.MANIFEST_PARSED, () => {
@@ -695,7 +826,7 @@
             if (data.fatal) fail(formatHlsFatalError(data));
           });
         } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-          video.src = url;
+          video.src = playbackUrl;
           video.play().catch(() => {});
         } else {
           fail('HLS not supported in this browser.');
@@ -723,6 +854,8 @@
     } else {
       els.offlineBar.hidden = true;
     }
+
+    attachCellObserversToGrid();
   }
 
   function applyToolbarLayout() {
@@ -807,15 +940,63 @@
     }
   }
 
-  els.addForm.addEventListener('submit', (e) => {
+  async function ensureTranscodeHashes() {
+    let changed = false;
+    for (const ch of state.channels) {
+      if (getChannelType(ch) === 'hls' && ch.transcode && !ch.transcodeHash) {
+        try {
+          const r = await fetch(
+            '/api/transcode/hash?' + new URLSearchParams({ url: ch.url }),
+            FETCH_OPTS
+          );
+          if (r.ok) {
+            const j = await r.json();
+            ch.transcodeHash = j.hash;
+            changed = true;
+          }
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    if (changed) saveState();
+  }
+
+  els.addForm.addEventListener('submit', async (e) => {
     e.preventDefault();
     const newCh = parseAddInput(els.channelInput.value);
     if (!newCh) {
       setMeta(
-        'Use a Twitch name, YouTube watch/live URL, or m3u8 URL (prefix yt: or hls: optional).',
+        'Twitch name, YouTube URL, m3u8 URL, or transcode:https://…/stream.m3u8 (needs ffmpeg for MPEG-2).',
         true
       );
       return;
+    }
+    if (newCh.type === 'hls' && newCh.transcode) {
+      try {
+        const r = await fetch(
+          '/api/transcode/hash?' + new URLSearchParams({ url: newCh.url }),
+          FETCH_OPTS
+        );
+        if (!r.ok) {
+          setMeta('Could not prepare transcode.', true);
+          return;
+        }
+        const j = await r.json();
+        newCh.transcodeHash = j.hash;
+        const st = await fetch('/api/transcode/status', FETCH_OPTS);
+        const sj = await st.json();
+        if (!sj.ffmpeg) {
+          setMeta(
+            'ffmpeg not found. Install ffmpeg, add it to PATH, restart the server, then try transcode:… again.',
+            true
+          );
+          return;
+        }
+      } catch {
+        setMeta('Could not reach /api/transcode (is the server running?)', true);
+        return;
+      }
     }
     if (!state.channels.some((c) => channelKey(c) === channelKey(newCh))) {
       state.channels.push(newCh);
@@ -921,6 +1102,14 @@
       applyChatLayout();
     });
   }
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+      suspendMediaWhenTabHidden();
+    } else {
+      fullRender();
+    }
+  });
 
   els.hideOffline.checked = state.hideOffline;
   els.showChat.checked = state.showChat;
@@ -1036,6 +1225,7 @@
       apiConfigured = false;
     }
     renderChatSelect();
+    await ensureTranscodeHashes();
     await refreshOnly();
     await refreshAuth();
     fullRender();

@@ -293,7 +293,9 @@ body {
   border-right: 1px solid var(--border);
 }
 
-/* Twitch’s iframe player only autoplays when the embed is ~≥400×300 CSS px. */
+/* Twitch’s iframe player only autoplays when the embed is ~≥400×300 CSS px.
+   Fixed 400×300 tracks (not 1fr): 1fr was stretching cells to fill the window,
+   which broke the intended size and could confuse autoplay sizing. */
 .grid {
   flex: 1;
   min-width: 0;
@@ -303,22 +305,29 @@ body {
   padding: 2px;
   background: #000;
   overflow: auto;
-  grid-template-columns: repeat(var(--cols, 2), minmax(400px, 1fr));
-  grid-template-rows: repeat(var(--rows, 1), minmax(300px, 1fr));
-  align-content: stretch;
-  justify-content: stretch;
+  grid-template-columns: repeat(var(--cols, 2), 400px);
+  grid-template-rows: repeat(var(--rows, 1), 300px);
+  justify-content: center;
+  align-content: start;
 }
 
 .grid.one-col {
-  grid-template-columns: minmax(400px, 1fr);
-  grid-template-rows: repeat(var(--rows, 1), minmax(300px, 1fr));
+  grid-template-columns: 400px;
+  grid-template-rows: repeat(var(--rows, 1), 300px);
 }
 
 .cell {
   position: relative;
+  width: 400px;
+  height: 300px;
   min-width: 400px;
   min-height: 300px;
+  max-width: 400px;
+  max-height: 300px;
   background: #000;
+  overflow: hidden;
+  content-visibility: auto;
+  contain-intrinsic-size: 400px 300px;
 }
 
 .cell iframe,
