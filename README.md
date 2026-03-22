@@ -10,7 +10,7 @@ By default the server uses **HTTPS** on port **3000** with a **self-signed** cer
 
 - [Node.js](https://nodejs.org/) 18+ (includes `npm`)
 - A [Twitch developer application](https://dev.twitch.tv/console/apps) if you use live/offline detection, login, or import follows (see [Twitch setup](#twitch-setup))
-- **[ffmpeg](https://ffmpeg.org/)** on your `PATH` if you use **`transcode:`** HLS URLs **or** Twitch **HLS** playback (see [HLS and transcoding](#hls-and-transcoding))
+- **[ffmpeg](https://ffmpeg.org/)** on your `PATH` (or **`FFMPEG_PATH`** in `.env`) if you use **`transcode:`** HLS URLs **or** Twitch **HLS** playback (see [HLS and transcoding](#hls-and-transcoding))
 - **[Streamlink](https://streamlink.github.io/)** on your `PATH` (or set **`STREAMLINK_PATH`**) for Twitch **HLS** mode — not needed if you force **`TWITCH_PLAYBACK=iframe`**
 
 ## Quick start
@@ -62,6 +62,7 @@ Copy `.env.example` to `.env` and set:
 | `SESSION_FILE_PATH` | No | Folder for **`sessions.sqlite`** (or set a full path ending in **`.sqlite`** / **`.db`**). Default: **`.sessions.sqlite`** next to the server on non-Windows; on **Windows** **`%LOCALAPPDATA%\twitchviewer\sessions.sqlite`**. Sessions use **SQLite** (not JSON files) to avoid Windows **`EPERM`** rename issues with antivirus/sync. |
 | `TWITCH_PLAYBACK` | No | Set **`iframe`** to always use Twitch’s official embed. If unset, the app uses **same-origin HLS** when **streamlink** and **ffmpeg** are available (better muted autoplay in the grid). |
 | `STREAMLINK_PATH` | No | Full path to **`streamlink.exe`** if Streamlink is not on `PATH` (common on Windows after a pip install). |
+| `FFMPEG_PATH` | No | Full path to **`ffmpeg.exe`** if ffmpeg is not on `PATH` (common on Windows with a manual zip install). |
 | `TWITCH_STREAMLINK_QUALITY` | No | Streamlink quality name (default **`720p60`**). If that name fails, the server tries **`720p30`**, **`480p30`**, …, **`best`** automatically (Twitch labels vary). |
 | `TWITCH_FFMPEG_PRESET` | No | x264 preset for Twitch **re-encode** (default **`ultrafast`**). Each live tile runs one ffmpeg process. |
 | `TWITCH_FFMPEG_MAX_HEIGHT` | No | Max video height for Twitch output (default **`720`**). Set **`0`** for no scaling, or **`TWITCH_FFMPEG_NO_SCALE=1`**. |
@@ -148,7 +149,7 @@ Never commit `.env` or share your client secret. `.gitignore` excludes `.env`, `
 - **Twitch: “could not load playlist” / spinner forever (HLS mode)**: The browser did not get a valid **`playlist.m3u8`**. Confirm the channel is **live**; run **`streamlink --stream-url https://www.twitch.tv/<login> best`** in a terminal; ensure **`ffmpeg -version`** works. Set **`STREAMLINK_PATH`** if Streamlink is not on `PATH`. For a quick workaround, set **`TWITCH_PLAYBACK=iframe`** in `.env` and restart (official embed, no local transcode).
 - **Twitch HLS stutters on fast internet**: Usually **CPU** (one **ffmpeg** re-encode per live tile), not bandwidth. Lower load with **`TWITCH_STREAMLINK_QUALITY`**, **`TWITCH_FFMPEG_MAX_HEIGHT`**, **`TWITCH_FFMPEG_PRESET`**, or use **`TWITCH_PLAYBACK=iframe`**.
 - **HLS fails in Chrome / “codec” errors**: Try **`transcode:`** with ffmpeg installed, or **Safari** for some native HLS feeds, or use a feed that is already **H.264/AAC**.
-- **`transcode:`** fails: Check **ffmpeg** is on `PATH` (`ffmpeg -version` in a terminal). Watch the **server console** for ffmpeg errors. Optionally set **`FFMPEG_MAX_HEIGHT`** / **`FFMPEG_PRESET`** to reduce load.
+- **`transcode:`** fails: Check **ffmpeg** (`ffmpeg -version` in a terminal, or set **`FFMPEG_PATH`**). Watch the **server console** for ffmpeg errors. Optionally set **`FFMPEG_MAX_HEIGHT`** / **`FFMPEG_PRESET`** to reduce load.
 
 ## License
 
