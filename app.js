@@ -11,28 +11,22 @@
 
   const STORAGE_KEY = 'twitchviewer:v1';
   /**
-   * sessionStorage: after a user gesture we load Twitch iframes (see twitchEmbedsDeferredUntilGesture).
-   * Chromium autoplay policy + Twitch’s embed both expect activation before the player URL loads.
+   * In-memory only (reset on every full page load). Do not use sessionStorage: it survives
+   * reloads and made us load player.twitch.tv without a fresh user gesture — browsers then
+   * show Twitch’s play overlay. Toolbar actions that run await before fullRender() also do
+   * not preserve activation; only a synchronous unlock (the gate) does.
    */
-  const PLAYBACK_OK_KEY = 'twitchviewer-playback-ok';
+  let twitchPlaybackUnlocked = false;
   const POLL_MS = 45_000;
 
   function recordPlaybackGesture() {
-    try {
-      sessionStorage.setItem(PLAYBACK_OK_KEY, '1');
-    } catch {
-      /* ignore */
-    }
+    twitchPlaybackUnlocked = true;
   }
 
   /** When true, Twitch cells use about:blank until recordPlaybackGesture() — do not load player.twitch.tv yet. */
   function twitchEmbedsDeferredUntilGesture() {
     if (!state.autoplayStreams) return false;
-    try {
-      return sessionStorage.getItem(PLAYBACK_OK_KEY) !== '1';
-    } catch {
-      return true;
-    }
+    return !twitchPlaybackUnlocked;
   }
   const FETCH_OPTS = { credentials: 'same-origin' };
 
@@ -951,11 +945,7 @@
   function setupPlaybackGate() {
     if (!els.playbackGate) return;
     const hasTwitch = state.channels.some((c) => getChannelType(c) === 'twitch');
-    if (
-      !state.autoplayStreams ||
-      !hasTwitch ||
-      sessionStorage.getItem(PLAYBACK_OK_KEY) === '1'
-    ) {
+    if (!state.autoplayStreams || !hasTwitch || twitchPlaybackUnlocked) {
       els.playbackGate.hidden = true;
       return;
     }
@@ -1065,9 +1055,6 @@
     els.channelInput.value = '';
     saveState();
     setMeta('', false);
-    if (getChannelType(newCh) === 'twitch') {
-      recordPlaybackGesture();
-    }
     tick().then(() => {
       fullRender();
       schedulePoll();
@@ -1075,7 +1062,6 @@
   });
 
   els.hideOffline.addEventListener('change', () => {
-    recordPlaybackGesture();
     state.hideOffline = els.hideOffline.checked;
     saveState();
     tick().then(() => {
@@ -1086,7 +1072,6 @@
 
   if (els.autoplayStreams) {
     els.autoplayStreams.addEventListener('change', () => {
-      recordPlaybackGesture();
       state.autoplayStreams = els.autoplayStreams.checked;
       saveState();
       fullRender();
@@ -1096,7 +1081,6 @@
   if (els.refreshStreams) {
     els.refreshStreams.addEventListener('click', async () => {
       if (!state.channels.length) return;
-      recordPlaybackGesture();
       els.refreshStreams.disabled = true;
       try {
         /* Always rebuild after a manual refresh: tick() skips renderGrid() when the
@@ -1281,7 +1265,7 @@
   (async function init() {
     if (els.playbackGate) {
       els.playbackGate.addEventListener('click', () => {
-        if (sessionStorage.getItem(PLAYBACK_OK_KEY) === '1') return;
+        if (twitchPlaybackUnlocked) return;
         recordPlaybackGesture();
         els.playbackGate.hidden = true;
         fullRender();
