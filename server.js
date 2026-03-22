@@ -163,9 +163,16 @@ app.use(
   })
 );
 
+/** Full path to streamlink.exe if not on PATH — see .env STREAMLINK_PATH */
+function streamlinkExecutable() {
+  const p = process.env.STREAMLINK_PATH?.trim();
+  return p || 'streamlink';
+}
+
 function isStreamlinkAvailable() {
+  const exe = streamlinkExecutable();
   try {
-    const r = spawnSync('streamlink', ['--version'], {
+    const r = spawnSync(exe, ['--version'], {
       encoding: 'utf8',
       timeout: 10_000,
       windowsHide: true,
@@ -646,11 +653,11 @@ function twitchLiveSourceKey(login) {
 
 function resolveStreamlinkStreamUrl(login) {
   return new Promise((resolve, reject) => {
-    const proc = spawn(
-      'streamlink',
-      ['--stream-url', `https://www.twitch.tv/${login}`, 'best'],
-      { windowsHide: true }
-    );
+    const proc = spawn(streamlinkExecutable(), [
+      '--stream-url',
+      `https://www.twitch.tv/${login}`,
+      'best',
+    ], { windowsHide: true });
     let out = '';
     let errBuf = '';
     proc.stdout.on('data', (d) => {
@@ -702,7 +709,7 @@ app.get('/api/twitch-live/:login/:file', async (req, res) => {
       .status(503)
       .type('text')
       .send(
-        'streamlink is not available on the server PATH. Install: https://streamlink.github.io/ or set TWITCH_PLAYBACK=iframe in .env'
+        'streamlink not found. Install from https://streamlink.github.io/ , set STREAMLINK_PATH in .env to streamlink.exe, or TWITCH_PLAYBACK=iframe'
       );
   }
 
@@ -921,7 +928,13 @@ function printStartupTips(scheme, tlsInfo) {
     );
   } else {
     console.log(
-      'Twitch channels: streamlink not on PATH — using the official Twitch iframe embed. Install https://streamlink.github.io/ + ffmpeg for HLS-based autoplay.'
+      'Twitch channels: streamlink not found — using the official Twitch iframe embed.'
+    );
+    console.log(
+      '  Install: https://streamlink.github.io/ or run install-streamlink.bat (Windows). Then restart the server.'
+    );
+    console.log(
+      '  If streamlink.exe is installed but not on PATH, set STREAMLINK_PATH in .env to the full path.'
     );
   }
 }
