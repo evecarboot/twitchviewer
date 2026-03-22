@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Twitch viewer</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div id="file-protocol" class="file-protocol" hidden>
+      <div class="file-protocol-inner">
+        <h1>Open this viewer over HTTP on your PC</h1>
+        <p>
+          Twitch does not allow embedded video when the page is opened as a file
+          (<code>file://</code> in the address bar). That is required by Twitch,
+          not a limitation of this project.
+        </p>
+        <p>
+          <strong>To run it locally:</strong> double-click
+          <strong>View Twitch Viewer.bat</strong> in this folder. It starts a
+          small server on your machine only and opens
+          <code>http://127.0.0.1:3000</code> in your browser.
+        </p>
+        <p>
+          The first time, install
+          <a href="https://nodejs.org/" target="_blank" rel="noopener"
+            >Node.js</a
+          >
+          if Windows reports that <code>node</code> was not found, then run the
+          batch file again.
+        </p>
+      </div>
+    </div>
+
+    <div id="app">
+      <header class="toolbar" id="toolbar">
+        <div class="toolbar-row">
+          <form class="add-form" id="add-form" autocomplete="off">
+            <input
+              type="text"
+              id="channel-input"
+              placeholder="Channel name"
+              spellcheck="false"
+              aria-label="Twitch channel name"
+            />
+            <button type="submit">Add</button>
+          </form>
+          <label class="check">
+            <input type="checkbox" id="hide-offline" />
+            Hide offline
+          </label>
+          <label class="check">
+            <input type="checkbox" id="show-chat" />
+            Show chat
+          </label>
+          <label class="select-label" id="chat-channel-wrap" hidden>
+            Chat for
+            <select id="chat-channel" aria-label="Channel for chat panel"></select>
+          </label>
+          <button type="button" class="ghost" id="toolbar-toggle" title="Hide toolbar">
+            Hide bar
+          </button>
+          <div class="auth-bar" id="auth-bar">
+            <a href="/auth/twitch" class="ghost auth-login" id="auth-login">Log in with Twitch</a>
+            <div class="auth-user-wrap" id="auth-user-wrap" hidden>
+              <img
+                class="auth-avatar"
+                id="auth-avatar"
+                alt=""
+                width="22"
+                height="22"
+                hidden
+              />
+              <span class="auth-user-label" id="auth-user-label"></span>
+              <button type="button" class="ghost" id="import-follows">
+                Import follows
+              </button>
+              <button type="button" class="ghost" id="edit-follow-selection" hidden>
+                Choose from follows
+              </button>
+              <a href="/auth/logout" class="ghost">Log out</a>
+            </div>
+          </div>
+        </div>
+        <div class="toolbar-meta" id="toolbar-meta"></div>
+        <div class="channel-list" id="channel-list"></div>
+      </header>
+
+      <button type="button" class="peek-tab" id="peek-tab" hidden title="Show toolbar">
+        ⋮
+      </button>
+
+      <main class="main" id="main">
+        <div class="grid" id="grid" aria-live="polite"></div>
+        <aside class="chat-panel" id="chat-panel" hidden>
+          <div class="chat-panel-header">
+            <span id="chat-panel-title">Chat</span>
+            <button type="button" class="ghost" id="close-chat" title="Hide chat">
+              ×
+            </button>
+          </div>
+          <div class="chat-iframe-wrap" id="chat-iframe-wrap"></div>
+        </aside>
+      </main>
+
+      <footer class="offline-bar" id="offline-bar" hidden></footer>
+    </div>
+
+    <div id="follow-modal" class="modal" hidden aria-hidden="true">
+      <div class="modal-backdrop" id="follow-modal-backdrop"></div>
+      <div
+        class="modal-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="follow-modal-title"
+      >
+        <h2 id="follow-modal-title" class="modal-title">Channels from your follows</h2>
+        <p class="modal-hint">
+          Choose which channels can appear in the grid. With <strong>Hide offline</strong>
+          on, only live channels are shown; the rest stay hidden until they go live.
+        </p>
+        <div class="modal-toolbar">
+          <input
+            type="search"
+            class="follow-filter"
+            id="follow-filter"
+            placeholder="Filter list…"
+            autocomplete="off"
+            aria-label="Filter follows"
+          />
+          <span class="follow-count" id="follow-count"></span>
+          <button type="button" class="ghost" id="follow-modal-refresh">
+            Refresh from Twitch
+          </button>
+        </div>
+        <div class="follow-list" id="follow-list"></div>
+        <div class="modal-actions">
+          <button type="button" class="ghost" id="follow-select-all">Select all</button>
+          <button type="button" class="ghost" id="follow-select-none">Select none</button>
+          <span class="modal-actions-spacer"></span>
+          <button type="button" class="ghost" id="follow-modal-cancel">Cancel</button>
+          <button type="button" class="ghost primary" id="follow-modal-save">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>
