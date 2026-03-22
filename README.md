@@ -4,6 +4,8 @@ A small **local** web app for watching **multiple Twitch channels** in one grid,
 
 Twitch embeds require a real `http://` or `https://` origin. This project ships a tiny **Node.js** server you run on your PC; opening the HTML file directly as `file://` will not load the player (Twitch’s rules).
 
+By default the server uses **HTTPS** with a **self-signed** certificate so OAuth redirect URLs can use `https://` (as Twitch often requires). Your browser will warn once; choose **Advanced → Continue** for local development only.
+
 ## Requirements
 
 - [Node.js](https://nodejs.org/) 18+ (includes `npm`)
@@ -24,16 +26,16 @@ Edit `.env` with your Twitch **Client ID** and **Client Secret** (see [Twitch se
 npm start
 ```
 
-Open [http://127.0.0.1:3000](http://127.0.0.1:3000) (or [http://localhost:3000](http://localhost:3000) if you prefer, and match your OAuth redirect — see below).
+Open [https://127.0.0.1:3000](https://127.0.0.1:3000) or [https://localhost:3000](https://localhost:3000) and accept the certificate warning the first time (self-signed, local only). Register the matching **`https://…/auth/callback`** URLs in Twitch (see below).
 
 On Windows you can double-click **`View Twitch Viewer.bat`** in the project folder: it runs `npm install` if needed, starts the server, and opens the browser.
 
 ## Twitch setup
 
 1. Go to the [Twitch Developer Console](https://dev.twitch.tv/console/apps) and **Register Your Application**.
-2. **OAuth Redirect URLs**: add the callback URL that matches how you open the app (must match **exactly**, including path and port):
-   - Default for this repo: **`http://127.0.0.1:3000/auth/callback`**
-   - If you only use `http://localhost:3000` in the browser, also add **`http://localhost:3000/auth/callback`** and set `TWITCH_REDIRECT_URI` in `.env` to that URL.
+2. **OAuth Redirect URLs**: add the callback URL that matches how you open the app (must match **exactly**, including **https**, host, port, and path):
+   - **`https://127.0.0.1:3000/auth/callback`** and/or **`https://localhost:3000/auth/callback`** (default server uses HTTPS).
+   - Twitch treats `localhost` and `127.0.0.1` as different — add both if you switch between them.
 3. **Client type**: **Confidential** (the server keeps the client secret).
 4. After creation, copy the **Client ID**. Generate a **Client Secret** (shown once) and put both in `.env`.
 
@@ -51,7 +53,8 @@ Copy `.env.example` to `.env` and set:
 | `TWITCH_CLIENT_ID` | Yes | From your Twitch app |
 | `TWITCH_CLIENT_SECRET` | Yes | From your Twitch app (Confidential apps) |
 | `PORT` | No | Server port (default `3000`) |
-| `TWITCH_REDIRECT_URI` | No | Must match a redirect URL registered on Twitch (default `http://127.0.0.1:PORT/auth/callback`) |
+| `TWITCH_REDIRECT_URI` | No | Must match a redirect URL on Twitch (default `https://127.0.0.1:PORT/auth/callback` when using HTTPS) |
+| `USE_HTTP` | No | Set to `true` to serve **HTTP only** (then use `http://…` OAuth URLs in Twitch) |
 | `SESSION_SECRET` | No | Random string used to sign login cookies (recommended) |
 
 Never commit `.env` or share your client secret. `.gitignore` already excludes `.env`.
@@ -75,8 +78,13 @@ Never commit `.env` or share your client secret. `.gitignore` already excludes `
 
 ## Troubleshooting
 
-- **Blank / blocked embeds**: Use `http://127.0.0.1:3000` or `http://localhost:3000`, not `file://`.
-- **OAuth / login errors**: Redirect URL in Twitch must match `TWITCH_REDIRECT_URI` (or the default) **exactly**. The server prints the expected callback URL when it starts.
+- **Blank / blocked embeds**: Use `https://127.0.0.1:3000` or `https://localhost:3000` (default), not `file://`.
+- **Browser warns about certificate / “not secure”**: Expected for the built-in **self-signed** certificate. For local use only, use **Advanced → Continue** (wording varies by browser).
+- **`ERR_SSL_PROTOCOL_ERROR` when opening `http://`**: The default server listens for **HTTPS** only. Either open **`https://127.0.0.1:3000`**, or set **`USE_HTTP=true`** in `.env` and use **`http://`** everywhere (including Twitch OAuth URLs).
+- **`redirect_mismatch` / “redirect_uri does not match registered URI”**:
+  - In the [Twitch Developer Console](https://dev.twitch.tv/console/apps), **OAuth Redirect URLs** must match **exactly** (including `https://` vs `http://`, host, port, and `/auth/callback`).
+  - Defaults: **`https://127.0.0.1:3000/auth/callback`** and **`https://localhost:3000/auth/callback`** — add the one(s) you use.
+  - Optional: set **`TWITCH_REDIRECT_URI`** in `.env` to one exact URL and add **that same** URL in Twitch.
 - **Live/offline not working**: Confirm `TWITCH_CLIENT_ID` and `TWITCH_CLIENT_SECRET` in `.env` and restart the server.
 
 ## License

@@ -1,7 +1,10 @@
 const path = require('path');
 const crypto = require('crypto');
+const http = require('http');
+const https = require('https');
 const express = require('express');
 const session = require('express-session');
+const selfsigned = require('selfsigned');
 require('dotenv').config();
 
 const app = express();
@@ -13,11 +16,35 @@ function getPort() {
   return Number(process.env.PORT) || 3000;
 }
 
-function getRedirectUri() {
+/** Set USE_HTTP=true in .env to serve plain HTTP only (OAuth redirect must use http:// too). */
+function useHttpOnly() {
+  return process.env.USE_HTTP === 'true';
+}
+
+/**
+ * OAuth redirect_uri must match the Twitch console exactly (https:// recommended).
+ * localhost vs 127.0.0.1 are different to Twitch.
+ * @param {import('express').Request} [req]
+ */
+function getRedirectUri(req) {
   if (process.env.TWITCH_REDIRECT_URI) {
-    return process.env.TWITCH_REDIRECT_URI.trim();
+    const u = process.env.TWITCH_REDIRECT_URI.trim();
+    if (
+      !useHttpOnly() &&
+      u.startsWith('http://') &&
+      /localhost|127\.0\.0\.1/.test(u)
+    ) {
+      console.warn(
+        '[twitchviewer] TWITCH_REDIRECT_URI uses http:// but the server uses HTTPS by default. Use https:// in .env and Twitch, or set USE_HTTP=true.'
+      );
+    }
+    return u;
   }
-  return `http://127.0.0.1:${getPort()}/auth/callback`;
+  const proto = useHttpOnly() ? 'http' : 'https';
+  if (req && typeof req.get === 'function' && req.get('host')) {
+    return `${proto}://${req.get('host')}/auth/callback`;
+  }
+  return `${proto}://127.0.0.1:${getPort()}/auth/callback`;
 }
 
 let tokenCache = { token: null, expiresAt: 0 };
@@ -101,6 +128,7 @@ app.use(
     saveUninitialized: false,
     cookie: {
       httpOnly: true,
+      secure: !useHttpOnly(),
       maxAge: 14 * 24 * 60 * 60 * 1000,
       sameSite: 'lax',
     },
@@ -136,7 +164,7 @@ app.get('/auth/twitch', (req, res) => {
   }
   const state = crypto.randomBytes(24).toString('hex');
   req.session.oauthState = state;
-  const redirectUri = getRedirectUri();
+  const redirectUri = getRedirectUri(req);
   const params = new URLSearchParams({
     client_id: clientId,
     redirect_uri: redirectUri,
@@ -165,7 +193,7 @@ app.get('/auth/callback', async (req, res) => {
 
   const clientId = process.env.TWITCH_CLIENT_ID;
   const clientSecret = process.env.TWITCH_CLIENT_SECRET;
-  const redirectUri = getRedirectUri();
+  const redirectUri = getRedirectUri(req);
   if (!clientId || !clientSecret) {
     return res.redirect('/?error=' + encodeURIComponent('Server missing Twitch credentials'));
   }
@@ -354,9 +382,42 @@ app.get('/app.js', (_req, res) => {
 });
 
 const port = getPort();
-app.listen(port, () => {
-  console.log(`Twitch viewer: http://localhost:${port}`);
-  console.log(`OAuth callback (add to Twitch app): ${getRedirectUri()}`);
+
+async function createTlsOptions() {
+  const attrs = [{ name: 'commonName', value: 'localhost' }];
+  const pems = await selfsigned.generate(attrs, {
+    algorithm: 'sha256',
+    keySize: 2048,
+    extensions: [
+      { name: 'basicConstraints', cA: false },
+      { name: 'keyUsage', digitalSignature: true, keyEncipherment: true },
+      {
+        name: 'subjectAltName',
+        altNames: [
+          { type: 2, value: 'localhost' },
+          { type: 7, ip: '127.0.0.1' },
+          { type: 7, ip: '::1' },
+        ],
+      },
+    ],
+  });
+  return { key: pems.private, cert: pems.cert };
+}
+
+function printStartupTips(scheme) {
+  console.log(
+    `OAuth redirect URLs to register in Twitch (must match scheme ${scheme}://):`
+  );
+  console.log(`  ${scheme}://127.0.0.1:${port}/auth/callback`);
+  console.log(`  ${scheme}://localhost:${port}/auth/callback`);
+  console.log(
+    `Or set TWITCH_REDIRECT_URI in .env to one exact URL and add that same URL in Twitch.`
+  );
+  if (scheme === 'https') {
+    console.log(
+      `Browser certificate warning: Advanced → Continue (self-signed cert, local dev only).`
+    );
+  }
   if (!process.env.TWITCH_CLIENT_ID) {
     console.log(
       'Tip: copy .env.example to .env and add Twitch app credentials.'
@@ -367,4 +428,27 @@ app.listen(port, () => {
       'Tip: set SESSION_SECRET in .env so login cookies stay valid after restarts.'
     );
   }
+}
+
+async function startServer() {
+  if (useHttpOnly()) {
+    http.createServer(app).listen(port, () => {
+      console.log(`Twitch viewer (HTTP): http://localhost:${port}`);
+      printStartupTips('http');
+    });
+    return;
+  }
+
+  const tls = await createTlsOptions();
+  https
+    .createServer(tls, app)
+    .listen(port, () => {
+      console.log(`Twitch viewer (HTTPS): https://localhost:${port}`);
+      printStartupTips('https');
+    });
+}
+
+startServer().catch((err) => {
+  console.error(err);
+  process.exit(1);
 });
