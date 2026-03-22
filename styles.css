@@ -322,6 +322,8 @@ body {
   min-height: 300px;
   background: #000;
   overflow: hidden;
+  visibility: visible;
+  opacity: 1;
   /* Avoid content-visibility: auto here — it can defer layout so Twitch’s embed
      mis-reads size/visibility and refuses autoplay (HLS <video> is unaffected). */
 }
@@ -336,7 +338,7 @@ body {
   background: #000;
 }
 
-/* Twitch.Player mounts a div; the inner iframe must fill the cell (≥400×300). */
+/* Twitch.Player: Twitch checks CSS visibility + min size before autoplay. */
 .cell .twitch-embed-mount {
   position: absolute;
   inset: 0;
@@ -344,6 +346,10 @@ body {
   height: 100%;
   min-width: 400px;
   min-height: 300px;
+  visibility: visible;
+  opacity: 1;
+  display: block;
+  contain: none;
 }
 
 .cell-hls-error {

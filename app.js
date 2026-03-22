@@ -337,28 +337,116 @@
     mountEl.appendChild(iframe);
   }
 
+  /** Walk ancestors for Twitch’s “style visibility” autoplay checks (see dev.twitch.tv/embed). */
+  function elementIsStyleVisible(el) {
+    let node = el;
+    while (node && node.nodeType === 1) {
+      if (node.hasAttribute && node.hasAttribute('hidden')) {
+        return false;
+      }
+      const cs = window.getComputedStyle(node);
+      if (
+        cs.visibility === 'hidden' ||
+        cs.display === 'none' ||
+        Number.parseFloat(cs.opacity || '1') === 0
+      ) {
+        return false;
+      }
+      node = node.parentElement;
+    }
+    return true;
+  }
+
   function scheduleTwitchPlayer(mountId, mountEl, login) {
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        if (typeof window.Twitch === 'undefined' || !window.Twitch.Player) {
-          appendTwitchIframeFallback(mountEl, login);
-          return;
-        }
+    let created = false;
+    let ro = null;
+
+    const finish = () => {
+      if (ro) {
         try {
-          const player = new window.Twitch.Player(mountId, {
-            channel: login,
-            width: '100%',
-            height: '100%',
-            parent: embedParentsArray(),
-            autoplay: true,
-            muted: true,
-          });
-          twitchPlayers.push(player);
+          ro.disconnect();
         } catch {
-          appendTwitchIframeFallback(mountEl, login);
+          /* ignore */
         }
+        ro = null;
+      }
+    };
+
+    const tryCreate = () => {
+      if (created) return true;
+      if (typeof window.Twitch === 'undefined' || !window.Twitch.Player) {
+        created = true;
+        appendTwitchIframeFallback(mountEl, login);
+        finish();
+        return true;
+      }
+      if (document.visibilityState !== 'visible') {
+        return false;
+      }
+      const w = mountEl.offsetWidth;
+      const h = mountEl.offsetHeight;
+      if (w < 400 || h < 300 || !elementIsStyleVisible(mountEl)) {
+        return false;
+      }
+      try {
+        const player = new window.Twitch.Player(mountId, {
+          channel: login,
+          width: w,
+          height: h,
+          parent: embedParentsArray(),
+          autoplay: true,
+          muted: true,
+        });
+        twitchPlayers.push(player);
+        created = true;
+        finish();
+        return true;
+      } catch {
+        created = true;
+        appendTwitchIframeFallback(mountEl, login);
+        finish();
+        return true;
+      }
+    };
+
+    let frames = 0;
+    const maxFrames = 240;
+    const loopBounded = () => {
+      if (created) return;
+      if (tryCreate()) return;
+      frames += 1;
+      if (frames >= maxFrames) {
+        if (!created) {
+          appendTwitchIframeFallback(mountEl, login);
+          created = true;
+          finish();
+        }
+        return;
+      }
+      requestAnimationFrame(loopBounded);
+    };
+
+    if (typeof ResizeObserver !== 'undefined') {
+      ro = new ResizeObserver(() => {
+        tryCreate();
       });
+      ro.observe(mountEl);
+    }
+
+    requestAnimationFrame(() => {
+      requestAnimationFrame(loopBounded);
     });
+
+    setTimeout(() => {
+      if (!created) {
+        tryCreate();
+        if (!created) {
+          appendTwitchIframeFallback(mountEl, login);
+          created = true;
+        }
+        finish();
+      }
+    }, 8000);
   }
 
   function chatSrc(login) {
