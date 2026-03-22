@@ -53,6 +53,10 @@
             <input type="checkbox" id="hide-offline" />
             Hide offline
           </label>
+          <label class="check" title="When off, streams load paused; click the player to start">
+            <input type="checkbox" id="autoplay-streams" checked />
+            Autoplay
+          </label>
           <button
             type="button"
             class="ghost"
@@ -114,7 +118,26 @@
       </button>
 
       <main class="main" id="main">
-        <div class="grid" id="grid" aria-live="polite"></div>
+        <div class="grid-area" id="grid-area">
+          <div
+            id="playback-gate"
+            class="playback-gate"
+            hidden
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="playback-gate-title"
+          >
+            <div class="playback-gate-inner">
+              <p id="playback-gate-title" class="playback-gate-title">Start playback</p>
+              <p class="playback-gate-hint">
+                Many browsers only let Twitch embeds start after you interact with this page.
+                Click anywhere here to load players (streams stay muted until you unmute in each
+                player).
+              </p>
+            </div>
+          </div>
+          <div class="grid" id="grid" aria-live="polite"></div>
+        </div>
         <aside class="chat-panel" id="chat-panel" hidden aria-label="Twitch chat">
           <div class="chat-panel-header">
             <div class="chat-panel-header-main">

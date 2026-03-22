@@ -283,8 +283,52 @@ body {
   flex-direction: row;
 }
 
-.main.chat-on-left .grid {
+.grid-area {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+.main.chat-on-left .grid-area {
   order: 2;
+}
+
+.playback-gate {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.72);
+  cursor: pointer;
+  padding: 1.25rem;
+}
+
+.playback-gate[hidden] {
+  display: none !important;
+}
+
+.playback-gate-inner {
+  text-align: center;
+  max-width: 26rem;
+  pointer-events: none;
+}
+
+.playback-gate-title {
+  font-size: 1.35rem;
+  font-weight: 600;
+  margin: 0 0 0.5rem;
+}
+
+.playback-gate-hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+  line-height: 1.5;
 }
 
 .main.chat-on-left .chat-panel {

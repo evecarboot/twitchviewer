@@ -10,6 +10,8 @@
   }
 
   const STORAGE_KEY = 'twitchviewer:v1';
+  /** sessionStorage: one click per tab session unlocks Twitch embeds after user activation */
+  const PLAYBACK_OK_KEY = 'twitchviewer-playback-ok';
   const POLL_MS = 45_000;
   const FETCH_OPTS = { credentials: 'same-origin' };
 
@@ -22,6 +24,7 @@
     chatOnLeft: false,
     chatForLogin: null,
     toolbarCollapsed: false,
+    autoplayStreams: true,
   });
 
   let state = loadState();
@@ -76,6 +79,7 @@
     followSelectAll: document.getElementById('follow-select-all'),
     followSelectNone: document.getElementById('follow-select-none'),
     followModalRefresh: document.getElementById('follow-modal-refresh'),
+    playbackGate: document.getElementById('playback-gate'),
   };
 
   function loadState() {
@@ -90,6 +94,7 @@
         importedFollows: Array.isArray(parsed.importedFollows)
           ? parsed.importedFollows
           : [],
+        autoplayStreams: parsed.autoplayStreams !== false,
       };
     } catch {
       return defaultState();
@@ -261,7 +266,7 @@
 
   function youtubeEmbedSrc(id) {
     const params = new URLSearchParams({
-      autoplay: '1',
+      autoplay: state.autoplayStreams ? '1' : '0',
       mute: '1',
       playsinline: '1',
     });
@@ -290,7 +295,7 @@
   function playerSrc(login) {
     const params = embedParents();
     params.set('channel', login);
-    params.set('autoplay', 'true');
+    params.set('autoplay', state.autoplayStreams ? 'true' : 'false');
     params.set('muted', 'true');
     return `https://player.twitch.tv/?${params.toString()}`;
   }
@@ -711,7 +716,7 @@
                     /* ignore */
                   }
                 }
-                video.play().catch(() => {});
+                if (state.autoplayStreams) video.play().catch(() => {});
               }
             }
           });
@@ -818,7 +823,7 @@
         video.muted = true;
         video.playsInline = true;
         video.setAttribute('playsinline', '');
-        video.autoplay = true;
+        video.autoplay = state.autoplayStreams;
 
         const fail = (msg) => {
           if (cell.querySelector('.cell-hls-error')) return;
@@ -863,14 +868,14 @@
           hls.attachMedia(video);
           video._hls = hls;
           hls.on(Hls.Events.MANIFEST_PARSED, () => {
-            video.play().catch(() => {});
+            if (state.autoplayStreams) video.play().catch(() => {});
           });
           hls.on(Hls.Events.ERROR, (_, data) => {
             if (data.fatal) fail(formatHlsFatalError(data));
           });
         } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
           video.src = playbackUrl;
-          video.play().catch(() => {});
+          if (state.autoplayStreams) video.play().catch(() => {});
         } else {
           fail('HLS not supported in this browser.');
         }
@@ -946,6 +951,20 @@
     els.refreshStreams.disabled = !hasAny;
   }
 
+  function setupPlaybackGate() {
+    if (!els.playbackGate) return;
+    const hasTwitch = state.channels.some((c) => getChannelType(c) === 'twitch');
+    if (
+      !state.autoplayStreams ||
+      !hasTwitch ||
+      sessionStorage.getItem(PLAYBACK_OK_KEY) === '1'
+    ) {
+      els.playbackGate.hidden = true;
+      return;
+    }
+    els.playbackGate.hidden = false;
+  }
+
   function fullRender() {
     renderChannelChips();
     renderChatSelect();
@@ -954,6 +973,7 @@
     applyToolbarLayout();
     updateFollowImportButtonsVisibility();
     updateRefreshStreamsButton();
+    setupPlaybackGate();
   }
 
   async function tick() {
@@ -1063,6 +1083,14 @@
     });
   });
 
+  if (els.autoplayStreams) {
+    els.autoplayStreams.addEventListener('change', () => {
+      state.autoplayStreams = els.autoplayStreams.checked;
+      saveState();
+      fullRender();
+    });
+  }
+
   if (els.refreshStreams) {
     els.refreshStreams.addEventListener('click', async () => {
       if (!state.channels.length) return;
@@ -1153,6 +1181,7 @@
   });
 
   els.hideOffline.checked = state.hideOffline;
+  if (els.autoplayStreams) els.autoplayStreams.checked = state.autoplayStreams;
   els.showChat.checked = state.showChat;
 
   async function fetchFollowsFromApi() {
@@ -1252,6 +1281,15 @@
   });
 
   (async function init() {
+    if (els.playbackGate) {
+      els.playbackGate.addEventListener('click', () => {
+        if (sessionStorage.getItem(PLAYBACK_OK_KEY) === '1') return;
+        sessionStorage.setItem(PLAYBACK_OK_KEY, '1');
+        els.playbackGate.hidden = true;
+        fullRender();
+      });
+    }
+
     const qs = new URLSearchParams(location.search);
     const urlErr = qs.get('error');
     if (urlErr) {
