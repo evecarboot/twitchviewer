@@ -10,24 +10,7 @@
   }
 
   const STORAGE_KEY = 'twitchviewer:v1';
-  /**
-   * In-memory only (reset on every full page load). Do not use sessionStorage: it survives
-   * reloads and made us load player.twitch.tv without a fresh user gesture — browsers then
-   * show Twitch’s play overlay. Toolbar actions that run await before fullRender() also do
-   * not preserve activation; only a synchronous unlock (the gate) does.
-   */
-  let twitchPlaybackUnlocked = false;
   const POLL_MS = 45_000;
-
-  function recordPlaybackGesture() {
-    twitchPlaybackUnlocked = true;
-  }
-
-  /** When true, Twitch cells use about:blank until recordPlaybackGesture() — do not load player.twitch.tv yet. */
-  function twitchEmbedsDeferredUntilGesture() {
-    if (!state.autoplayStreams) return false;
-    return !twitchPlaybackUnlocked;
-  }
   const FETCH_OPTS = { credentials: 'same-origin' };
 
   const defaultState = () => ({
@@ -39,7 +22,6 @@
     chatOnLeft: false,
     chatForLogin: null,
     toolbarCollapsed: false,
-    autoplayStreams: true,
   });
 
   let state = loadState();
@@ -49,10 +31,6 @@
   let pollTimer = null;
   /** @type {IntersectionObserver[]} */
   let cellObservers = [];
-  /** Twitch.Player instances for the current grid (destroyed on each render). */
-  /** @type {any[]} */
-  let twitchPlayerInstances = [];
-  let twitchEmbedSeq = 0;
   /** @type {Set<string>} */
   let followModalSelection = new Set();
 
@@ -61,7 +39,6 @@
     channelInput: document.getElementById('channel-input'),
     hideOffline: document.getElementById('hide-offline'),
     refreshStreams: document.getElementById('refresh-streams'),
-    startTwitchPlayers: document.getElementById('start-twitch-players'),
     showChat: document.getElementById('show-chat'),
     hideChatPanelWrap: document.getElementById('hide-chat-panel-wrap'),
     hideChatPanel: document.getElementById('hide-chat-panel'),
@@ -99,7 +76,6 @@
     followSelectAll: document.getElementById('follow-select-all'),
     followSelectNone: document.getElementById('follow-select-none'),
     followModalRefresh: document.getElementById('follow-modal-refresh'),
-    playbackGate: document.getElementById('playback-gate'),
   };
 
   function loadState() {
@@ -107,15 +83,16 @@
       const raw = localStorage.getItem(STORAGE_KEY);
       if (!raw) return defaultState();
       const parsed = JSON.parse(raw);
-      return {
+      const merged = {
         ...defaultState(),
         ...parsed,
         channels: migrateChannels(parsed.channels),
         importedFollows: Array.isArray(parsed.importedFollows)
           ? parsed.importedFollows
           : [],
-        autoplayStreams: parsed.autoplayStreams !== false,
       };
+      delete merged.autoplayStreams;
+      return merged;
     } catch {
       return defaultState();
     }
@@ -286,7 +263,7 @@
 
   function youtubeEmbedSrc(id) {
     const params = new URLSearchParams({
-      autoplay: state.autoplayStreams ? '1' : '0',
+      autoplay: '1',
       mute: '1',
       playsinline: '1',
     });
@@ -312,27 +289,19 @@
     return qs;
   }
 
+  /**
+   * Non-interactive iframe embed per https://dev.twitch.tv/docs/embed/video-and-clips/
+   * (channel + parent + muted=true + autoplay=true; cells are ≥400×300 in CSS).
+   */
   function playerSrc(login) {
     const params = embedParents();
     params.set('channel', login);
-    params.set('autoplay', state.autoplayStreams ? 'true' : 'false');
+    params.set('autoplay', 'true');
     params.set('muted', 'true');
     return `https://player.twitch.tv/?${params.toString()}`;
   }
 
-  function parentDomainsForTwitch() {
-    const h = window.location.hostname;
-    const parent = [h];
-    if (h === '127.0.0.1') parent.push('localhost');
-    if (h === 'localhost') parent.push('127.0.0.1');
-    return parent;
-  }
-
-  /**
-   * Raw iframe only — parent JS cannot click inside this iframe (cross-origin).
-   * Prefer Twitch.Player + play() when embed v1.js is available.
-   */
-  function attachTwitchIframePlain(cell, login) {
+  function attachTwitchIframe(cell, login) {
     const iframe = document.createElement('iframe');
     iframe.dataset.twitchEmbed = '1';
     iframe.title = `Twitch: ${login}`;
@@ -340,78 +309,11 @@
     iframe.setAttribute('height', '300');
     iframe.setAttribute(
       'allow',
-      'autoplay *; fullscreen *; picture-in-picture *; encrypted-media *; clipboard-write *'
+      'autoplay; fullscreen; picture-in-picture; encrypted-media; clipboard-write'
     );
     iframe.allowFullscreen = true;
-    if (twitchEmbedsDeferredUntilGesture()) {
-      iframe.src = 'about:blank';
-      iframe.dataset.pendingTwitchLogin = login;
-    } else {
-      iframe.src = playerSrc(login);
-    }
+    iframe.src = playerSrc(login);
     cell.appendChild(iframe);
-  }
-
-  function playAllTwitchPlayers() {
-    twitchPlayerInstances.forEach((player) => {
-      try {
-        if (player && typeof player.play === 'function') player.play();
-      } catch {
-        /* ignore */
-      }
-    });
-  }
-
-  /** Plain Twitch iframe embed (see https://dev.twitch.tv/docs/embed/video-and-clips/). */
-  function attachTwitchIframe(cell, login) {
-    if (twitchEmbedsDeferredUntilGesture()) {
-      const ph = document.createElement('div');
-      ph.className = 'twitch-deferred-placeholder';
-      ph.textContent = 'Use “Start playback” above to load Twitch embeds.';
-      cell.appendChild(ph);
-      return;
-    }
-
-    if (
-      typeof window.Twitch === 'undefined' ||
-      typeof window.Twitch.Player !== 'function'
-    ) {
-      attachTwitchIframePlain(cell, login);
-      return;
-    }
-
-    const host = document.createElement('div');
-    host.className = 'twitch-embed-host';
-    const id = `twitch-embed-${++twitchEmbedSeq}`;
-    host.id = id;
-    cell.appendChild(host);
-
-    try {
-      const player = new window.Twitch.Player(id, {
-        width: '100%',
-        height: '100%',
-        channel: login,
-        parent: parentDomainsForTwitch(),
-        muted: true,
-        autoplay: Boolean(state.autoplayStreams),
-      });
-      twitchPlayerInstances.push(player);
-      const readyEv =
-        window.Twitch.Player && window.Twitch.Player.READY
-          ? window.Twitch.Player.READY
-          : 'ready';
-      player.addEventListener(readyEv, () => {
-        if (!state.autoplayStreams) return;
-        try {
-          if (typeof player.play === 'function') player.play();
-        } catch {
-          /* ignore */
-        }
-      });
-    } catch {
-      host.remove();
-      attachTwitchIframePlain(cell, login);
-    }
   }
 
   function chatSrc(login) {
@@ -747,17 +649,6 @@
     });
   }
 
-  function destroyGridTwitchPlayers() {
-    twitchPlayerInstances.forEach((player) => {
-      try {
-        if (player && typeof player.destroy === 'function') player.destroy();
-      } catch {
-        /* ignore */
-      }
-    });
-    twitchPlayerInstances = [];
-  }
-
   function disconnectCellObservers() {
     cellObservers.forEach((o) => o.disconnect());
     cellObservers = [];
@@ -825,7 +716,7 @@
                     /* ignore */
                   }
                 }
-                if (state.autoplayStreams) video.play().catch(() => {});
+                video.play().catch(() => {});
               }
             }
           });
@@ -840,7 +731,6 @@
   function renderGrid() {
     disconnectCellObservers();
     destroyGridHls();
-    destroyGridTwitchPlayers();
     const visible = visibleChannels();
     const n = visible.length;
     const { cols, rows } = gridDimensions(n);
@@ -903,7 +793,7 @@
         video.muted = true;
         video.playsInline = true;
         video.setAttribute('playsinline', '');
-        video.autoplay = state.autoplayStreams;
+        video.autoplay = true;
 
         const fail = (msg) => {
           if (cell.querySelector('.cell-hls-error')) return;
@@ -948,14 +838,14 @@
           hls.attachMedia(video);
           video._hls = hls;
           hls.on(Hls.Events.MANIFEST_PARSED, () => {
-            if (state.autoplayStreams) video.play().catch(() => {});
+            video.play().catch(() => {});
           });
           hls.on(Hls.Events.ERROR, (_, data) => {
             if (data.fatal) fail(formatHlsFatalError(data));
           });
         } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
           video.src = playbackUrl;
-          if (state.autoplayStreams) video.play().catch(() => {});
+          video.play().catch(() => {});
         } else {
           fail('HLS not supported in this browser.');
         }
@@ -1031,22 +921,6 @@
     els.refreshStreams.disabled = !hasAny;
   }
 
-  function updateStartTwitchButton() {
-    if (!els.startTwitchPlayers) return;
-    const hasTwitch = state.channels.some((c) => getChannelType(c) === 'twitch');
-    els.startTwitchPlayers.hidden = !hasTwitch;
-  }
-
-  function setupPlaybackGate() {
-    if (!els.playbackGate) return;
-    const hasTwitch = state.channels.some((c) => getChannelType(c) === 'twitch');
-    if (!state.autoplayStreams || !hasTwitch || twitchPlaybackUnlocked) {
-      els.playbackGate.hidden = true;
-      return;
-    }
-    els.playbackGate.hidden = false;
-  }
-
   function fullRender() {
     renderChannelChips();
     renderChatSelect();
@@ -1055,8 +929,6 @@
     applyToolbarLayout();
     updateFollowImportButtonsVisibility();
     updateRefreshStreamsButton();
-    updateStartTwitchButton();
-    setupPlaybackGate();
   }
 
   async function tick() {
@@ -1166,14 +1038,6 @@
     });
   });
 
-  if (els.autoplayStreams) {
-    els.autoplayStreams.addEventListener('change', () => {
-      state.autoplayStreams = els.autoplayStreams.checked;
-      saveState();
-      fullRender();
-    });
-  }
-
   if (els.refreshStreams) {
     els.refreshStreams.addEventListener('click', async () => {
       if (!state.channels.length) return;
@@ -1186,12 +1050,6 @@
       } finally {
         updateRefreshStreamsButton();
       }
-    });
-  }
-
-  if (els.startTwitchPlayers) {
-    els.startTwitchPlayers.addEventListener('click', () => {
-      playAllTwitchPlayers();
     });
   }
 
@@ -1265,7 +1123,6 @@
   }
 
   els.hideOffline.checked = state.hideOffline;
-  if (els.autoplayStreams) els.autoplayStreams.checked = state.autoplayStreams;
   els.showChat.checked = state.showChat;
 
   async function fetchFollowsFromApi() {
@@ -1365,15 +1222,6 @@
   });
 
   (async function init() {
-    if (els.playbackGate) {
-      els.playbackGate.addEventListener('click', () => {
-        if (twitchPlaybackUnlocked) return;
-        recordPlaybackGesture();
-        els.playbackGate.hidden = true;
-        fullRender();
-      });
-    }
-
     const qs = new URLSearchParams(location.search);
     const urlErr = qs.get('error');
     if (urlErr) {

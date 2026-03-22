@@ -89,7 +89,7 @@ Never commit `.env` or share your client secret. `.gitignore` excludes `.env`, `
 
 ### Notes
 
-- **Twitch embed autoplay**: Browsers only allow **muted** autoplay in third-party frames when the **player URL is assigned in the same turn as a user gesture** (e.g. clicking the **Start playback** overlay). Unlocking is **not** persisted across reloads (that used to break autoplay after refresh). Toolbar actions that `await` the network before rebuilding the grid can still leave Twitch showing a **play** button — click play in the embed or use **HLS** (`m3u8` / `transcode:`) for that stream. Twitch has also said embed **autoplay is not always honored** ([forums](https://discuss.dev.twitch.com/t/embed-video-autoplay-is-not-honored/15795)).
+- **Twitch embeds** use the [documented iframe URL](https://dev.twitch.tv/docs/embed/video-and-clips/) (`channel`, `parent`, `muted=true`, `autoplay=true`; cells are at least **400×300** px). Browsers and Twitch may still require a tap to play on some devices; **HLS** (`m3u8` / `transcode:`) uses `<video>` and often behaves more predictably.
 - **Channel points**: Twitch does not guarantee that **embedded** players earn channel points the same way as watching on **twitch.tv**. For reliable channel points, watch on Twitch directly.
 - **Same host for OAuth**: use either **`localhost`** or **`127.0.0.1`** consistently; cookies are per-host.
 
