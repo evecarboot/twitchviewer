@@ -716,17 +716,40 @@ function twitchLiveSourceKey(login) {
 }
 
 function streamlinkQualityArg() {
-  const raw = (process.env.TWITCH_STREAMLINK_QUALITY || '720p').trim() || '720p';
-  return /^[a-zA-Z0-9][a-zA-Z0-9_+-]*$/.test(raw) ? raw : '720p';
+  const raw = (process.env.TWITCH_STREAMLINK_QUALITY || '720p60').trim() || '720p60';
+  return /^[a-zA-Z0-9][a-zA-Z0-9_+-]*$/.test(raw) ? raw : '720p60';
 }
 
-function resolveStreamlinkStreamUrl(login) {
+/** Twitch often exposes 720p60 / 480p30, not a bare "720p" — try fallbacks if the preferred name fails. */
+function streamlinkQualityCandidates() {
+  const primary = streamlinkQualityArg();
+  const fallbacks = [
+    '720p60',
+    '720p30',
+    '720p',
+    '480p30',
+    '480p',
+    '360p30',
+    'best',
+  ];
+  const seen = new Set();
+  const list = [];
+  for (const q of [primary, ...fallbacks]) {
+    if (q && !seen.has(q)) {
+      seen.add(q);
+      list.push(q);
+    }
+  }
+  return list;
+}
+
+function resolveStreamlinkStreamUrlOnce(login, quality) {
   return new Promise((resolve, reject) => {
-    const proc = spawn(streamlinkExecutable(), [
-      '--stream-url',
-      `https://www.twitch.tv/${login}`,
-      streamlinkQualityArg(),
-    ], { windowsHide: true });
+    const proc = spawn(
+      streamlinkExecutable(),
+      ['--stream-url', `https://www.twitch.tv/${login}`, quality],
+      { windowsHide: true }
+    );
     let out = '';
     let errBuf = '';
     proc.stdout.on('data', (d) => {
@@ -747,7 +770,7 @@ function resolveStreamlinkStreamUrl(login) {
         const msg = (errBuf || out || '').trim() || `exit ${code}`;
         reject(
           new Error(
-            `streamlink failed (stream offline, wrong name, or error): ${msg.slice(0, 500)}`
+            `streamlink [${quality}] (stream offline, unknown quality name, or error): ${msg.slice(0, 500)}`
           )
         );
         return;
@@ -761,6 +784,19 @@ function resolveStreamlinkStreamUrl(login) {
       resolve(url);
     });
   });
+}
+
+async function resolveStreamlinkStreamUrl(login) {
+  const candidates = streamlinkQualityCandidates();
+  let lastErr = '';
+  for (const quality of candidates) {
+    try {
+      return await resolveStreamlinkStreamUrlOnce(login, quality);
+    } catch (e) {
+      lastErr = String(e && e.message ? e.message : e);
+    }
+  }
+  throw new Error(lastErr || 'streamlink failed for all quality fallbacks');
 }
 
 /**
