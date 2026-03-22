@@ -31,11 +31,8 @@
   let pollTimer = null;
   /** @type {IntersectionObserver[]} */
   let cellObservers = [];
-  /** Serial gap between Twitch player inits (reduces 429 + visibility races). */
+  /** Serial gap between Twitch iframe loads (reduces 429 + visibility races). */
   let twitchEmbedQueue = Promise.resolve();
-  /** @type {any[]} */
-  let twitchPlayerInstances = [];
-  let twitchEmbedSeq = 0;
   /** @type {Set<string>} */
   let followModalSelection = new Set();
 
@@ -295,7 +292,7 @@
   }
 
   /**
-   * Plain iframe fallback (same URL params as non-interactive embed docs).
+   * Non-interactive embed URL (parent + channel + autoplay + muted).
    * https://dev.twitch.tv/docs/embed/video-and-clips/
    */
   function playerSrc(login) {
@@ -306,15 +303,7 @@
     return `https://player.twitch.tv/?${params.toString()}`;
   }
 
-  function parentDomainsForTwitch() {
-    const h = window.location.hostname;
-    const parent = [h];
-    if (h === '127.0.0.1') parent.push('localhost');
-    if (h === 'localhost') parent.push('127.0.0.1');
-    return parent;
-  }
-
-  function queueTwitchPlayerInit(run) {
+  function queueTwitchEmbedInit(run) {
     twitchEmbedQueue = twitchEmbedQueue.then(
       () =>
         new Promise((resolve) => {
@@ -330,99 +319,6 @@
           });
         })
     );
-  }
-
-  /**
-   * Twitch’s embed refuses muted autoplay if the host isn’t “visible enough”:
-   * tab visible, ≥400×300, no display:none / visibility:hidden / opacity≈0 on ancestors,
-   * and overlap with the grid viewport (scroll container).
-   */
-  function twitchCellMeetsEmbedVisibility(cell) {
-    if (!cell) return false;
-    if (document.visibilityState !== 'visible' || document.hidden) return false;
-    const cw = cell.clientWidth;
-    const ch = cell.clientHeight;
-    if (cw < 400 || ch < 300) return false;
-    const rect = cell.getBoundingClientRect();
-    if (rect.width < 400 || rect.height < 300) return false;
-    let el = cell;
-    while (el && el.nodeType === 1) {
-      const cs = window.getComputedStyle(el);
-      if (cs.display === 'none') return false;
-      if (cs.visibility === 'hidden') return false;
-      if (parseFloat(cs.opacity) < 0.01) return false;
-      el = el.parentElement;
-    }
-    if (els.grid) {
-      const gr = els.grid.getBoundingClientRect();
-      const overlaps =
-        rect.bottom > gr.top &&
-        rect.top < gr.bottom &&
-        rect.right > gr.left &&
-        rect.left < gr.right;
-      if (!overlaps) return false;
-    }
-    return true;
-  }
-
-  /**
-   * Wait until the tab is visible and the cell passes twitchCellMeetsEmbedVisibility,
-   * then double-rAF so layout has settled. If it never becomes ready, call onGiveUp().
-   */
-  function whenTwitchEmbedHostReady(cell, onReady, onGiveUp) {
-    let frames = 0;
-    const maxFrames = 360;
-    let visBound = false;
-
-    const finishOk = () => {
-      if (visBound) {
-        document.removeEventListener('visibilitychange', onVis);
-        visBound = false;
-      }
-      requestAnimationFrame(() => {
-        requestAnimationFrame(() => {
-          if (twitchCellMeetsEmbedVisibility(cell)) onReady();
-          else onGiveUp();
-        });
-      });
-    };
-
-    const tick = () => {
-      if (document.hidden) {
-        if (!visBound) {
-          visBound = true;
-          document.addEventListener('visibilitychange', onVis);
-        }
-        return;
-      }
-      if (twitchCellMeetsEmbedVisibility(cell)) {
-        finishOk();
-        return;
-      }
-      frames++;
-      if (frames >= maxFrames) {
-        if (visBound) {
-          document.removeEventListener('visibilitychange', onVis);
-          visBound = false;
-        }
-        onGiveUp();
-        return;
-      }
-      requestAnimationFrame(tick);
-    };
-
-    function onVis() {
-      if (!document.hidden) {
-        if (visBound) {
-          document.removeEventListener('visibilitychange', onVis);
-          visBound = false;
-        }
-        frames = 0;
-        requestAnimationFrame(tick);
-      }
-    }
-
-    requestAnimationFrame(tick);
   }
 
   function attachTwitchIframeOnly(cell, login) {
@@ -442,62 +338,12 @@
   }
 
   /**
-   * Interactive embed via Twitch.Player (embed v1.js): explicit autoplay + muted in options.
-   * https://dev.twitch.tv/docs/embed/video-and-clips/ — Interactive Frames
+   * Non-interactive embed: direct player.twitch.tv iframe with autoplay + muted URL params.
+   * Same underlying player as Twitch.Player; no embed/v1.js required.
+   * https://dev.twitch.tv/docs/embed/video-and-clips/
    */
   function attachTwitchEmbedCell(cell, login) {
-    const wrap = document.createElement('div');
-    wrap.className = 'twitch-embed-host';
-    const id = `twitch-embed-${++twitchEmbedSeq}`;
-    wrap.id = id;
-    cell.appendChild(wrap);
-
-    const fallbackIframe = () => {
-      wrap.remove();
-      attachTwitchIframeOnly(cell, login);
-    };
-
-    const runPlayerCore = () => {
-      if (
-        typeof window.Twitch === 'undefined' ||
-        typeof window.Twitch.Player !== 'function'
-      ) {
-        fallbackIframe();
-        return;
-      }
-      try {
-        const player = new window.Twitch.Player(id, {
-          width: '100%',
-          height: '100%',
-          channel: login,
-          parent: parentDomainsForTwitch(),
-          muted: true,
-          autoplay: true,
-        });
-        twitchPlayerInstances.push(player);
-        const readyEv =
-          window.Twitch.Player && window.Twitch.Player.READY
-            ? window.Twitch.Player.READY
-            : 'ready';
-        player.addEventListener(readyEv, () => {
-          try {
-            if (typeof player.play === 'function') player.play();
-          } catch {
-            /* ignore */
-          }
-        });
-      } catch {
-        fallbackIframe();
-      }
-    };
-
-    const queuePlayerAfterVisibilityGate = () => {
-      whenTwitchEmbedHostReady(
-        cell,
-        () => queueTwitchPlayerInit(runPlayerCore),
-        fallbackIframe
-      );
-    };
+    const run = () => attachTwitchIframeOnly(cell, login);
 
     let loadScheduled = false;
     /** @type {ResizeObserver | null} */
@@ -511,7 +357,7 @@
         sizeObs.disconnect();
         sizeObs = null;
       }
-      queuePlayerAfterVisibilityGate();
+      queueTwitchEmbedInit(run);
     };
 
     if (!els.grid || typeof IntersectionObserver === 'undefined') {
@@ -527,7 +373,7 @@
     const io = new IntersectionObserver(
       (entries) => {
         entries.forEach((entry) => {
-          if (!entry.isIntersecting || entry.intersectionRatio < 0.25) return;
+          if (!entry.isIntersecting || entry.intersectionRatio < 0.1) return;
           io.disconnect();
           scheduleWhenSized();
           if (!loadScheduled) {
@@ -542,12 +388,11 @@
               sizeObs = null;
             }
             if (!loadScheduled) {
+              loadScheduled = true;
               if (cell.clientWidth >= 400 && cell.clientHeight >= 300) {
-                loadScheduled = true;
-                queuePlayerAfterVisibilityGate();
+                queueTwitchEmbedInit(run);
               } else {
-                loadScheduled = true;
-                fallbackIframe();
+                attachTwitchIframeOnly(cell, login);
               }
             }
           }, 8000);
@@ -565,12 +410,58 @@
     )}/chat?${params.toString()}&darkpopout`;
   }
 
-  function gridDimensions(count) {
+  function gridViewportSize() {
+    if (!els.grid) return { w: 1200, h: 800 };
+    const r = els.grid.getBoundingClientRect();
+    let w = r.width;
+    let h = r.height;
+    if (w < 2 || h < 2) {
+      const iw = window.innerWidth;
+      const ih = window.innerHeight;
+      const th = els.toolbar ? els.toolbar.getBoundingClientRect().height : 0;
+      w = Math.max(400, iw - 8);
+      h = Math.max(300, ih - th - 8);
+    }
+    return { w: Math.max(400, w), h: Math.max(300, h) };
+  }
+
+  /**
+   * Choose cols × rows so tiles are as large as possible for the current window shape:
+   * prefer layouts with no empty grid cells, then maximize min(cell width, cell height).
+   * A plain sqrt(n) grid wastes slots on many counts (e.g. 8 → 3×3) and ignores ultra-wide.
+   */
+  function gridDimensions(count, vp) {
     if (count <= 0) return { cols: 1, rows: 1 };
     if (count === 1) return { cols: 1, rows: 1 };
-    const cols = Math.ceil(Math.sqrt(count));
-    const rows = Math.ceil(count / cols);
-    return { cols, rows };
+    const { w, h } = vp;
+    let bestCols = Math.ceil(Math.sqrt(count));
+    let bestRows = Math.ceil(count / bestCols);
+    let bestScore = -Infinity;
+    for (let cols = 1; cols <= count; cols++) {
+      const rows = Math.ceil(count / cols);
+      const waste = cols * rows - count;
+      const cw = w / cols;
+      const ch = h / rows;
+      const minSide = Math.min(cw, ch);
+      const score = minSide * minSide - waste * 1_000_000;
+      if (score > bestScore) {
+        bestScore = score;
+        bestCols = cols;
+        bestRows = rows;
+      }
+    }
+    return { cols: bestCols, rows: bestRows };
+  }
+
+  /** Update grid columns/rows from viewport without rebuilding cells (keeps Twitch embeds alive). */
+  function layoutGridToViewport() {
+    if (!els.grid) return;
+    const visible = visibleChannels();
+    const n = visible.length;
+    const { cols, rows } = gridDimensions(n, gridViewportSize());
+    els.grid.style.setProperty('--cols', String(Math.max(1, cols)));
+    els.grid.style.setProperty('--rows', String(Math.max(1, rows)));
+    els.grid.classList.toggle('one-col', n === 1);
   }
 
   function visibleChannels() {
@@ -882,17 +773,6 @@
     els.chatIframeWrap.appendChild(iframe);
   }
 
-  function destroyGridTwitchPlayers() {
-    twitchPlayerInstances.forEach((player) => {
-      try {
-        if (player && typeof player.destroy === 'function') player.destroy();
-      } catch {
-        /* ignore */
-      }
-    });
-    twitchPlayerInstances = [];
-  }
-
   function destroyGridHls() {
     els.grid.querySelectorAll('video.cell-video').forEach((video) => {
       if (video._hls) {
@@ -983,18 +863,16 @@
 
   function renderGrid() {
     disconnectCellObservers();
-    destroyGridTwitchPlayers();
     destroyGridHls();
     const visible = visibleChannels();
     const n = visible.length;
-    const { cols, rows } = gridDimensions(n);
+    const { cols, rows } = gridDimensions(n, gridViewportSize());
     els.grid.style.setProperty('--cols', String(Math.max(1, cols)));
     els.grid.style.setProperty('--rows', String(Math.max(1, rows)));
     els.grid.classList.toggle('one-col', n === 1);
 
     els.grid.innerHTML = '';
     twitchEmbedQueue = Promise.resolve();
-    twitchEmbedSeq = 0;
     visible.forEach((ch) => {
       const cell = document.createElement('div');
       cell.className = 'cell';
@@ -1126,6 +1004,7 @@
   function applyToolbarLayout() {
     els.toolbar.classList.toggle('collapsed', state.toolbarCollapsed);
     els.peekTab.hidden = !state.toolbarCollapsed;
+    requestAnimationFrame(() => layoutGridToViewport());
   }
 
   function applyChatLayout() {
@@ -1168,6 +1047,7 @@
       );
     }
     renderChatIframe();
+    requestAnimationFrame(() => layoutGridToViewport());
   }
 
   function updateRefreshStreamsButton() {
@@ -1180,11 +1060,14 @@
   function fullRender() {
     renderChannelChips();
     renderChatSelect();
-    renderGrid();
     applyChatLayout();
     applyToolbarLayout();
+    renderGrid();
     updateFollowImportButtonsVisibility();
     updateRefreshStreamsButton();
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => layoutGridToViewport());
+    });
   }
 
   async function tick() {
@@ -1497,6 +1380,23 @@
     await refreshAuth();
     fullRender();
     schedulePoll();
+    let gridResizeTimer = null;
+    window.addEventListener('resize', () => {
+      if (gridResizeTimer) clearTimeout(gridResizeTimer);
+      gridResizeTimer = setTimeout(() => {
+        gridResizeTimer = null;
+        layoutGridToViewport();
+      }, 120);
+    });
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', () => {
+        if (gridResizeTimer) clearTimeout(gridResizeTimer);
+        gridResizeTimer = setTimeout(() => {
+          gridResizeTimer = null;
+          layoutGridToViewport();
+        }, 120);
+      });
+    }
     if (urlErr) {
       try {
         setMeta(decodeURIComponent(urlErr), true);
