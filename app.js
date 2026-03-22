@@ -657,6 +657,27 @@
           cell.appendChild(err);
         };
 
+        function formatHlsFatalError(data) {
+          const details = data && data.details ? String(data.details) : '';
+          const typ = data && data.type != null ? String(data.type) : '';
+          if (
+            details.includes('bufferAppendError') ||
+            details.includes('fragParsingError') ||
+            details.includes('bufferAddCodecError')
+          ) {
+            return 'Browser cannot decode this stream (often MPEG-2 or AC3 in .ts). Chrome/Edge usually need H.264/AAC HLS. Try Safari or another m3u8.';
+          }
+          if (
+            details.includes('manifestLoadError') ||
+            details.includes('levelLoadError') ||
+            details.includes('fragLoadError') ||
+            typ === 'networkError'
+          ) {
+            return 'Could not load playlist or segments (network, 403, or CORS). Check the URL.';
+          }
+          return `Playback failed: ${details || typ || 'unknown'}.`;
+        }
+
         // Prefer MSE + hls.js when available. Some browsers report a truthy
         // canPlayType for application/vnd.apple.mpegurl but cannot play HLS
         // via <video src> (e.g. Chromium), which breaks raw m3u8 URLs.
@@ -671,11 +692,7 @@
             video.play().catch(() => {});
           });
           hls.on(Hls.Events.ERROR, (_, data) => {
-            if (data.fatal) {
-              fail(
-                'Stream failed (codec, CORS, or network). Try another source.'
-              );
-            }
+            if (data.fatal) fail(formatHlsFatalError(data));
           });
         } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
           video.src = url;
