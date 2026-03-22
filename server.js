@@ -23,13 +23,16 @@ function getPort() {
   return Number(process.env.PORT) || 3000;
 }
 
-/** Set USE_HTTP=true in .env to serve plain HTTP only (OAuth redirect must use http:// too). */
+/**
+ * Default: HTTP (no certificate warning). Set USE_HTTPS=true for self-signed HTTPS.
+ * Twitch OAuth redirect URLs in the developer console must match the scheme you use.
+ */
 function useHttpOnly() {
-  return process.env.USE_HTTP === 'true';
+  return process.env.USE_HTTPS !== 'true';
 }
 
 /**
- * OAuth redirect_uri must match the Twitch console exactly (https:// recommended).
+ * OAuth redirect_uri must match the Twitch console exactly.
  * localhost vs 127.0.0.1 are different to Twitch.
  * @param {import('express').Request} [req]
  */
@@ -42,7 +45,16 @@ function getRedirectUri(req) {
       /localhost|127\.0\.0\.1/.test(u)
     ) {
       console.warn(
-        '[twitchviewer] TWITCH_REDIRECT_URI uses http:// but the server uses HTTPS by default. Use https:// in .env and Twitch, or set USE_HTTP=true.'
+        '[twitchviewer] TWITCH_REDIRECT_URI uses http:// but the server uses HTTPS (USE_HTTPS=true). Use https:// in Twitch or remove USE_HTTPS from .env.'
+      );
+    }
+    if (
+      useHttpOnly() &&
+      u.startsWith('https://') &&
+      /localhost|127\.0\.0\.1/.test(u)
+    ) {
+      console.warn(
+        '[twitchviewer] TWITCH_REDIRECT_URI uses https:// but the server uses HTTP. Use http:// in Twitch or set USE_HTTPS=true in .env.'
       );
     }
     return u;

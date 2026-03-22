@@ -18,7 +18,7 @@ echo.
 echo Starting the viewer...
 start "Twitch viewer" cmd /k "cd /d %~dp0 && node server.js"
 timeout /t 2 /nobreak >nul
-start "" "https://127.0.0.1:3000/"
+start "" "http://127.0.0.1:3000/"
 exit /b 0
 
 :EnsureNode

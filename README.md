@@ -4,7 +4,7 @@ A **local** web app for watching **multiple streams** in one grid: **Twitch**, *
 
 Twitch and YouTube embeds require a real `http://` or `https://` origin. This project ships a small **Node.js** server you run on your PC; opening files as `file://` will not load those players (platform rules).
 
-By default the server uses **HTTPS** with a **self-signed** certificate so OAuth redirect URLs can use `https://` (as Twitch often requires). Your browser will warn once; choose **Advanced → Continue** for local development only.
+By default the server uses **HTTP** on port **3000** (no certificate warning). Twitch OAuth **redirect URLs** must use **`http://`** to match (for example `http://127.0.0.1:3000/auth/callback`). Set **`USE_HTTPS=true`** in `.env` if you prefer **self-signed HTTPS** instead (browser will warn; then use **`https://`** redirect URLs in Twitch).
 
 ## Requirements
 
@@ -27,15 +27,16 @@ Edit `.env` with your Twitch **Client ID** and **Client Secret** if you use Twit
 npm start
 ```
 
-Open [https://127.0.0.1:3000](https://127.0.0.1:3000) or [https://localhost:3000](https://localhost:3000) and accept the certificate warning the first time (self-signed, local only). Register the matching **`https://…/auth/callback`** URLs in Twitch (see below).
+Open [http://127.0.0.1:3000](http://127.0.0.1:3000) or [http://localhost:3000](http://localhost:3000). Register the matching **`http://…/auth/callback`** URLs in Twitch (see below). If you use **`USE_HTTPS=true`**, open **`https://`** instead and accept the self-signed certificate warning once.
 
 On Windows you can double-click **`View Twitch Viewer.bat`** in the project folder: it runs `npm install` if needed, starts the server, and opens the browser.
 
 ## Twitch setup
 
 1. Go to the [Twitch Developer Console](https://dev.twitch.tv/console/apps) and **Register Your Application**.
-2. **OAuth Redirect URLs**: add the callback URL that matches how you open the app (must match **exactly**, including **https**, host, port, and path):
-   - **`https://127.0.0.1:3000/auth/callback`** and/or **`https://localhost:3000/auth/callback`** (default server uses HTTPS).
+2. **OAuth Redirect URLs**: add the callback URL that matches how you open the app (must match **exactly**, including **http** vs **https**, host, port, and path):
+   - **`http://127.0.0.1:3000/auth/callback`** and/or **`http://localhost:3000/auth/callback`** (default server uses HTTP).
+   - If you set **`USE_HTTPS=true`** in `.env`, use **`https://127.0.0.1:3000/auth/callback`** and/or **`https://localhost:3000/auth/callback`** instead.
    - Twitch treats `localhost` and `127.0.0.1` as different — add both if you switch between them.
 3. **Client type**: **Confidential** (the server keeps the client secret).
 4. After creation, copy the **Client ID**. Generate a **Client Secret** (shown once) and put both in `.env`.
@@ -54,8 +55,8 @@ Copy `.env.example` to `.env` and set:
 | `TWITCH_CLIENT_ID` | Yes* | From your Twitch app (*needed for live/offline, login, follows) |
 | `TWITCH_CLIENT_SECRET` | Yes* | From your Twitch app (Confidential apps) |
 | `PORT` | No | Server port (default `3000`) |
-| `TWITCH_REDIRECT_URI` | No | Must match a redirect URL on Twitch (default `https://127.0.0.1:PORT/auth/callback` when using HTTPS) |
-| `USE_HTTP` | No | Set to `true` to serve **HTTP only** (then use `http://…` OAuth URLs in Twitch) |
+| `TWITCH_REDIRECT_URI` | No | Must match a redirect URL on Twitch (default `http://127.0.0.1:PORT/auth/callback` when using HTTP) |
+| `USE_HTTPS` | No | Set to `true` for **self-signed HTTPS** (then use `https://…` OAuth URLs in Twitch) |
 | `SESSION_SECRET` | No | Random string used to sign login cookies (recommended so sessions behave predictably) |
 | `FFMPEG_MAX_HEIGHT` | No | For **`transcode:`** streams only: e.g. `480` to scale video height (lowers CPU use) |
 | `FFMPEG_PRESET` | No | x264 preset for transcoding (default `veryfast`; try `fast` or `faster` to reduce CPU a bit) |
@@ -122,12 +123,12 @@ Never commit `.env` or share your client secret. `.gitignore` excludes `.env`, `
 ## Troubleshooting
 
 - **Console spam from `background.js`, `chrome-extension://…`, disconnected ports**: Disable extensions (or use an InPrivate/Incognito window with extensions off) to confirm they are not from this app.
-- **Blank / blocked embeds**: Use `https://127.0.0.1:3000` or `https://localhost:3000`, not `file://`.
-- **Browser warns about certificate / “not secure”**: Expected for the built-in **self-signed** certificate. For local use only, use **Advanced → Continue** (wording varies by browser).
-- **`ERR_SSL_PROTOCOL_ERROR` when opening `http://`**: The default server listens for **HTTPS** only. Either open **`https://127.0.0.1:3000`**, or set **`USE_HTTP=true`** in `.env` and use **`http://`** everywhere (including Twitch OAuth URLs).
+- **Blank / blocked embeds**: Use `http://127.0.0.1:3000` or `http://localhost:3000` (default), not `file://`.
+- **Browser warns about certificate / “not secure”**: Only if you set **`USE_HTTPS=true`** (self-signed HTTPS). For local use only, use **Advanced → Continue** (wording varies by browser).
+- **`ERR_SSL_PROTOCOL_ERROR` when opening `https://`**: The default server uses **HTTP**. Either open **`http://127.0.0.1:3000`**, or set **`USE_HTTPS=true`** in `.env` and use **`https://`** everywhere (including Twitch OAuth URLs).
 - **`redirect_mismatch` / “redirect_uri does not match registered URI”**:
   - In the [Twitch Developer Console](https://dev.twitch.tv/console/apps), **OAuth Redirect URLs** must match **exactly** (including `https://` vs `http://`, host, port, and `/auth/callback`).
-  - Defaults: **`https://127.0.0.1:3000/auth/callback`** and **`https://localhost:3000/auth/callback`** — add the one(s) you use.
+  - Defaults: **`http://127.0.0.1:3000/auth/callback`** and **`http://localhost:3000/auth/callback`** — add the one(s) you use (or **`https://`** URLs if **`USE_HTTPS=true`**).
   - Optional: set **`TWITCH_REDIRECT_URI`** in `.env` to one exact URL and add **that same** URL in Twitch.
 - **Live/offline not working**: Confirm `TWITCH_CLIENT_ID` and `TWITCH_CLIENT_SECRET` in `.env` and restart the server.
 - **Logged out every server restart**: Set **`SESSION_SECRET`** in `.env`; ensure the server can write `.sessions/` (folder is gitignored but created automatically).
