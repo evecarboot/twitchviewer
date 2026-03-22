@@ -609,6 +609,8 @@
         const iframe = document.createElement('iframe');
         iframe.src = playerSrc(login);
         iframe.title = `Twitch: ${login}`;
+        iframe.setAttribute('width', '400');
+        iframe.setAttribute('height', '300');
         iframe.setAttribute('loading', 'eager');
         iframe.setAttribute(
           'allow',
@@ -655,11 +657,13 @@
           cell.appendChild(err);
         };
 
-        if (video.canPlayType('application/vnd.apple.mpegurl')) {
-          video.src = url;
-          video.play().catch(() => {});
-        } else if (typeof Hls !== 'undefined' && Hls.isSupported()) {
-          const hls = new Hls({ enableWorker: true });
+        // Prefer MSE + hls.js when available. Some browsers report a truthy
+        // canPlayType for application/vnd.apple.mpegurl but cannot play HLS
+        // via <video src> (e.g. Chromium), which breaks raw m3u8 URLs.
+        if (typeof Hls !== 'undefined' && Hls.isSupported()) {
+          const hls = new Hls({
+            enableWorker: false,
+          });
           hls.loadSource(url);
           hls.attachMedia(video);
           video._hls = hls;
@@ -669,10 +673,13 @@
           hls.on(Hls.Events.ERROR, (_, data) => {
             if (data.fatal) {
               fail(
-                'Stream failed (often CORS or dead URL). Try another source.'
+                'Stream failed (codec, CORS, or network). Try another source.'
               );
             }
           });
+        } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+          video.src = url;
+          video.play().catch(() => {});
         } else {
           fail('HLS not supported in this browser.');
         }
