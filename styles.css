@@ -336,6 +336,16 @@ body {
   background: #000;
 }
 
+/* Twitch.Player mounts a div; the inner iframe must fill the cell (≥400×300). */
+.cell .twitch-embed-mount {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  min-width: 400px;
+  min-height: 300px;
+}
+
 .cell-hls-error {
   position: absolute;
   bottom: 8px;

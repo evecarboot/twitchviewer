@@ -28,6 +28,8 @@
   let apiConfigured = false;
   let pollFailed = false;
   let onlineSet = new Set();
+  /** @type {unknown[]} */
+  let twitchPlayers = [];
   let pollTimer = null;
   /** @type {IntersectionObserver[]} */
   let cellObservers = [];
@@ -293,6 +295,70 @@
     params.set('autoplay', 'true');
     params.set('muted', 'true');
     return `https://player.twitch.tv/?${params.toString()}`;
+  }
+
+  function embedParentsArray() {
+    const h = window.location.hostname;
+    const set = new Set([h]);
+    if (h === '127.0.0.1') set.add('localhost');
+    if (h === 'localhost') set.add('127.0.0.1');
+    return Array.from(set);
+  }
+
+  function destroyTwitchPlayers() {
+    twitchPlayers.forEach((player) => {
+      try {
+        if (
+          player &&
+          typeof player === 'object' &&
+          typeof player.destroy === 'function'
+        ) {
+          player.destroy();
+        }
+      } catch {
+        /* ignore */
+      }
+    });
+    twitchPlayers = [];
+  }
+
+  function appendTwitchIframeFallback(mountEl, login) {
+    mountEl.textContent = '';
+    const iframe = document.createElement('iframe');
+    iframe.src = playerSrc(login);
+    iframe.title = `Twitch: ${login}`;
+    iframe.setAttribute('width', '400');
+    iframe.setAttribute('height', '300');
+    iframe.setAttribute(
+      'allow',
+      'autoplay; fullscreen; picture-in-picture; encrypted-media; clipboard-write'
+    );
+    iframe.allowFullscreen = true;
+    mountEl.appendChild(iframe);
+  }
+
+  function scheduleTwitchPlayer(mountId, mountEl, login) {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        if (typeof window.Twitch === 'undefined' || !window.Twitch.Player) {
+          appendTwitchIframeFallback(mountEl, login);
+          return;
+        }
+        try {
+          const player = new window.Twitch.Player(mountId, {
+            channel: login,
+            width: '100%',
+            height: '100%',
+            parent: embedParentsArray(),
+            autoplay: true,
+            muted: true,
+          });
+          twitchPlayers.push(player);
+        } catch {
+          appendTwitchIframeFallback(mountEl, login);
+        }
+      });
+    });
   }
 
   function chatSrc(login) {
@@ -732,6 +798,7 @@
 
   function renderGrid() {
     disconnectCellObservers();
+    destroyTwitchPlayers();
     destroyGridHls();
     const visible = visibleChannels();
     const n = visible.length;
@@ -741,25 +808,19 @@
     els.grid.classList.toggle('one-col', n === 1);
 
     els.grid.innerHTML = '';
-    visible.forEach((ch) => {
+    visible.forEach((ch, idx) => {
       const cell = document.createElement('div');
       cell.className = 'cell';
       const t = getChannelType(ch);
 
       if (t === 'twitch') {
         const login = getTwitchLogin(ch);
-        const iframe = document.createElement('iframe');
-        iframe.src = playerSrc(login);
-        iframe.title = `Twitch: ${login}`;
-        iframe.setAttribute('width', '400');
-        iframe.setAttribute('height', '300');
-        iframe.setAttribute(
-          'allow',
-          'autoplay; fullscreen; picture-in-picture; encrypted-media; clipboard-write'
-        );
-        iframe.setAttribute('referrerpolicy', 'strict-origin-when-cross-origin');
-        iframe.allowFullscreen = true;
-        cell.appendChild(iframe);
+        const mountId = `twitch-embed-${idx}`;
+        const mount = document.createElement('div');
+        mount.id = mountId;
+        mount.className = 'twitch-embed-mount';
+        cell.appendChild(mount);
+        scheduleTwitchPlayer(mountId, mount, login);
         const lab = document.createElement('div');
         lab.className = 'cell-label';
         lab.textContent = login;
