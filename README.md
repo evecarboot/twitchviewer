@@ -89,7 +89,7 @@ Never commit `.env` or share your client secret. `.gitignore` excludes `.env`, `
 
 ### Notes
 
-- **Twitch embeds** use the [documented iframe URL](https://dev.twitch.tv/docs/embed/video-and-clips/) (`channel`, `parent`, `muted=true`, `autoplay=true`; cells are at least **400×300** px). Browsers and Twitch may still require a tap to play on some devices; **HLS** (`m3u8` / `transcode:`) uses `<video>` and often behaves more predictably.
+- **Twitch embeds** use the [documented iframe URL](https://dev.twitch.tv/docs/embed/video-and-clips/) (`channel`, `parent`, `muted=true`, `autoplay=true`; cells are at least **400×300** px). Twitch’s player also enforces [embedded visibility rules](https://dev.twitch.tv/docs/embed/) — if the console says **style visibility** / **viewport visibility**, the embed wasn’t considered visible yet; this app loads each Twitch iframe only when its cell is in (or near) the grid viewport and staggers loads to reduce **429** errors from opening many embeds at once. **HLS** (`m3u8` / `transcode:`) avoids Twitch’s iframe entirely if you need the most reliable playback.
 - **Channel points**: Twitch does not guarantee that **embedded** players earn channel points the same way as watching on **twitch.tv**. For reliable channel points, watch on Twitch directly.
 - **Same host for OAuth**: use either **`localhost`** or **`127.0.0.1`** consistently; cookies are per-host.
 

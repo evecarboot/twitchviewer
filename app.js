@@ -301,7 +301,13 @@
     return `https://player.twitch.tv/?${params.toString()}`;
   }
 
-  function attachTwitchIframe(cell, login) {
+  /**
+   * Twitch’s player refuses autoplay unless “Embedded Experiences” visibility checks pass
+   * (see console: style visibility / viewport visibility). Loading every embed at once also
+   * hits passport/gql with 429. We assign player.twitch.tv only when the cell is in (or near)
+   * the scrollable grid, after layout, with a small stagger between embeds.
+   */
+  function attachTwitchIframe(cell, login, loadIndex) {
     const iframe = document.createElement('iframe');
     iframe.dataset.twitchEmbed = '1';
     iframe.title = `Twitch: ${login}`;
@@ -311,9 +317,40 @@
       'allow',
       'autoplay; fullscreen; picture-in-picture; encrypted-media; clipboard-write'
     );
-    iframe.allowFullscreen = true;
-    iframe.src = playerSrc(login);
+    iframe.src = 'about:blank';
     cell.appendChild(iframe);
+
+    const url = playerSrc(login);
+    const idx = loadIndex || 0;
+    const startLoad = () => {
+      if (iframe.dataset.twitchLoadStarted === '1') return;
+      iframe.dataset.twitchLoadStarted = '1';
+      const staggerMs = Math.min(idx * 120, 4000);
+      window.setTimeout(() => {
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            iframe.src = url;
+          });
+        });
+      }, staggerMs);
+    };
+
+    if (!els.grid || typeof IntersectionObserver === 'undefined') {
+      startLoad();
+      return;
+    }
+
+    const obs = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => {
+          if (!entry.isIntersecting) return;
+          obs.disconnect();
+          startLoad();
+        });
+      },
+      { root: els.grid, rootMargin: '200px', threshold: 0.02 }
+    );
+    obs.observe(cell);
   }
 
   function chatSrc(login) {
@@ -739,6 +776,7 @@
     els.grid.classList.toggle('one-col', n === 1);
 
     els.grid.innerHTML = '';
+    let twitchLoadIndex = 0;
     visible.forEach((ch) => {
       const cell = document.createElement('div');
       cell.className = 'cell';
@@ -746,7 +784,7 @@
 
       if (t === 'twitch') {
         const login = getTwitchLogin(ch);
-        attachTwitchIframe(cell, login);
+        attachTwitchIframe(cell, login, twitchLoadIndex++);
         const lab = document.createElement('div');
         lab.className = 'cell-label';
         lab.textContent = login;
