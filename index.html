@@ -65,6 +65,15 @@
           >
             Refresh streams
           </button>
+          <button
+            type="button"
+            class="ghost"
+            id="start-twitch-players"
+            hidden
+            title="Twitch’s player runs in its own site; we can’t click it for you, but we can ask it to play via Twitch’s API"
+          >
+            Start Twitch
+          </button>
           <label class="check">
             <input type="checkbox" id="show-chat" />
             Show chat
@@ -130,9 +139,10 @@
             <div class="playback-gate-inner">
               <p id="playback-gate-title" class="playback-gate-title">Start playback</p>
               <p class="playback-gate-hint">
-                Many browsers only let Twitch embeds start after you interact with this page.
-                Click anywhere here to load players (streams stay muted until you unmute in each
-                player).
+                Twitch’s video is a separate website inside each cell — this page is not allowed to
+                press its play button for you (browser security). Click here to load the players,
+                then use <strong>Start Twitch</strong> in the bar if a stream still shows play.
+                Streams stay muted until you unmute in each player.
               </p>
             </div>
           </div>
@@ -197,6 +207,7 @@
       </div>
     </div>
 
+    <script src="https://player.twitch.tv/js/embed/v1.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.7/dist/hls.min.js"></script>
     <script src="app.js"></script>
   </body>

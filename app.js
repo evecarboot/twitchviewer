@@ -49,6 +49,10 @@
   let pollTimer = null;
   /** @type {IntersectionObserver[]} */
   let cellObservers = [];
+  /** Twitch.Player instances for the current grid (destroyed on each render). */
+  /** @type {any[]} */
+  let twitchPlayerInstances = [];
+  let twitchEmbedSeq = 0;
   /** @type {Set<string>} */
   let followModalSelection = new Set();
 
@@ -57,6 +61,7 @@
     channelInput: document.getElementById('channel-input'),
     hideOffline: document.getElementById('hide-offline'),
     refreshStreams: document.getElementById('refresh-streams'),
+    startTwitchPlayers: document.getElementById('start-twitch-players'),
     showChat: document.getElementById('show-chat'),
     hideChatPanelWrap: document.getElementById('hide-chat-panel-wrap'),
     hideChatPanel: document.getElementById('hide-chat-panel'),
@@ -315,14 +320,24 @@
     return `https://player.twitch.tv/?${params.toString()}`;
   }
 
-  /** Plain Twitch iframe embed (see https://dev.twitch.tv/docs/embed/video-and-clips/). */
-  function attachTwitchIframe(cell, login) {
+  function parentDomainsForTwitch() {
+    const h = window.location.hostname;
+    const parent = [h];
+    if (h === '127.0.0.1') parent.push('localhost');
+    if (h === 'localhost') parent.push('127.0.0.1');
+    return parent;
+  }
+
+  /**
+   * Raw iframe only — parent JS cannot click inside this iframe (cross-origin).
+   * Prefer Twitch.Player + play() when embed v1.js is available.
+   */
+  function attachTwitchIframePlain(cell, login) {
     const iframe = document.createElement('iframe');
     iframe.dataset.twitchEmbed = '1';
     iframe.title = `Twitch: ${login}`;
     iframe.setAttribute('width', '400');
     iframe.setAttribute('height', '300');
-    /* `*` delegates autoplay to the embedded player origin (Chromium autoplay policy). */
     iframe.setAttribute(
       'allow',
       'autoplay *; fullscreen *; picture-in-picture *; encrypted-media *; clipboard-write *'
@@ -335,6 +350,68 @@
       iframe.src = playerSrc(login);
     }
     cell.appendChild(iframe);
+  }
+
+  function playAllTwitchPlayers() {
+    twitchPlayerInstances.forEach((player) => {
+      try {
+        if (player && typeof player.play === 'function') player.play();
+      } catch {
+        /* ignore */
+      }
+    });
+  }
+
+  /** Plain Twitch iframe embed (see https://dev.twitch.tv/docs/embed/video-and-clips/). */
+  function attachTwitchIframe(cell, login) {
+    if (twitchEmbedsDeferredUntilGesture()) {
+      const ph = document.createElement('div');
+      ph.className = 'twitch-deferred-placeholder';
+      ph.textContent = 'Use “Start playback” above to load Twitch embeds.';
+      cell.appendChild(ph);
+      return;
+    }
+
+    if (
+      typeof window.Twitch === 'undefined' ||
+      typeof window.Twitch.Player !== 'function'
+    ) {
+      attachTwitchIframePlain(cell, login);
+      return;
+    }
+
+    const host = document.createElement('div');
+    host.className = 'twitch-embed-host';
+    const id = `twitch-embed-${++twitchEmbedSeq}`;
+    host.id = id;
+    cell.appendChild(host);
+
+    try {
+      const player = new window.Twitch.Player(id, {
+        width: '100%',
+        height: '100%',
+        channel: login,
+        parent: parentDomainsForTwitch(),
+        muted: true,
+        autoplay: Boolean(state.autoplayStreams),
+      });
+      twitchPlayerInstances.push(player);
+      const readyEv =
+        window.Twitch.Player && window.Twitch.Player.READY
+          ? window.Twitch.Player.READY
+          : 'ready';
+      player.addEventListener(readyEv, () => {
+        if (!state.autoplayStreams) return;
+        try {
+          if (typeof player.play === 'function') player.play();
+        } catch {
+          /* ignore */
+        }
+      });
+    } catch {
+      host.remove();
+      attachTwitchIframePlain(cell, login);
+    }
   }
 
   function chatSrc(login) {
@@ -670,6 +747,17 @@
     });
   }
 
+  function destroyGridTwitchPlayers() {
+    twitchPlayerInstances.forEach((player) => {
+      try {
+        if (player && typeof player.destroy === 'function') player.destroy();
+      } catch {
+        /* ignore */
+      }
+    });
+    twitchPlayerInstances = [];
+  }
+
   function disconnectCellObservers() {
     cellObservers.forEach((o) => o.disconnect());
     cellObservers = [];
@@ -752,6 +840,7 @@
   function renderGrid() {
     disconnectCellObservers();
     destroyGridHls();
+    destroyGridTwitchPlayers();
     const visible = visibleChannels();
     const n = visible.length;
     const { cols, rows } = gridDimensions(n);
@@ -942,6 +1031,12 @@
     els.refreshStreams.disabled = !hasAny;
   }
 
+  function updateStartTwitchButton() {
+    if (!els.startTwitchPlayers) return;
+    const hasTwitch = state.channels.some((c) => getChannelType(c) === 'twitch');
+    els.startTwitchPlayers.hidden = !hasTwitch;
+  }
+
   function setupPlaybackGate() {
     if (!els.playbackGate) return;
     const hasTwitch = state.channels.some((c) => getChannelType(c) === 'twitch');
@@ -960,6 +1055,7 @@
     applyToolbarLayout();
     updateFollowImportButtonsVisibility();
     updateRefreshStreamsButton();
+    updateStartTwitchButton();
     setupPlaybackGate();
   }
 
@@ -1090,6 +1186,12 @@
       } finally {
         updateRefreshStreamsButton();
       }
+    });
+  }
+
+  if (els.startTwitchPlayers) {
+    els.startTwitchPlayers.addEventListener('click', () => {
+      playAllTwitchPlayers();
     });
   }
 
