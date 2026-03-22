@@ -318,6 +318,28 @@
     });
   }
 
+  /** Stable signature of the current grid — used to skip rebuild when poll didn’t change visibility. */
+  function visibleChannelsSignature() {
+    return visibleChannels()
+      .map((ch) => channelKey(ch))
+      .join('\x1e');
+  }
+
+  function updateOfflineBar() {
+    const offline = state.channels
+      .filter(
+        (c) =>
+          getChannelType(c) === 'twitch' && !onlineSet.has(getTwitchLogin(c))
+      )
+      .map((c) => getTwitchLogin(c));
+    if (state.hideOffline && apiConfigured && !pollFailed && offline.length) {
+      els.offlineBar.hidden = false;
+      els.offlineBar.textContent = `Offline (hidden): ${offline.join(', ')}`;
+    } else {
+      els.offlineBar.hidden = true;
+    }
+  }
+
   function twitchLoginsForPoll() {
     return state.channels
       .filter((c) => getChannelType(c) === 'twitch')
@@ -851,18 +873,7 @@
       els.grid.appendChild(cell);
     });
 
-    const offline = state.channels
-      .filter(
-        (c) =>
-          getChannelType(c) === 'twitch' && !onlineSet.has(getTwitchLogin(c))
-      )
-      .map((c) => getTwitchLogin(c));
-    if (state.hideOffline && apiConfigured && !pollFailed && offline.length) {
-      els.offlineBar.hidden = false;
-      els.offlineBar.textContent = `Offline (hidden): ${offline.join(', ')}`;
-    } else {
-      els.offlineBar.hidden = true;
-    }
+    updateOfflineBar();
 
     requestAnimationFrame(() => {
       requestAnimationFrame(() => attachCellObserversToGrid());
@@ -934,9 +945,16 @@
   }
 
   async function tick() {
+    const before = visibleChannelsSignature();
     await refreshOnline();
     renderChannelChips();
-    renderGrid();
+    updateOfflineBar();
+    /* Rebuilding the grid nukes every iframe — only do it when hide-offline / live
+       state actually changes who is shown. Otherwise polls every 45s would restart
+       all Twitch players and feel like streams “died” for no reason. */
+    if (visibleChannelsSignature() !== before) {
+      renderGrid();
+    }
   }
 
   async function refreshOnly() {
