@@ -292,62 +292,6 @@ body {
   flex-direction: column;
 }
 
-.playback-unlock-bar {
-  flex-shrink: 0;
-  padding: 0.5rem 0.75rem;
-  background: rgba(0, 0, 0, 0.92);
-  border-bottom: 1px solid var(--border);
-  color: var(--text);
-}
-
-.playback-unlock-inner {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.75rem;
-  max-width: 960px;
-}
-
-.playback-unlock-text {
-  margin: 0;
-  font-size: 0.85rem;
-  line-height: 1.35;
-  color: var(--muted);
-  flex: 1 1 200px;
-}
-
-.playback-unlock-btn {
-  flex-shrink: 0;
-  padding: 0.5rem 1rem;
-  border-radius: 6px;
-  border: 1px solid var(--border);
-  background: var(--surface);
-  color: var(--text);
-  cursor: pointer;
-  font-size: 0.9rem;
-}
-
-.playback-unlock-btn:hover {
-  filter: brightness(1.08);
-}
-
-.cell-twitch-pending {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: #111;
-  z-index: 1;
-}
-
-.cell-twitch-pending-msg {
-  font-size: 0.8rem;
-  color: var(--muted);
-  text-align: center;
-  padding: 0 1rem;
-}
-
 .main.chat-on-left .grid-area {
   order: 2;
 }

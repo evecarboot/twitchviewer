@@ -71,7 +71,7 @@ Never commit `.env` or share your client secret. `.gitignore` excludes `.env`, `
 - **YouTube**: paste a watch, embed, Shorts, or live URL, or use `yt:` / `youtube:` plus the video ID or URL.
 - **HLS**: paste an `https://…` playlist URL that looks like HLS (often contains `m3u8`, `/hls/`, or `/manifest/`), or prefix with `hls:`.
 - **Transcoded HLS** (`transcode:https://…/playlist.m3u8`): the server runs **ffmpeg** to re-encode to **H.264/AAC** (needed for many broadcast **MPEG-2** `.ts` streams that Chrome/Edge cannot decode). Requires **ffmpeg** installed and on `PATH`. The app checks `/api/transcode/status` before adding.
-- **Grid**: layout scales with the number of streams; **minimum cell size** is enforced (~**400×300** CSS pixels) so **Twitch** embeds can autoplay (muted); the grid **scrolls** when needed. The first time per browser, use **Start Twitch streams** (user gesture) if the browser blocks autoplay until you click.
+- **Grid**: layout scales with the number of streams; **minimum cell size** is enforced (~**400×300** CSS pixels) so **Twitch** embeds can autoplay (muted); the grid **scrolls** when needed.
 - **Persistence**: channel list and UI options are stored in **`localStorage`** (saved layout survives refresh and browser restart).
 
 ### Twitch-only features
@@ -123,7 +123,7 @@ Never commit `.env` or share your client secret. `.gitignore` excludes `.env`, `
 ## Troubleshooting
 
 - **Console spam from `background.js`, `chrome-extension://…`, disconnected ports**: Disable extensions (or use an InPrivate/Incognito window with extensions off) to confirm they are not from this app.
-- **Blank / blocked embeds**: Use `https://127.0.0.1:3000` or `https://localhost:3000` (default), not `file://`. Click **Start Twitch streams** once if embeds stay black (browser autoplay policy).
+- **Blank / blocked embeds**: Use `https://127.0.0.1:3000` or `https://localhost:3000` (default), not `file://`.
 - **Browser warns about certificate / “not secure”**: Expected for the built-in **self-signed** certificate. For local use only, use **Advanced → Continue** (wording varies by browser).
 - **`ERR_SSL_PROTOCOL_ERROR` when opening `http://`**: The default server listens for **HTTPS**. Either open **`https://127.0.0.1:3000`**, or set **`USE_HTTP=true`** in `.env` and use **`http://`** everywhere (including Twitch OAuth URLs).
 - **`redirect_mismatch` / “redirect_uri does not match registered URI”**:
