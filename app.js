@@ -351,7 +351,7 @@
             } catch {
               /* ignore */
             }
-            window.setTimeout(resolve, 450);
+            window.setTimeout(resolve, 900);
           }, 0);
         })
     );
@@ -484,7 +484,7 @@
       const iframe = document.createElement('iframe');
       iframe.dataset.twitchEmbed = '1';
       iframe.title = `Twitch: ${login}`;
-      iframe.setAttribute('allowfullscreen', '');
+      /* `allow` includes fullscreen — avoid duplicate allowfullscreen (Chrome warns). */
       iframe.allow =
         'autoplay; fullscreen; picture-in-picture; clipboard-write; encrypted-media; web-share';
       const params = new URLSearchParams();
@@ -1692,7 +1692,7 @@
         );
       });
       console.log(
-        '[twitchviewer] If Twitch still blocks autoplay: domain policy (Twitch can disable autoplay per site), offline stream, mobile (tap required), CSS transforms around the embed, or Chrome media engagement — see https://dev.twitch.tv/docs/embed/video-and-clips/'
+        '[twitchviewer] If Twitch still blocks autoplay: domain policy, offline stream, mobile (tap required), CSS transforms, or browser extensions that inject into player.twitch.tv (see console guide on load). Docs: https://dev.twitch.tv/docs/embed/'
       );
     };
   }
@@ -1721,7 +1721,7 @@
     fullRender();
     schedulePoll();
     console.info(
-      '[twitchviewer] Vague “autoplay disabled” messages in the console usually come from the Twitch player (player.twitch.tv iframe), not from this app. Run twitchviewerAutoplayDiagnostics() here to check cell size and iframe allow=autoplay.'
+      '[twitchviewer] Reading the console: (1) "runtime.lastError", "background.js", "disconnected port" = a Chrome extension, not this app — disable extensions on 127.0.0.1 or use a clean profile. (2) "hookWorkerFetch", "Replaced player type with popout" = an extension rewriting Twitch’s player and can cause "style visibility" autoplay errors — disable it. (3) 429 on gql/passport.twitch.tv = too many embeds; we stagger loads (~900ms); try fewer streams. (4) ERR_BLOCKED_BY_CLIENT = ad blocker. (5) Twitch "style visibility" = Twitch embed rules: https://dev.twitch.tv/docs/embed/ — Run twitchviewerAutoplayDiagnostics() for cell sizes.'
     );
     window.addEventListener('resize', scheduleLayoutGridToViewport);
     if (window.visualViewport) {
