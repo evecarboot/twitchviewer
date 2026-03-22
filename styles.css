@@ -350,6 +350,12 @@ body {
   min-height: 0;
 }
 
+/* .chat-panel { display: flex } overrides the native [hidden] rule; force collapse */
+#chat-panel[hidden],
+#peek-chat[hidden] {
+  display: none !important;
+}
+
 .chat-panel-header {
   display: flex;
   align-items: center;

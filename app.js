@@ -111,22 +111,22 @@
     qs.append('parent', h);
     if (h === '127.0.0.1') qs.append('parent', 'localhost');
     if (h === 'localhost') qs.append('parent', '127.0.0.1');
-    return qs.toString();
+    return qs;
   }
 
   function playerSrc(login) {
-    const q = embedParents();
-    // autoplay=true + muted=true: browsers allow muted autoplay without a click; unmuted is usually blocked.
-    return `https://player.twitch.tv/?channel=${encodeURIComponent(
-      login
-    )}&${q}&autoplay=true&muted=true`;
+    const params = embedParents();
+    params.set('channel', login);
+    params.set('autoplay', 'true');
+    params.set('muted', 'true');
+    return `https://player.twitch.tv/?${params.toString()}`;
   }
 
   function chatSrc(login) {
-    const q = embedParents();
+    const params = embedParents();
     return `https://www.twitch.tv/embed/${encodeURIComponent(
       login
-    )}/chat?${q}&darkpopout`;
+    )}/chat?${params.toString()}&darkpopout`;
   }
 
   function gridDimensions(count) {
@@ -399,7 +399,12 @@
       const iframe = document.createElement('iframe');
       iframe.src = playerSrc(login);
       iframe.title = `Twitch: ${login}`;
-      iframe.setAttribute('allow', 'autoplay; fullscreen; picture-in-picture');
+      iframe.setAttribute('loading', 'eager');
+      iframe.setAttribute(
+        'allow',
+        'autoplay; fullscreen; picture-in-picture; encrypted-media; clipboard-write'
+      );
+      iframe.setAttribute('referrerpolicy', 'strict-origin-when-cross-origin');
       iframe.allowFullscreen = true;
       cell.appendChild(iframe);
       const lab = document.createElement('div');

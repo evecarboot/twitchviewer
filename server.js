@@ -4,6 +4,7 @@ const http = require('http');
 const https = require('https');
 const express = require('express');
 const session = require('express-session');
+const FileStore = require('session-file-store')(session);
 const selfsigned = require('selfsigned');
 require('dotenv').config();
 
@@ -118,18 +119,27 @@ function helixHeaders(accessToken) {
   };
 }
 
+const SESSION_MS = 14 * 24 * 60 * 60 * 1000;
+
 app.use(
   session({
     name: 'twitchviewer.sid',
+    store: new FileStore({
+      path: path.join(__dirname, '.sessions'),
+      ttl: Math.floor(SESSION_MS / 1000),
+      retries: 0,
+      logFn: () => {},
+    }),
     secret:
       process.env.SESSION_SECRET ||
       'change-me-in-production-use-long-random-string',
     resave: false,
     saveUninitialized: false,
+    rolling: true,
     cookie: {
       httpOnly: true,
       secure: !useHttpOnly(),
-      maxAge: 14 * 24 * 60 * 60 * 1000,
+      maxAge: SESSION_MS,
       sameSite: 'lax',
     },
   })
@@ -142,11 +152,12 @@ app.get('/api/status', (req, res) => {
   res.json({ configured });
 });
 
-app.get('/api/me', (req, res) => {
+app.get('/api/me', async (req, res) => {
   const t = req.session.twitch;
   if (!t?.login) {
     return res.json({ authenticated: false });
   }
+  await getUserAccessToken(req);
   res.json({
     authenticated: true,
     user: {
