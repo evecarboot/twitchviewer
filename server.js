@@ -1,5 +1,6 @@
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const crypto = require('crypto');
 const http = require('http');
 const https = require('https');
@@ -139,13 +140,40 @@ function helixHeaders(accessToken) {
 
 const SESSION_MS = 14 * 24 * 60 * 60 * 1000;
 
+/**
+ * File session store: Windows + project under OneDrive/Downloads often hits EPERM on rename.
+ * Default on Windows → LOCALAPPDATA (not synced). Override with SESSION_FILE_PATH.
+ */
+function getSessionStorePath() {
+  const envPath = process.env.SESSION_FILE_PATH?.trim();
+  if (envPath) return path.resolve(envPath);
+  if (process.platform === 'win32') {
+    const base = process.env.LOCALAPPDATA || os.tmpdir();
+    return path.join(base, 'twitchviewer', 'sessions');
+  }
+  return path.join(__dirname, '.sessions');
+}
+
+const sessionStorePath = getSessionStorePath();
+try {
+  fs.mkdirSync(sessionStorePath, { recursive: true });
+} catch (e) {
+  console.warn(
+    '[twitchviewer] Could not create session directory:',
+    sessionStorePath,
+    e.message
+  );
+}
+
 app.use(
   session({
     name: 'twitchviewer.sid',
     store: new FileStore({
-      path: path.join(__dirname, '.sessions'),
+      path: sessionStorePath,
       ttl: Math.floor(SESSION_MS / 1000),
-      retries: 0,
+      retries: 25,
+      minTimeout: 50,
+      maxTimeout: 250,
       logFn: () => {},
     }),
     secret:
@@ -883,6 +911,7 @@ async function createTlsOptions() {
  * @param {{ source: 'custom' | 'selfsigned', label?: string } | undefined} [tlsInfo]
  */
 function printStartupTips(scheme, tlsInfo) {
+  console.log(`Session files: ${sessionStorePath}`);
   console.log(
     `OAuth redirect URLs to register in Twitch (must match scheme ${scheme}://):`
   );
