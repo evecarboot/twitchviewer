@@ -17,6 +17,9 @@
 html,
 body {
   height: 100%;
+  /* Percentage height can fail in fullscreen / dynamic toolbars; dvh fills the viewport. */
+  min-height: 100vh;
+  min-height: 100dvh;
   margin: 0;
   background: var(--bg);
   color: var(--text);
@@ -67,7 +70,8 @@ body {
   display: flex;
   flex-direction: column;
   height: 100%;
-  min-height: 0;
+  min-height: 100vh;
+  min-height: 100dvh;
   min-width: 0;
   overflow-x: hidden;
 }
@@ -279,14 +283,17 @@ body {
 }
 
 .main {
-  flex: 1;
+  /* basis 0 so this row fills all space below the toolbar (avoids 1fr rows collapsing to 300px). */
+  flex: 1 1 0;
   min-height: 0;
+  min-width: 0;
   display: flex;
   flex-direction: row;
+  align-items: stretch;
 }
 
 .grid-area {
-  flex: 1;
+  flex: 1 1 0;
   min-width: 0;
   min-height: 0;
   width: 100%;
@@ -294,6 +301,7 @@ body {
   position: relative;
   display: flex;
   flex-direction: column;
+  align-items: stretch;
 }
 
 .main.chat-on-left .grid-area {
@@ -310,7 +318,7 @@ body {
    minmax(400px, 1fr) / minmax(300px, 1fr) keeps that minimum while cells grow
    to fill the window (iframes are position:absolute; inset:0; width/height 100%). */
 .grid {
-  flex: 1;
+  flex: 1 1 0;
   min-width: 0;
   min-height: 0;
   width: 100%;

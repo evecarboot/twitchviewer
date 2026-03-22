@@ -574,18 +574,24 @@
   }
 
   function gridViewportSize() {
-    if (!els.grid) return { w: 1200, h: 800 };
-    const r = els.grid.getBoundingClientRect();
-    let w = r.width;
-    let h = r.height;
-    if (w < 2 || h < 2) {
-      const iw = window.innerWidth;
-      const ih = window.innerHeight;
-      const th = els.toolbar ? els.toolbar.getBoundingClientRect().height : 0;
-      w = Math.max(400, iw - 8);
-      h = Math.max(300, ih - th - 8);
+    /** Prefer #main — .grid height can be wrong before flex distributes space (e.g. fullscreen). */
+    const primary = els.main || els.gridArea || els.grid;
+    if (primary) {
+      const r = primary.getBoundingClientRect();
+      if (r.width >= 2 && r.height >= 2) {
+        return { w: Math.max(400, r.width), h: Math.max(300, r.height) };
+      }
     }
-    return { w: Math.max(400, w), h: Math.max(300, h) };
+    const iw = window.innerWidth;
+    const ih = window.innerHeight;
+    const th =
+      els.toolbar && !els.toolbar.classList.contains('collapsed')
+        ? els.toolbar.getBoundingClientRect().height
+        : 0;
+    return {
+      w: Math.max(400, iw - 8),
+      h: Math.max(300, ih - th - 8),
+    };
   }
 
   /**
@@ -1826,15 +1832,14 @@
       `[twitchviewer] Twitch playback: ${twitchPlayback}. With streamlink+ffmpeg on the server, Twitch uses HLS (reliable muted autoplay). Otherwise the official iframe embed is used. Run twitchviewerAutoplayDiagnostics().`
     );
     window.addEventListener('resize', scheduleLayoutGridToViewport);
+    document.addEventListener('fullscreenchange', scheduleLayoutGridToViewport);
     if (window.visualViewport) {
       window.visualViewport.addEventListener('resize', scheduleLayoutGridToViewport);
     }
     if (typeof ResizeObserver !== 'undefined') {
-      const target = els.gridArea || els.grid;
-      if (target) {
-        const ro = new ResizeObserver(() => scheduleLayoutGridToViewport());
-        ro.observe(target);
-      }
+      const ro = new ResizeObserver(() => scheduleLayoutGridToViewport());
+      if (els.main) ro.observe(els.main);
+      if (els.gridArea) ro.observe(els.gridArea);
     }
     if (urlErr) {
       try {

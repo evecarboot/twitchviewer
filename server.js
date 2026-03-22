@@ -7,7 +7,7 @@ const https = require('https');
 const { spawn, spawnSync } = require('child_process');
 const express = require('express');
 const session = require('express-session');
-const FileStore = require('session-file-store')(session);
+const SQLiteStore = require('connect-sqlite3')(session);
 const selfsigned = require('selfsigned');
 require('dotenv').config();
 
@@ -141,26 +141,35 @@ function helixHeaders(accessToken) {
 const SESSION_MS = 14 * 24 * 60 * 60 * 1000;
 
 /**
- * File session store: Windows + project under OneDrive/Downloads often hits EPERM on rename.
- * Default on Windows → LOCALAPPDATA (not synced). Override with SESSION_FILE_PATH.
+ * SQLite session store (no temp+rename, avoids Windows EPERM from session-file-store + AV/sync).
+ * Default on Windows → LOCALAPPDATA. Override directory with SESSION_FILE_PATH (file: sessions.sqlite inside it).
  */
-function getSessionStorePath() {
+function getSessionSqlitePath() {
   const envPath = process.env.SESSION_FILE_PATH?.trim();
-  if (envPath) return path.resolve(envPath);
+  if (envPath) {
+    const resolved = path.resolve(envPath);
+    if (/\.(sqlite|db)$/i.test(resolved)) {
+      return resolved;
+    }
+    return path.join(resolved, 'sessions.sqlite');
+  }
   if (process.platform === 'win32') {
     const base = process.env.LOCALAPPDATA || os.tmpdir();
-    return path.join(base, 'twitchviewer', 'sessions');
+    return path.join(base, 'twitchviewer', 'sessions.sqlite');
   }
-  return path.join(__dirname, '.sessions');
+  return path.join(__dirname, '.sessions.sqlite');
 }
 
-const sessionStorePath = getSessionStorePath();
+const sessionSqlitePath = getSessionSqlitePath();
+const sessionSqliteDir = path.dirname(sessionSqlitePath);
+const sessionDbName = path.basename(sessionSqlitePath);
+
 try {
-  fs.mkdirSync(sessionStorePath, { recursive: true });
+  fs.mkdirSync(sessionSqliteDir, { recursive: true });
 } catch (e) {
   console.warn(
     '[twitchviewer] Could not create session directory:',
-    sessionStorePath,
+    sessionSqliteDir,
     e.message
   );
 }
@@ -168,13 +177,12 @@ try {
 app.use(
   session({
     name: 'twitchviewer.sid',
-    store: new FileStore({
-      path: sessionStorePath,
-      ttl: Math.floor(SESSION_MS / 1000),
-      retries: 25,
-      minTimeout: 50,
-      maxTimeout: 250,
-      logFn: () => {},
+    store: new SQLiteStore({
+      db: sessionDbName,
+      dir: sessionSqliteDir,
+      table: 'sessions',
+      concurrentDb: true,
+      createDirIfNotExists: true,
     }),
     secret:
       process.env.SESSION_SECRET ||
@@ -250,9 +258,17 @@ app.get('/api/me', async (req, res) => {
 });
 
 app.get('/auth/twitch', (req, res) => {
-  const clientId = process.env.TWITCH_CLIENT_ID;
+  const clientId = process.env.TWITCH_CLIENT_ID?.trim();
   if (!clientId) {
-    return res.status(500).type('text').send('TWITCH_CLIENT_ID is not set');
+    return res
+      .status(503)
+      .type('html')
+      .send(
+        `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Login not configured</title></head><body style="font-family:sans-serif;max-width:36rem;margin:2rem;line-height:1.45">
+<h1>Twitch login is not configured</h1>
+<p>Copy <code>.env.example</code> to <code>.env</code> and set <strong>TWITCH_CLIENT_ID</strong> and <strong>TWITCH_CLIENT_SECRET</strong> from your <a href="https://dev.twitch.tv/console/apps">Twitch Developer Console</a> app, then restart the server.</p>
+<p><a href="/">Back to viewer</a></p></body></html>`
+      );
   }
   const state = crypto.randomBytes(24).toString('hex');
   req.session.oauthState = state;
@@ -260,11 +276,27 @@ app.get('/auth/twitch', (req, res) => {
   const params = new URLSearchParams({
     client_id: clientId,
     redirect_uri: redirectUri,
-    response_type: 'code',
     scope: SCOPES,
+    response_type: 'code',
     state,
   });
-  res.redirect(`https://id.twitch.tv/oauth2/authorize?${params.toString()}`);
+  const authorizeUrl = `https://id.twitch.tv/oauth2/authorize?${params.toString()}`;
+  /** Persist oauth state before redirect so /auth/callback still sees it (file store is async). */
+  req.session.save((err) => {
+    if (err) {
+      console.error('[twitchviewer] Session save failed before OAuth redirect:', err);
+      return res
+        .status(503)
+        .type('html')
+        .send(
+          `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Login unavailable</title></head><body style="font-family:sans-serif;max-width:36rem;margin:2rem;line-height:1.45">
+<h1>Could not start login</h1>
+<p>The server could not save your session (needed for the Twitch redirect). Check that it can create/write the SQLite session file (see <code>SESSION_FILE_PATH</code> in <code>.env</code>; on Windows the default is under <code>%LOCALAPPDATA%\\twitchviewer\\sessions.sqlite</code>).</p>
+<p><a href="/">Back to viewer</a></p></body></html>`
+        );
+    }
+    res.redirect(authorizeUrl);
+  });
 });
 
 app.get('/auth/callback', async (req, res) => {
@@ -279,6 +311,9 @@ app.get('/auth/callback', async (req, res) => {
     typeof state !== 'string' ||
     state !== req.session.oauthState
   ) {
+    console.warn(
+      '[twitchviewer] OAuth callback rejected (missing code/state or state mismatch). Often: open the app with the same host you registered in Twitch (localhost vs 127.0.0.1), or set TWITCH_REDIRECT_URI to exactly that URL’s callback.'
+    );
     return res.redirect('/?error=' + encodeURIComponent('Invalid login state'));
   }
   delete req.session.oauthState;
@@ -988,7 +1023,7 @@ async function createTlsOptions() {
  * @param {{ source: 'custom' | 'selfsigned', label?: string } | undefined} [tlsInfo]
  */
 function printStartupTips(scheme, tlsInfo) {
-  console.log(`Session files: ${sessionStorePath}`);
+  console.log(`Session database: ${sessionSqlitePath}`);
   console.log(
     `OAuth redirect URLs to register in Twitch (must match scheme ${scheme}://):`
   );

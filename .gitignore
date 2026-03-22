@@ -3,4 +3,5 @@ certs/
 cert/
 .env
 .sessions/
+.sessions.sqlite
 .hls-transcode/

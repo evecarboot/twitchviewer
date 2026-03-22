@@ -59,7 +59,7 @@ Copy `.env.example` to `.env` and set:
 | `TWITCH_REDIRECT_URI` | No | Must match a redirect URL on Twitch (default `https://127.0.0.1:PORT/auth/callback` when using HTTPS) |
 | `USE_HTTP` | No | Set to `true` to serve **HTTP only** (then use `http://…` OAuth URLs in Twitch) |
 | `SESSION_SECRET` | No | Random string used to sign login cookies (recommended so sessions behave predictably) |
-| `SESSION_FILE_PATH` | No | Folder for login session JSON. Default: **`.sessions/`** in the project; on **Windows** the default is **`%LOCALAPPDATA%\twitchviewer\sessions`** (avoids sync/`EPERM` issues under OneDrive). |
+| `SESSION_FILE_PATH` | No | Folder for **`sessions.sqlite`** (or set a full path ending in **`.sqlite`** / **`.db`**). Default: **`.sessions.sqlite`** next to the server on non-Windows; on **Windows** **`%LOCALAPPDATA%\twitchviewer\sessions.sqlite`**. Sessions use **SQLite** (not JSON files) to avoid Windows **`EPERM`** rename issues with antivirus/sync. |
 | `TWITCH_PLAYBACK` | No | Set **`iframe`** to always use Twitch’s official embed. If unset, the app uses **same-origin HLS** when **streamlink** and **ffmpeg** are available (better muted autoplay in the grid). |
 | `STREAMLINK_PATH` | No | Full path to **`streamlink.exe`** if Streamlink is not on `PATH` (common on Windows after a pip install). |
 | `TWITCH_STREAMLINK_QUALITY` | No | Streamlink quality name (default **`720p60`**). If that name fails, the server tries **`720p30`**, **`480p30`**, …, **`best`** automatically (Twitch labels vary). |
@@ -71,7 +71,7 @@ Copy `.env.example` to `.env` and set:
 | `FFMPEG_MAX_HEIGHT` | No | For **`transcode:`** streams only: e.g. `480` to scale video height (lowers CPU use) |
 | `FFMPEG_PRESET` | No | x264 preset for **`transcode:`** only (default **`veryfast`**) |
 
-Never commit `.env` or share your client secret. `.gitignore` excludes `.env`, `.sessions/` (optional legacy session folder in the repo), and `.hls-transcode/` (transcoded HLS cache).
+Never commit `.env` or share your client secret. `.gitignore` excludes `.env`, `.sessions/` (legacy), `.sessions.sqlite`, and `.hls-transcode/` (transcoded HLS cache).
 
 ## Features
 
@@ -88,7 +88,7 @@ Never commit `.env` or share your client secret. `.gitignore` excludes `.env`, `
 
 - **Hide offline**: when app credentials are set, optionally hide offline channels; they reappear when the API reports them live. Poll interval is **45 seconds**; use **Refresh streams** to check immediately.
 - **Twitch chat** (optional): side panel with a **channel dropdown** in the toolbar and in the **chat panel header** (Twitch channels only). Chat is not available for YouTube/HLS-only layouts unless you also add a Twitch channel.
-- **Twitch login** and **Import follows**: OAuth; session is stored in an **HTTP-only cookie** with **session data on disk** (`session-file-store`) so login survives **Node process restarts** (not only browser refresh). On **Windows**, sessions default to **`%LOCALAPPDATA%\twitchviewer\sessions`** unless you set **`SESSION_FILE_PATH`** (see table above).
+- **Twitch login** and **Import follows**: OAuth; session is stored in an **HTTP-only cookie** with **session data in SQLite** (`connect-sqlite3`) so login survives **Node process restarts** (not only browser refresh). On **Windows**, the default DB is **`%LOCALAPPDATA%\twitchviewer\sessions.sqlite`** unless you set **`SESSION_FILE_PATH`** (see table above).
 
 ### Performance (when many streams are open)
 
@@ -130,7 +130,7 @@ Never commit `.env` or share your client secret. `.gitignore` excludes `.env`, `
 | `index.html`, `styles.css`, `app.js` | Front end |
 | `View Twitch Viewer.bat` | Windows helper to install deps, run the server, open the browser |
 | `install-streamlink.bat` | Windows helper to pip-install Streamlink (user install) when `streamlink` is not on PATH |
-| `.sessions/` | Optional legacy session folder; default session dir may be under `%LOCALAPPDATA%` on Windows (see **`SESSION_FILE_PATH`**) |
+| `.sessions.sqlite` | Local SQLite session DB when not using the Windows default path (see **`SESSION_FILE_PATH`**) |
 | `.hls-transcode/` | Transcoded HLS output (gitignored) |
 
 ## Troubleshooting
@@ -144,7 +144,7 @@ Never commit `.env` or share your client secret. `.gitignore` excludes `.env`, `
   - Defaults: **`https://127.0.0.1:3000/auth/callback`** and **`https://localhost:3000/auth/callback`** — add the one(s) you use (or **`http://`** if **`USE_HTTP=true`**).
   - Optional: set **`TWITCH_REDIRECT_URI`** in `.env` to one exact URL and add **that same** URL in Twitch.
 - **Live/offline not working**: Confirm `TWITCH_CLIENT_ID` and `TWITCH_CLIENT_SECRET` in `.env` and restart the server.
-- **Logged out every server restart**: Set **`SESSION_SECRET`** in `.env`; ensure the server can write the session directory (see **`SESSION_FILE_PATH`** — on Windows the default is under **`%LOCALAPPDATA%`**).
+- **Logged out every server restart**: Set **`SESSION_SECRET`** in `.env`; ensure the server can create/write the SQLite session file (see **`SESSION_FILE_PATH`** — on Windows the default is **`%LOCALAPPDATA%\twitchviewer\sessions.sqlite`**).
 - **Twitch: “could not load playlist” / spinner forever (HLS mode)**: The browser did not get a valid **`playlist.m3u8`**. Confirm the channel is **live**; run **`streamlink --stream-url https://www.twitch.tv/<login> best`** in a terminal; ensure **`ffmpeg -version`** works. Set **`STREAMLINK_PATH`** if Streamlink is not on `PATH`. For a quick workaround, set **`TWITCH_PLAYBACK=iframe`** in `.env` and restart (official embed, no local transcode).
 - **Twitch HLS stutters on fast internet**: Usually **CPU** (one **ffmpeg** re-encode per live tile), not bandwidth. Lower load with **`TWITCH_STREAMLINK_QUALITY`**, **`TWITCH_FFMPEG_MAX_HEIGHT`**, **`TWITCH_FFMPEG_PRESET`**, or use **`TWITCH_PLAYBACK=iframe`**.
 - **HLS fails in Chrome / “codec” errors**: Try **`transcode:`** with ffmpeg installed, or **Safari** for some native HLS feeds, or use a feed that is already **H.264/AAC**.
