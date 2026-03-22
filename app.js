@@ -326,18 +326,26 @@
   }
 
   /**
-   * Twitch’s embed checks the *browser viewport*, not a scroll container’s box.
-   * Require meaningful overlap with the viewport (not necessarily fully inside — grid can scroll).
+   * Twitch’s “style visibility” requires the embed’s visible area to meet the same ~400×300
+   * minimum as the layout size — not just “some pixels” in the viewport.
+   * Intersection with the viewport must cover at least that (capped when the window is smaller).
    */
   function cellIntersectsViewportForTwitchAutoplay(cell) {
     const r = cell.getBoundingClientRect();
     if (r.width < 400 || r.height < 300) return false;
     const vw = window.innerWidth;
     const vh = window.innerHeight;
-    const overlapW = Math.min(r.right, vw) - Math.max(r.left, 0);
-    const overlapH = Math.min(r.bottom, vh) - Math.max(r.top, 0);
-    if (overlapW < 200 || overlapH < 150) return false;
-    return overlapW * overlapH > 0;
+    const overlapW = Math.max(
+      0,
+      Math.min(r.right, vw) - Math.max(r.left, 0)
+    );
+    const overlapH = Math.max(
+      0,
+      Math.min(r.bottom, vh) - Math.max(r.top, 0)
+    );
+    const needW = Math.min(400, vw);
+    const needH = Math.min(300, vh);
+    return overlapW >= needW && overlapH >= needH;
   }
 
   /**
@@ -374,7 +382,7 @@
             /* ignore */
           }
           run();
-        }, 150);
+        }, 280);
       });
     });
   }
@@ -413,7 +421,7 @@
             } catch {
               /* ignore */
             }
-            window.setTimeout(resolve, 400);
+            window.setTimeout(resolve, 650);
           }, 0);
         })
     );
@@ -425,7 +433,6 @@
     iframe.title = `Twitch: ${login}`;
     iframe.setAttribute('width', '400');
     iframe.setAttribute('height', '300');
-    iframe.setAttribute('allowfullscreen', 'true');
     iframe.setAttribute(
       'allow',
       'autoplay; fullscreen; picture-in-picture; encrypted-media; clipboard-write'
@@ -504,7 +511,7 @@
         () => {
           tryMount();
         },
-        { root: null, rootMargin: '0px', threshold: [0, 0.1, 0.25] }
+        { root: null, rootMargin: '0px', threshold: [0, 0.1, 0.25, 0.45, 0.6, 0.75, 1] }
       );
       io.observe(cell);
     }
