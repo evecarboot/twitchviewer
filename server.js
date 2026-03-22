@@ -205,6 +205,12 @@ function streamlinkExecutable() {
   return p || 'streamlink';
 }
 
+/** Full path to ffmpeg.exe if not on PATH — see .env FFMPEG_PATH */
+function ffmpegExecutable() {
+  const p = process.env.FFMPEG_PATH?.trim();
+  return p || 'ffmpeg';
+}
+
 function isStreamlinkAvailable() {
   const exe = streamlinkExecutable();
   try {
@@ -586,7 +592,7 @@ function startFfmpegIfNeeded(hash, url, options) {
     : ['-fflags', '+genpts'];
 
   const proc = spawn(
-    'ffmpeg',
+    ffmpegExecutable(),
     [
       '-y',
       '-loglevel',
@@ -621,7 +627,7 @@ function startFfmpegIfNeeded(hash, url, options) {
       segPattern,
       playlistArg,
     ],
-    { stdio: ['ignore', 'ignore', 'pipe'] }
+    { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true }
   );
 
   const entry = { url, dir, proc };
@@ -634,7 +640,7 @@ function startFfmpegIfNeeded(hash, url, options) {
   });
   proc.on('error', (err) => {
     console.error(
-      '[transcode] ffmpeg not found or failed to start. Install ffmpeg and add it to PATH.',
+      '[transcode] ffmpeg not found or failed to start. Install ffmpeg, add it to PATH, or set FFMPEG_PATH in .env.',
       err.message
     );
     entry.error = err.message;
@@ -674,7 +680,10 @@ app.get('/api/transcode/hash', (req, res) => {
 });
 
 app.get('/api/transcode/status', (_req, res) => {
-  const p = spawn('ffmpeg', ['-version'], { stdio: 'ignore' });
+  const p = spawn(ffmpegExecutable(), ['-version'], {
+    stdio: 'ignore',
+    windowsHide: true,
+  });
   let done = false;
   const finish = (ok) => {
     if (done) return;

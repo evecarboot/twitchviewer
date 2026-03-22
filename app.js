@@ -1545,7 +1545,7 @@
         const sj = await st.json();
         if (!sj.ffmpeg) {
           setMeta(
-            'ffmpeg not found. Install ffmpeg, add it to PATH, restart the server, then try transcode:… again.',
+            'ffmpeg not found. Install ffmpeg, add it to PATH or set FFMPEG_PATH in .env, restart the server, then try transcode:… again.',
             true
           );
           return;
