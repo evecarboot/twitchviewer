@@ -374,6 +374,39 @@ body {
   pointer-events: none;
 }
 
+/* Right-edge strip so iframes stay draggable; label stays visible on the left. */
+.cell-drag-handle {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 22px;
+  z-index: 11;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  background: linear-gradient(to left, rgba(0, 0, 0, 0.4), transparent);
+}
+
+.cell-drag-handle:active {
+  cursor: grabbing;
+}
+
+body.grid-dragging .cell iframe,
+body.grid-dragging .cell video.cell-video {
+  pointer-events: none;
+}
+
+.cell.cell-dragging {
+  opacity: 0.88;
+  box-shadow: inset 0 0 0 2px rgba(255, 255, 255, 0.25);
+}
+
+.cell.cell-drag-over {
+  box-shadow: inset 0 0 0 2px rgba(120, 180, 255, 0.7);
+}
+
 .chat-panel {
   flex: 0 0 min(360px, 40vw);
   min-width: 260px;

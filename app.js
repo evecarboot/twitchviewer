@@ -31,8 +31,6 @@
   let pollTimer = null;
   /** @type {IntersectionObserver[]} */
   let cellObservers = [];
-  /** Serial gap between Twitch iframe loads (reduces 429 + visibility races). */
-  let twitchEmbedQueue = Promise.resolve();
   /** @type {Set<string>} */
   let followModalSelection = new Set();
 
@@ -282,43 +280,44 @@
       .replace(/\s+/g, '');
   }
 
-  function embedParents() {
+  /**
+   * Twitch requires every parent hostname the page may be served from (see multitwitch.tv:
+   * parent=…&parent=www.…). https://dev.twitch.tv/docs/embed/video-and-clips/
+   */
+  function appendParentDomains(params) {
     const h = window.location.hostname;
+    params.append('parent', h);
+    if (h === '127.0.0.1') params.append('parent', 'localhost');
+    if (h === 'localhost') params.append('parent', '127.0.0.1');
+    if (h.startsWith('www.')) {
+      const bare = h.slice(4);
+      if (bare) params.append('parent', bare);
+    } else if (
+      h.length > 0 &&
+      h !== 'localhost' &&
+      h !== '127.0.0.1' &&
+      !/^\d+\.\d+\.\d+\.\d+$/.test(h)
+    ) {
+      params.append('parent', `www.${h}`);
+    }
+  }
+
+  function embedParents() {
     const qs = new URLSearchParams();
-    qs.append('parent', h);
-    if (h === '127.0.0.1') qs.append('parent', 'localhost');
-    if (h === 'localhost') qs.append('parent', '127.0.0.1');
+    appendParentDomains(qs);
     return qs;
   }
 
   /**
-   * Non-interactive embed URL (parent + channel + autoplay + muted).
-   * https://dev.twitch.tv/docs/embed/video-and-clips/
+   * Plain player embed (same shape as multitwitch.tv: muted first, no delayed load).
+   * They omit autoplay=; muted embeds still start playback in the same way.
    */
   function playerSrc(login) {
-    const params = embedParents();
-    params.set('channel', login);
-    params.set('autoplay', 'true');
+    const params = new URLSearchParams();
     params.set('muted', 'true');
+    params.set('channel', login);
+    appendParentDomains(params);
     return `https://player.twitch.tv/?${params.toString()}`;
-  }
-
-  function queueTwitchEmbedInit(run) {
-    twitchEmbedQueue = twitchEmbedQueue.then(
-      () =>
-        new Promise((resolve) => {
-          requestAnimationFrame(() => {
-            requestAnimationFrame(() => {
-              try {
-                run();
-              } catch {
-                /* ignore */
-              }
-              window.setTimeout(resolve, 600);
-            });
-          });
-        })
-    );
   }
 
   function attachTwitchIframeOnly(cell, login) {
@@ -327,6 +326,7 @@
     iframe.title = `Twitch: ${login}`;
     iframe.setAttribute('width', '400');
     iframe.setAttribute('height', '300');
+    iframe.setAttribute('allowfullscreen', 'true');
     iframe.setAttribute(
       'allow',
       'autoplay; fullscreen; picture-in-picture; encrypted-media; clipboard-write'
@@ -338,69 +338,15 @@
   }
 
   /**
-   * Non-interactive embed: direct player.twitch.tv iframe with autoplay + muted URL params.
-   * Same underlying player as Twitch.Player; no embed/v1.js required.
-   * https://dev.twitch.tv/docs/embed/video-and-clips/
+   * Eager embed like multitwitch.tv: assign src right after layout (no IO delay,
+   * no serial queue). Late iframe loads often fail muted autoplay in the browser.
    */
   function attachTwitchEmbedCell(cell, login) {
-    const run = () => attachTwitchIframeOnly(cell, login);
-
-    let loadScheduled = false;
-    /** @type {ResizeObserver | null} */
-    let sizeObs = null;
-
-    const scheduleWhenSized = () => {
-      if (loadScheduled) return;
-      if (cell.clientWidth < 400 || cell.clientHeight < 300) return;
-      loadScheduled = true;
-      if (sizeObs) {
-        sizeObs.disconnect();
-        sizeObs = null;
-      }
-      queueTwitchEmbedInit(run);
-    };
-
-    if (!els.grid || typeof IntersectionObserver === 'undefined') {
-      const ro = new ResizeObserver(() => {
-        scheduleWhenSized();
-        if (loadScheduled) ro.disconnect();
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        attachTwitchIframeOnly(cell, login);
       });
-      ro.observe(cell);
-      scheduleWhenSized();
-      return;
-    }
-
-    const io = new IntersectionObserver(
-      (entries) => {
-        entries.forEach((entry) => {
-          if (!entry.isIntersecting || entry.intersectionRatio < 0.1) return;
-          io.disconnect();
-          scheduleWhenSized();
-          if (!loadScheduled) {
-            sizeObs = new ResizeObserver(() => {
-              scheduleWhenSized();
-            });
-            sizeObs.observe(cell);
-          }
-          window.setTimeout(() => {
-            if (sizeObs) {
-              sizeObs.disconnect();
-              sizeObs = null;
-            }
-            if (!loadScheduled) {
-              loadScheduled = true;
-              if (cell.clientWidth >= 400 && cell.clientHeight >= 300) {
-                queueTwitchEmbedInit(run);
-              } else {
-                attachTwitchIframeOnly(cell, login);
-              }
-            }
-          }, 8000);
-        });
-      },
-      { root: els.grid, rootMargin: '120px', threshold: [0, 0.1, 0.25, 0.5, 1] }
-    );
-    io.observe(cell);
+    });
   }
 
   function chatSrc(login) {
@@ -470,6 +416,37 @@
       if (!state.hideOffline || !apiConfigured || pollFailed) return true;
       return onlineSet.has(getTwitchLogin(ch));
     });
+  }
+
+  /** Reorder only channels that are currently visible in the grid; others stay in place. */
+  function applyVisibleOrder(nextVisible) {
+    const visibleKeys = new Set(nextVisible.map(channelKey));
+    let qi = 0;
+    state.channels = state.channels.map((ch) => {
+      if (visibleKeys.has(channelKey(ch))) {
+        return nextVisible[qi++];
+      }
+      return ch;
+    });
+  }
+
+  function reorderVisibleChannelsGrid(fromIndex, toIndex) {
+    const v = visibleChannels();
+    if (
+      fromIndex === toIndex ||
+      fromIndex < 0 ||
+      toIndex < 0 ||
+      fromIndex >= v.length ||
+      toIndex >= v.length
+    ) {
+      return;
+    }
+    const item = v[fromIndex];
+    const next = v.filter((_, i) => i !== fromIndex);
+    next.splice(toIndex, 0, item);
+    applyVisibleOrder(next);
+    saveState();
+    fullRender();
   }
 
   /** Stable signature of the current grid — used to skip rebuild when poll didn’t change visibility. */
@@ -861,6 +838,91 @@
     });
   }
 
+  /** @type {{ fromIndex: number; pointerId: number; handle: HTMLElement; sourceCell: HTMLElement } | null} */
+  let gridDragState = null;
+  let gridDragBound = false;
+
+  function clearGridDragOver() {
+    if (!els.grid) return;
+    els.grid.querySelectorAll('.cell.cell-drag-over').forEach((el) => {
+      el.classList.remove('cell-drag-over');
+    });
+  }
+
+  function endGridDragListeners() {
+    document.removeEventListener('pointermove', onGridPointerMove);
+    document.removeEventListener('pointerup', onGridPointerUp);
+    document.removeEventListener('pointercancel', onGridPointerUp);
+  }
+
+  function onGridPointerMove(e) {
+    if (!gridDragState || !els.grid) return;
+    clearGridDragOver();
+    const under = document.elementFromPoint(e.clientX, e.clientY);
+    const cell = under && under.closest('.cell');
+    if (cell && els.grid.contains(cell)) {
+      cell.classList.add('cell-drag-over');
+    }
+  }
+
+  function onGridPointerUp(e) {
+    if (!gridDragState || !els.grid) return;
+    const { fromIndex, pointerId, handle, sourceCell } = gridDragState;
+    const x = e.clientX;
+    const y = e.clientY;
+    try {
+      handle.releasePointerCapture(pointerId);
+    } catch {
+      /* ignore */
+    }
+    document.body.classList.remove('grid-dragging');
+    sourceCell.classList.remove('cell-dragging');
+    clearGridDragOver();
+    endGridDragListeners();
+
+    const under = document.elementFromPoint(x, y);
+    const targetCell = under && under.closest('.cell');
+    if (targetCell && els.grid.contains(targetCell)) {
+      const toIndex = parseInt(targetCell.dataset.cellIndex || '', 10);
+      if (!Number.isNaN(toIndex) && fromIndex !== toIndex) {
+        reorderVisibleChannelsGrid(fromIndex, toIndex);
+      }
+    }
+    gridDragState = null;
+  }
+
+  function onGridPointerDown(e) {
+    const handle = e.target && e.target.closest('.cell-drag-handle');
+    if (!handle || !els.grid || !els.grid.contains(handle)) return;
+    const cell = handle.closest('.cell');
+    if (!cell || !els.grid.contains(cell)) return;
+    e.preventDefault();
+    const fromIndex = parseInt(cell.dataset.cellIndex || '', 10);
+    if (Number.isNaN(fromIndex)) return;
+    gridDragState = {
+      fromIndex,
+      pointerId: e.pointerId,
+      handle,
+      sourceCell: cell,
+    };
+    try {
+      handle.setPointerCapture(e.pointerId);
+    } catch {
+      /* ignore */
+    }
+    document.body.classList.add('grid-dragging');
+    cell.classList.add('cell-dragging');
+    document.addEventListener('pointermove', onGridPointerMove);
+    document.addEventListener('pointerup', onGridPointerUp);
+    document.addEventListener('pointercancel', onGridPointerUp);
+  }
+
+  function setupGridDrag() {
+    if (!els.grid || gridDragBound) return;
+    gridDragBound = true;
+    els.grid.addEventListener('pointerdown', onGridPointerDown);
+  }
+
   function renderGrid() {
     disconnectCellObservers();
     destroyGridHls();
@@ -872,10 +934,14 @@
     els.grid.classList.toggle('one-col', n === 1);
 
     els.grid.innerHTML = '';
-    twitchEmbedQueue = Promise.resolve();
-    visible.forEach((ch) => {
+    visible.forEach((ch, cellIndex) => {
       const cell = document.createElement('div');
       cell.className = 'cell';
+      cell.dataset.cellIndex = String(cellIndex);
+      const dragHandle = document.createElement('div');
+      dragHandle.className = 'cell-drag-handle';
+      dragHandle.title = 'Drag (hold) along the right edge to reorder';
+      cell.appendChild(dragHandle);
       const t = getChannelType(ch);
 
       if (t === 'twitch') {
@@ -1378,6 +1444,7 @@
     await ensureTranscodeHashes();
     await refreshOnly();
     await refreshAuth();
+    setupGridDrag();
     fullRender();
     schedulePoll();
     let gridResizeTimer = null;
