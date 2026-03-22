@@ -1662,6 +1662,43 @@
     closeFollowModal();
   });
 
+  /**
+   * Twitch’s player runs inside player.twitch.tv and logs vague “autoplay disabled” lines.
+   * Expose a console helper so you can see *this* page’s sizes and iframe allow= flags.
+   */
+  function exposeTwitchAutoplayHelp() {
+    window.twitchviewerAutoplayDiagnostics = function () {
+      const grid = document.getElementById('grid');
+      if (!grid) {
+        console.warn('[twitchviewer] No #grid');
+        return;
+      }
+      const cells = grid.querySelectorAll('.cell');
+      console.log(
+        `[twitchviewer] ${cells.length} Twitch cell(s). Lines from player.twitch.tv are from Twitch’s embed, not this app.`
+      );
+      cells.forEach((cell, i) => {
+        const r = cell.getBoundingClientRect();
+        const w = Math.round(r.width);
+        const h = Math.round(r.height);
+        const sizeOk = w >= GRID_MIN_CELL_W && h >= GRID_MIN_CELL_H;
+        const iframe = cell.querySelector('iframe[src*="player.twitch.tv"]');
+        const allow = iframe ? iframe.getAttribute('allow') || '' : '';
+        const hasAllowAutoplay = /\bautoplay\b/i.test(allow);
+        const src = iframe ? iframe.getAttribute('src') || '' : '';
+        const parentOk = /[?&]parent=/.test(src);
+        console.log(
+          `  [${i}] ${w}×${h}px ${sizeOk ? 'OK' : 'BELOW min'} (${GRID_MIN_CELL_W}×${GRID_MIN_CELL_H}) | allow autoplay: ${hasAllowAutoplay ? 'yes' : 'MISSING'} | parent=: ${parentOk ? 'yes' : 'no'}`
+        );
+      });
+      console.log(
+        '[twitchviewer] If Twitch still blocks autoplay: domain policy (Twitch can disable autoplay per site), offline stream, mobile (tap required), CSS transforms around the embed, or Chrome media engagement — see https://dev.twitch.tv/docs/embed/video-and-clips/'
+      );
+    };
+  }
+
+  exposeTwitchAutoplayHelp();
+
   (async function init() {
     const qs = new URLSearchParams(location.search);
     const urlErr = qs.get('error');
@@ -1683,6 +1720,9 @@
     setupGridDrag();
     fullRender();
     schedulePoll();
+    console.info(
+      '[twitchviewer] Vague “autoplay disabled” messages in the console usually come from the Twitch player (player.twitch.tv iframe), not from this app. Run twitchviewerAutoplayDiagnostics() here to check cell size and iframe allow=autoplay.'
+    );
     window.addEventListener('resize', scheduleLayoutGridToViewport);
     if (window.visualViewport) {
       window.visualViewport.addEventListener('resize', scheduleLayoutGridToViewport);
