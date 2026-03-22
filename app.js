@@ -309,12 +309,12 @@
   }
 
   /**
-   * Plain player embed (same shape as multitwitch.tv: muted first, no delayed load).
-   * They omit autoplay=; muted embeds still start playback in the same way.
+   * player.twitch.tv embed URL (muted + autoplay per Twitch docs; parent list like multitwitch).
    */
   function playerSrc(login) {
     const params = new URLSearchParams();
     params.set('muted', 'true');
+    params.set('autoplay', 'true');
     params.set('channel', login);
     appendParentDomains(params);
     return `https://player.twitch.tv/?${params.toString()}`;
@@ -338,15 +338,11 @@
   }
 
   /**
-   * Eager embed like multitwitch.tv: assign src right after layout (no IO delay,
-   * no serial queue). Late iframe loads often fail muted autoplay in the browser.
+   * Assign src in the same turn as DOM insert (multitwitch uses static HTML iframes).
+   * Deferred rAF loads miss the same navigation/autoplay timing as a plain embed.
    */
   function attachTwitchEmbedCell(cell, login) {
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        attachTwitchIframeOnly(cell, login);
-      });
-    });
+    attachTwitchIframeOnly(cell, login);
   }
 
   function chatSrc(login) {
