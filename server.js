@@ -13,6 +13,19 @@ require('dotenv').config();
 const app = express();
 const root = __dirname;
 
+/* Let embedded Twitch/YouTube iframes use muted autoplay (Chromium consults this + iframe allow=). */
+app.use((req, res, next) => {
+  res.setHeader(
+    'Permissions-Policy',
+    [
+      'autoplay=(self "https://player.twitch.tv" "https://www.twitch.tv" "https://www.youtube.com" "https://www.youtube-nocookie.com")',
+      'fullscreen=(self)',
+      'picture-in-picture=(self)',
+    ].join(', ')
+  );
+  next();
+});
+
 const SCOPES = 'user:read:email user:read:follows';
 
 function getPort() {
