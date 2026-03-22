@@ -53,6 +53,14 @@
             <input type="checkbox" id="show-chat" />
             Show chat
           </label>
+          <label class="check" id="hide-chat-panel-wrap" hidden>
+            <input type="checkbox" id="hide-chat-panel" />
+            Hide chat panel
+          </label>
+          <label class="check" id="chat-on-left-wrap" hidden>
+            <input type="checkbox" id="chat-on-left" />
+            Chat on left
+          </label>
           <label class="select-label" id="chat-channel-wrap" hidden>
             Chat for
             <select id="chat-channel" aria-label="Channel for chat panel"></select>
@@ -89,13 +97,16 @@
       <button type="button" class="peek-tab" id="peek-tab" hidden title="Show toolbar">
         ⋮
       </button>
+      <button type="button" class="peek-chat" id="peek-chat" hidden title="Show chat panel">
+        Chat
+      </button>
 
       <main class="main" id="main">
         <div class="grid" id="grid" aria-live="polite"></div>
-        <aside class="chat-panel" id="chat-panel" hidden>
+        <aside class="chat-panel" id="chat-panel" hidden aria-label="Twitch chat">
           <div class="chat-panel-header">
             <span id="chat-panel-title">Chat</span>
-            <button type="button" class="ghost" id="close-chat" title="Hide chat">
+            <button type="button" class="ghost" id="close-chat" title="Hide chat panel">
               ×
             </button>
           </div>

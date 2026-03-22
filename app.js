@@ -18,6 +18,8 @@
     importedFollows: [],
     hideOffline: false,
     showChat: false,
+    hideChatPanel: false,
+    chatOnLeft: false,
     chatForLogin: null,
     toolbarCollapsed: false,
   });
@@ -35,11 +37,18 @@
     channelInput: document.getElementById('channel-input'),
     hideOffline: document.getElementById('hide-offline'),
     showChat: document.getElementById('show-chat'),
+    hideChatPanelWrap: document.getElementById('hide-chat-panel-wrap'),
+    hideChatPanel: document.getElementById('hide-chat-panel'),
+    chatOnLeftWrap: document.getElementById('chat-on-left-wrap'),
+    chatOnLeft: document.getElementById('chat-on-left'),
     chatChannelWrap: document.getElementById('chat-channel-wrap'),
     chatChannel: document.getElementById('chat-channel'),
     toolbarToggle: document.getElementById('toolbar-toggle'),
     toolbar: document.getElementById('toolbar'),
     peekTab: document.getElementById('peek-tab'),
+    peekChat: document.getElementById('peek-chat'),
+    app: document.getElementById('app'),
+    main: document.getElementById('main'),
     toolbarMeta: document.getElementById('toolbar-meta'),
     channelList: document.getElementById('channel-list'),
     grid: document.getElementById('grid'),
@@ -48,7 +57,6 @@
     chatPanelTitle: document.getElementById('chat-panel-title'),
     closeChat: document.getElementById('close-chat'),
     offlineBar: document.getElementById('offline-bar'),
-    main: document.getElementById('main'),
     authLogin: document.getElementById('auth-login'),
     authUserWrap: document.getElementById('auth-user-wrap'),
     authAvatar: document.getElementById('auth-avatar'),
@@ -108,9 +116,10 @@
 
   function playerSrc(login) {
     const q = embedParents();
+    // autoplay=true + muted=true: browsers allow muted autoplay without a click; unmuted is usually blocked.
     return `https://player.twitch.tv/?channel=${encodeURIComponent(
       login
-    )}&${q}&muted=false`;
+    )}&${q}&autoplay=true&muted=true`;
   }
 
   function chatSrc(login) {
@@ -367,6 +376,7 @@
   function renderChatIframe() {
     els.chatIframeWrap.innerHTML = '';
     if (!state.showChat || !state.chatForLogin) return;
+    if (state.hideChatPanel) return;
     const iframe = document.createElement('iframe');
     iframe.src = chatSrc(state.chatForLogin);
     iframe.title = `Twitch chat: ${state.chatForLogin}`;
@@ -389,6 +399,7 @@
       const iframe = document.createElement('iframe');
       iframe.src = playerSrc(login);
       iframe.title = `Twitch: ${login}`;
+      iframe.setAttribute('allow', 'autoplay; fullscreen; picture-in-picture');
       iframe.allowFullscreen = true;
       cell.appendChild(iframe);
       const lab = document.createElement('div');
@@ -416,7 +427,42 @@
     els.showChat.checked = state.showChat;
     els.hideOffline.checked = state.hideOffline;
     els.chatChannelWrap.hidden = !state.showChat || !state.channels.length;
-    els.chatPanel.hidden = !state.showChat || !state.channels.length;
+    if (els.hideChatPanelWrap) {
+      els.hideChatPanelWrap.hidden = !state.showChat;
+    }
+    if (els.chatOnLeftWrap) {
+      els.chatOnLeftWrap.hidden = !state.showChat;
+    }
+    if (els.hideChatPanel) {
+      els.hideChatPanel.checked = state.hideChatPanel;
+    }
+    if (els.chatOnLeft) {
+      els.chatOnLeft.checked = state.chatOnLeft;
+    }
+    const panelVisible =
+      state.showChat &&
+      state.channels.length > 0 &&
+      !state.hideChatPanel;
+    els.chatPanel.hidden = !panelVisible;
+    if (els.main) {
+      els.main.classList.toggle(
+        'chat-on-left',
+        Boolean(state.chatOnLeft && state.showChat)
+      );
+    }
+    if (els.app) {
+      els.app.classList.toggle(
+        'chat-on-left',
+        Boolean(state.chatOnLeft && state.showChat)
+      );
+    }
+    if (els.peekChat) {
+      els.peekChat.hidden = !(
+        state.showChat &&
+        state.hideChatPanel &&
+        state.channels.length
+      );
+    }
     renderChatIframe();
   }
 
@@ -472,9 +518,28 @@
 
   els.showChat.addEventListener('change', () => {
     state.showChat = els.showChat.checked;
+    if (!state.showChat) {
+      state.hideChatPanel = false;
+    }
     saveState();
     applyChatLayout();
   });
+
+  if (els.hideChatPanel) {
+    els.hideChatPanel.addEventListener('change', () => {
+      state.hideChatPanel = els.hideChatPanel.checked;
+      saveState();
+      applyChatLayout();
+    });
+  }
+
+  if (els.chatOnLeft) {
+    els.chatOnLeft.addEventListener('change', () => {
+      state.chatOnLeft = els.chatOnLeft.checked;
+      saveState();
+      applyChatLayout();
+    });
+  }
 
   els.chatChannel.addEventListener('change', () => {
     state.chatForLogin = els.chatChannel.value;
@@ -495,11 +560,18 @@
   });
 
   els.closeChat.addEventListener('click', () => {
-    state.showChat = false;
-    els.showChat.checked = false;
+    state.hideChatPanel = true;
     saveState();
     applyChatLayout();
   });
+
+  if (els.peekChat) {
+    els.peekChat.addEventListener('click', () => {
+      state.hideChatPanel = false;
+      saveState();
+      applyChatLayout();
+    });
+  }
 
   els.hideOffline.checked = state.hideOffline;
   els.showChat.checked = state.showChat;

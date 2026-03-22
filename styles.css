@@ -246,11 +246,51 @@ body {
   color: var(--text);
 }
 
+.peek-chat {
+  position: fixed;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 20;
+  padding: 0.5rem 0.35rem;
+  border: 1px solid var(--border);
+  border-radius: 6px 0 0 6px;
+  border-right: none;
+  background: var(--surface);
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 0.8rem;
+  writing-mode: vertical-rl;
+  text-orientation: mixed;
+}
+
+.peek-chat:hover {
+  color: var(--text);
+}
+
+#app.chat-on-left .peek-chat {
+  left: 0;
+  right: auto;
+  border-radius: 0 6px 6px 0;
+  border-left: none;
+  border-right: 1px solid var(--border);
+}
+
 .main {
   flex: 1;
   min-height: 0;
   display: flex;
   flex-direction: row;
+}
+
+.main.chat-on-left .grid {
+  order: 2;
+}
+
+.main.chat-on-left .chat-panel {
+  order: 1;
+  border-left: none;
+  border-right: 1px solid var(--border);
 }
 
 .grid {
@@ -462,6 +502,10 @@ body {
     max-width: 100%;
     border-left: none;
     border-top: 1px solid var(--border);
+  }
+
+  .main.chat-on-left .chat-panel {
+    border-right: none;
   }
 
   .main {
