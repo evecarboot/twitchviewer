@@ -35,6 +35,8 @@
   let twitchEmbedQueue = Promise.resolve();
   /** @type {Set<string>} */
   let followModalSelection = new Set();
+  /** Debounce for layoutGridToViewport (resize + ResizeObserver). */
+  let gridLayoutTimer = null;
 
   const els = {
     addForm: document.getElementById('add-form'),
@@ -57,6 +59,7 @@
     toolbarMeta: document.getElementById('toolbar-meta'),
     channelList: document.getElementById('channel-list'),
     grid: document.getElementById('grid'),
+    gridArea: document.getElementById('grid-area'),
     chatPanel: document.getElementById('chat-panel'),
     chatIframeWrap: document.getElementById('chat-iframe-wrap'),
     chatChannelPanel: document.getElementById('chat-channel-panel'),
@@ -579,6 +582,14 @@
     els.grid.style.setProperty('--cols', String(Math.max(1, cols)));
     els.grid.style.setProperty('--rows', String(Math.max(1, rows)));
     els.grid.classList.toggle('one-col', n === 1);
+  }
+
+  function scheduleLayoutGridToViewport() {
+    if (gridLayoutTimer) clearTimeout(gridLayoutTimer);
+    gridLayoutTimer = setTimeout(() => {
+      gridLayoutTimer = null;
+      layoutGridToViewport();
+    }, 120);
   }
 
   function visibleChannels() {
@@ -1672,22 +1683,16 @@
     setupGridDrag();
     fullRender();
     schedulePoll();
-    let gridResizeTimer = null;
-    window.addEventListener('resize', () => {
-      if (gridResizeTimer) clearTimeout(gridResizeTimer);
-      gridResizeTimer = setTimeout(() => {
-        gridResizeTimer = null;
-        layoutGridToViewport();
-      }, 120);
-    });
+    window.addEventListener('resize', scheduleLayoutGridToViewport);
     if (window.visualViewport) {
-      window.visualViewport.addEventListener('resize', () => {
-        if (gridResizeTimer) clearTimeout(gridResizeTimer);
-        gridResizeTimer = setTimeout(() => {
-          gridResizeTimer = null;
-          layoutGridToViewport();
-        }, 120);
-      });
+      window.visualViewport.addEventListener('resize', scheduleLayoutGridToViewport);
+    }
+    if (typeof ResizeObserver !== 'undefined') {
+      const target = els.gridArea || els.grid;
+      if (target) {
+        const ro = new ResizeObserver(() => scheduleLayoutGridToViewport());
+        ro.observe(target);
+      }
     }
     if (urlErr) {
       try {

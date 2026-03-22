@@ -289,6 +289,8 @@ body {
   flex: 1;
   min-width: 0;
   min-height: 0;
+  width: 100%;
+  height: 100%;
   position: relative;
   display: flex;
   flex-direction: column;
@@ -311,6 +313,8 @@ body {
   flex: 1;
   min-width: 0;
   min-height: 0;
+  width: 100%;
+  height: 100%;
   display: grid;
   gap: 2px;
   padding: 2px;
@@ -320,6 +324,8 @@ body {
   grid-template-rows: repeat(var(--rows, 1), minmax(300px, 1fr));
   align-content: stretch;
   justify-content: stretch;
+  align-items: stretch;
+  justify-items: stretch;
 }
 
 .grid.one-col {
@@ -329,14 +335,19 @@ body {
 
 .cell {
   position: relative;
-  min-width: 400px;
-  min-height: 300px;
+  min-width: 0;
+  min-height: 0;
+  width: 100%;
+  height: 100%;
+  max-width: 100%;
+  max-height: 100%;
   background: #000;
   overflow: hidden;
   visibility: visible;
   opacity: 1;
   contain: none;
   transition: none;
+  /* Grid tracks use minmax(400px,…) / minmax(300px,…) — cell fills the track. */
   /* Avoid content-visibility: auto here — it can defer layout so Twitch’s embed
      mis-reads size/visibility and refuses autoplay (HLS <video> is unaffected). */
 }
@@ -346,8 +357,8 @@ body {
   inset: 0;
   width: 100%;
   height: 100%;
-  min-width: 400px;
-  min-height: 300px;
+  max-width: 100%;
+  max-height: 100%;
   z-index: 1;
 }
 
@@ -357,8 +368,15 @@ body {
   inset: 0;
   width: 100%;
   height: 100%;
+  max-width: 100%;
+  max-height: 100%;
   border: 0;
   background: #000;
+  display: block;
+}
+
+.cell video.cell-video {
+  object-fit: contain;
 }
 
 .cell-hls-error {
@@ -486,7 +504,10 @@ body.grid-dragging .cell video.cell-video {
   inset: 0;
   width: 100%;
   height: 100%;
+  max-width: 100%;
+  max-height: 100%;
   border: 0;
+  display: block;
 }
 
 .modal {
