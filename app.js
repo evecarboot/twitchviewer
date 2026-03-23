@@ -607,35 +607,43 @@
   }
 
   /**
-   * Choose cols × rows to maximize actual visible 16:9 video area per cell.
-   * This avoids ultra-wide single rows on fullscreen (e.g. 5×1) when 3×2 shows larger video.
+   * Count-first balanced grid (stable across 1080p/4K/ultrawide window sizes).
+   * We choose a near-square cols×rows, then only use viewport as a light tie-break.
    */
   function gridDimensions(count, vp, mins) {
     if (count <= 0) return { cols: 1, rows: 1 };
     if (count === 1) return { cols: 1, rows: 1 };
     const { w, h } = vp;
     const { minW, minH } = mins;
-    const VIDEO_AR = 16 / 9;
-    let bestCols = 1;
-    let bestRows = Math.ceil(count);
-    let bestScore = -Infinity;
+    let bestCols = Math.ceil(Math.sqrt(count));
+    let bestRows = Math.ceil(count / bestCols);
+    let bestWaste = bestCols * bestRows - count;
+    let bestImbalance = Math.abs(bestCols - bestRows);
+    let bestTieScore = -Infinity;
     for (let cols = 1; cols <= count; cols++) {
       const rows = Math.ceil(count / cols);
       const waste = cols * rows - count;
       const cw = w / cols;
       const ch = h / rows;
       if (cw < minW || ch < minH) continue;
-      const videoW = Math.min(cw, ch * VIDEO_AR);
-      const videoH = Math.min(ch, cw / VIDEO_AR);
-      const videoArea = videoW * videoH;
-      const score = videoArea - waste * 250_000;
-      if (score > bestScore) {
-        bestScore = score;
+      const imbalance = Math.abs(cols - rows);
+      const tieScore = Math.min(cw, ch);
+      if (
+        waste < bestWaste ||
+        (waste === bestWaste && imbalance < bestImbalance) ||
+        (waste === bestWaste && imbalance === bestImbalance && tieScore > bestTieScore)
+      ) {
         bestCols = cols;
         bestRows = rows;
+        bestWaste = waste;
+        bestImbalance = imbalance;
+        bestTieScore = tieScore;
       }
     }
-    if (bestScore === -Infinity) {
+    if (
+      w / bestCols < minW ||
+      h / bestRows < minH
+    ) {
       let cols = Math.max(1, Math.min(count, Math.floor(w / Math.max(1, minW))));
       if (cols < 1) cols = 1;
       const rows = Math.ceil(count / cols);
