@@ -338,9 +338,12 @@
     return parents;
   }
 
-  /** Must match .grid minmax(400px,…) / minmax(300px,…) — Twitch embed minimum. */
-  const GRID_MIN_CELL_W = 400;
-  const GRID_MIN_CELL_H = 300;
+  /**
+   * Twitch docs recommend ~400x300 minimum for embeds, but that can force very sparse
+   * layouts on ultrawide/fullscreen. Use a softer minimum so 5+ streams can still tile.
+   */
+  const GRID_MIN_CELL_W = 320;
+  const GRID_MIN_CELL_H = 180;
 
   /** Space embeds apart: Helix limits + fewer simultaneous WebGL contexts in the browser. */
   function queueTwitchMount(run) {
@@ -594,15 +597,25 @@
     };
   }
 
+  function currentGridMinimums(visible) {
+    const hasTwitchIframe =
+      twitchPlayback === 'iframe' &&
+      visible.some((ch) => getChannelType(ch) === 'twitch');
+    return hasTwitchIframe
+      ? { minW: GRID_MIN_CELL_W, minH: GRID_MIN_CELL_H }
+      : { minW: 1, minH: 1 };
+  }
+
   /**
-   * Choose cols × rows so tiles fit the viewport without a single ultra-wide row of
-   * skinny cells. We only consider layouts where w/cols ≥ 400 and h/rows ≥ 300 (same
-   * as CSS); otherwise 5 streams would pick 5×1 and force ~2000px width + horizontal scroll.
+   * Choose cols × rows to maximize actual visible 16:9 video area per cell.
+   * This avoids ultra-wide single rows on fullscreen (e.g. 5×1) when 3×2 shows larger video.
    */
-  function gridDimensions(count, vp) {
+  function gridDimensions(count, vp, mins) {
     if (count <= 0) return { cols: 1, rows: 1 };
     if (count === 1) return { cols: 1, rows: 1 };
     const { w, h } = vp;
+    const { minW, minH } = mins;
+    const VIDEO_AR = 16 / 9;
     let bestCols = 1;
     let bestRows = Math.ceil(count);
     let bestScore = -Infinity;
@@ -611,9 +624,11 @@
       const waste = cols * rows - count;
       const cw = w / cols;
       const ch = h / rows;
-      if (cw < GRID_MIN_CELL_W || ch < GRID_MIN_CELL_H) continue;
-      const minSide = Math.min(cw, ch);
-      const score = minSide * minSide - waste * 1_000_000;
+      if (cw < minW || ch < minH) continue;
+      const videoW = Math.min(cw, ch * VIDEO_AR);
+      const videoH = Math.min(ch, cw / VIDEO_AR);
+      const videoArea = videoW * videoH;
+      const score = videoArea - waste * 250_000;
       if (score > bestScore) {
         bestScore = score;
         bestCols = cols;
@@ -621,7 +636,7 @@
       }
     }
     if (bestScore === -Infinity) {
-      let cols = Math.max(1, Math.min(count, Math.floor(w / GRID_MIN_CELL_W)));
+      let cols = Math.max(1, Math.min(count, Math.floor(w / Math.max(1, minW))));
       if (cols < 1) cols = 1;
       const rows = Math.ceil(count / cols);
       return { cols, rows };
@@ -634,7 +649,10 @@
     if (!els.grid) return;
     const visible = visibleChannels();
     const n = visible.length;
-    const { cols, rows } = gridDimensions(n, gridViewportSize());
+    const mins = currentGridMinimums(visible);
+    const { cols, rows } = gridDimensions(n, gridViewportSize(), mins);
+    els.grid.style.setProperty('--cell-min-w', `${Math.max(1, mins.minW)}px`);
+    els.grid.style.setProperty('--cell-min-h', `${Math.max(1, mins.minH)}px`);
     els.grid.style.setProperty('--cols', String(Math.max(1, cols)));
     els.grid.style.setProperty('--rows', String(Math.max(1, rows)));
     els.grid.classList.toggle('one-col', n === 1);
@@ -1339,7 +1357,10 @@
     const visible = visibleChannels();
     const desiredKeys = visible.map(channelKey);
     const n = visible.length;
-    const { cols, rows } = gridDimensions(n, gridViewportSize());
+    const mins = currentGridMinimums(visible);
+    const { cols, rows } = gridDimensions(n, gridViewportSize(), mins);
+    els.grid.style.setProperty('--cell-min-w', `${Math.max(1, mins.minW)}px`);
+    els.grid.style.setProperty('--cell-min-h', `${Math.max(1, mins.minH)}px`);
     els.grid.style.setProperty('--cols', String(Math.max(1, cols)));
     els.grid.style.setProperty('--rows', String(Math.max(1, rows)));
     els.grid.classList.toggle('one-col', n === 1);

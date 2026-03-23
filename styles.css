@@ -314,9 +314,8 @@ body {
   border-right: 1px solid var(--border);
 }
 
-/* Twitch’s iframe player only autoplays when the embed is ~≥400×300 CSS px.
-   minmax(400px, 1fr) / minmax(300px, 1fr) keeps that minimum while cells grow
-   to fill the window (iframes are position:absolute; inset:0; width/height 100%). */
+/* Grid minimums are runtime-controlled from app.js via CSS vars so we can
+   keep iframe Twitch playable while still using denser layouts in HLS mode. */
 .grid {
   flex: 1 1 0;
   min-width: 0;
@@ -328,8 +327,8 @@ body {
   padding: 2px;
   background: #000;
   overflow: auto;
-  grid-template-columns: repeat(var(--cols, 2), minmax(400px, 1fr));
-  grid-template-rows: repeat(var(--rows, 1), minmax(300px, 1fr));
+  grid-template-columns: repeat(var(--cols, 2), minmax(var(--cell-min-w, 1px), 1fr));
+  grid-template-rows: repeat(var(--rows, 1), minmax(var(--cell-min-h, 1px), 1fr));
   align-content: stretch;
   justify-content: stretch;
   align-items: stretch;
@@ -337,8 +336,8 @@ body {
 }
 
 .grid.one-col {
-  grid-template-columns: minmax(400px, 1fr);
-  grid-template-rows: repeat(var(--rows, 1), minmax(300px, 1fr));
+  grid-template-columns: minmax(var(--cell-min-w, 1px), 1fr);
+  grid-template-rows: repeat(var(--rows, 1), minmax(var(--cell-min-h, 1px), 1fr));
 }
 
 .cell {
