@@ -82,7 +82,7 @@ Never commit `.env` or share your client secret. `.gitignore` excludes `.env`, `
 - **YouTube**: paste a watch, embed, Shorts, or live URL, or use `yt:` / `youtube:` plus the video ID or URL.
 - **HLS**: paste an `https://…` playlist URL that looks like HLS (often contains `m3u8`, `/hls/`, or `/manifest/`), or prefix with `hls:`.
 - **Transcoded HLS** (`transcode:https://…/playlist.m3u8`): the server runs **ffmpeg** to re-encode to **H.264/AAC** (needed for many broadcast **MPEG-2** `.ts` streams that Chrome/Edge cannot decode). Requires **ffmpeg** installed and on `PATH`. The app checks `/api/transcode/status` before adding.
-- **Grid**: layout scales with the number of streams; **minimum cell size** is enforced (~**400×300** CSS pixels) so **Twitch** embeds can autoplay (muted); the grid **scrolls** when needed.
+- **Grid**: layout scales with the number of streams; **minimum cell size** is enforced (~**320×180** CSS pixels by default) so **Twitch** embeds can autoplay (muted); the grid **scrolls** when needed.
 - **Persistence**: channel list and UI options are stored in **`localStorage`** (saved layout survives refresh and browser restart).
 
 ### Twitch-only features
@@ -95,6 +95,7 @@ Never commit `.env` or share your client secret. `.gitignore` excludes `.env`, `
 
 - **Background tab**: embeds and chat stay loaded so audio/video can keep playing while you use another tab (the browser may still throttle background tabs).
 - **Scrollable grid**: cells that scroll off-screen unload embeds (iframes blanked; HLS uses `stopLoad` / `startLoad` when visible again).
+- **Priority tiles (optional)**: enable the **`Priority tiles`** checkbox in the toolbar, then click **`Priority list`** to choose which currently-watched channels/links should get a bigger tile when available. For **Twitch**, the priority tile only becomes “big” when that channel is online.
 - **Lazy loading** for Twitch/YouTube iframes where supported.
 - **CSS** `content-visibility` hints on cells to reduce off-screen work.
 - **Transcoding**: optional **`FFMPEG_MAX_HEIGHT`** / **`FFMPEG_PRESET`** in `.env` to reduce CPU for `transcode:` feeds.
