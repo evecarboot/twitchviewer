@@ -360,6 +360,11 @@
    */
   const GRID_MIN_CELL_W = 320;
   const GRID_MIN_CELL_H = 180;
+  // For non-iframe modes (HLS <video> path, YouTube embeds, etc.) we can allow
+  // smaller cells than the Twitch autoplay-sensitive iframe minimum.
+  // This prevents "single-line strip" layouts on shorter viewports.
+  const GRID_MIN_CELL_W_SOFT = 240;
+  const GRID_MIN_CELL_H_SOFT = 135;
 
   /** Space embeds apart: Helix limits + fewer simultaneous WebGL contexts in the browser. */
   function queueTwitchMount(run) {
@@ -616,9 +621,15 @@
   function currentGridMinimums(visible) {
     // Historically we dropped mins to {1,1} for non-iframe modes to enable denser
     // tiling. That can make non-priority tiles look like a compressed strip.
-    // Use a real minimum so normal tiles stay "as big as the viewport allows".
-    // (Twitch autoplay sensitivity is handled elsewhere by waiting for paint.)
-    return { minW: GRID_MIN_CELL_W, minH: GRID_MIN_CELL_H };
+    // Use a soft minimum so normal tiles stay reasonably sized, while Twitch
+    // iframe mode still keeps its stricter autoplay threshold.
+    const hasTwitchIframe =
+      twitchPlayback === 'iframe' &&
+      visible.some((ch) => getChannelType(ch) === 'twitch');
+
+    return hasTwitchIframe
+      ? { minW: GRID_MIN_CELL_W, minH: GRID_MIN_CELL_H }
+      : { minW: GRID_MIN_CELL_W_SOFT, minH: GRID_MIN_CELL_H_SOFT };
   }
 
   /**
@@ -665,6 +676,55 @@
       return { cols, rows };
     }
     return { cols: bestCols, rows: bestRows };
+  }
+
+  /**
+   * Non-priority layout: prefer layouts that keep tiles looking "big" for typical
+   * Twitch/YouTube aspect (16:9), even if that means some grid waste (empty cells).
+   *
+   * This avoids the common "N columns x 1 row strip" that happens when we only
+   * minimize waste/imbalance.
+   */
+  function gridDimensionsByStreamFit(count, vp, mins) {
+    if (count <= 0) return { cols: 1, rows: 1 };
+    if (count === 1) return { cols: 1, rows: 1 };
+
+    const { w, h } = vp;
+    const { minW, minH } = mins;
+    const AR_W = 16;
+    const AR_H = 9;
+
+    let best = { cols: 1, rows: 1, score: -Infinity, waste: Infinity, imbalance: Infinity };
+
+    for (let cols = 1; cols <= count; cols++) {
+      const rows = Math.ceil(count / cols);
+      const cw = w / cols;
+      const ch = h / rows;
+      if (cw < minW || ch < minH) continue;
+
+      // Contain-fit into a 16:9 tile.
+      // displayW is limited by either the tile width or the height-constrained width.
+      const displayW = Math.min(cw, (ch * AR_W) / AR_H);
+      const displayH = Math.min(ch, (cw * AR_H) / AR_W);
+      const score = displayW * displayH;
+
+      const waste = cols * rows - count;
+      const imbalance = Math.abs(cols - rows);
+
+      if (
+        score > best.score ||
+        (score === best.score && waste < best.waste) ||
+        (score === best.score && waste === best.waste && imbalance < best.imbalance)
+      ) {
+        best = { cols, rows, score, waste, imbalance };
+      }
+    }
+
+    // Fallback to old logic if mins were too strict for this viewport.
+    if (!Number.isFinite(best.score)) {
+      return gridDimensions(count, vp, mins);
+    }
+    return { cols: best.cols, rows: best.rows };
   }
 
   /** Update grid columns/rows from viewport without rebuilding cells (keeps Twitch embeds alive). */
@@ -762,7 +822,7 @@
     const vp = gridViewportSize();
 
     if (!bigKeys.length) {
-      const { cols, rows } = gridDimensions(n, vp, mins);
+      const { cols, rows } = gridDimensionsByStreamFit(n, vp, mins);
       return {
         orderedVisible,
         bigKeys: [],
