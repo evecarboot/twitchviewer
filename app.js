@@ -17,6 +17,7 @@
     channels: [],
     importedFollows: [],
     hideOffline: false,
+    priorityTiles: false,
     showChat: false,
     hideChatPanel: false,
     chatOnLeft: false,
@@ -44,6 +45,7 @@
     addForm: document.getElementById('add-form'),
     channelInput: document.getElementById('channel-input'),
     hideOffline: document.getElementById('hide-offline'),
+    priorityTiles: document.getElementById('priority-tiles'),
     refreshStreams: document.getElementById('refresh-streams'),
     showChat: document.getElementById('show-chat'),
     hideChatPanelWrap: document.getElementById('hide-chat-panel-wrap'),
@@ -655,15 +657,19 @@
   /** Update grid columns/rows from viewport without rebuilding cells (keeps Twitch embeds alive). */
   function layoutGridToViewport() {
     if (!els.grid) return;
-    const visible = visibleChannels();
-    const n = visible.length;
-    const mins = currentGridMinimums(visible);
-    const { cols, rows } = gridDimensions(n, gridViewportSize(), mins);
-    els.grid.style.setProperty('--cell-min-w', `${Math.max(1, mins.minW)}px`);
-    els.grid.style.setProperty('--cell-min-h', `${Math.max(1, mins.minH)}px`);
-    els.grid.style.setProperty('--cols', String(Math.max(1, cols)));
-    els.grid.style.setProperty('--rows', String(Math.max(1, rows)));
-    els.grid.classList.toggle('one-col', n === 1);
+    const layout = computeGridLayoutVars();
+    els.grid.style.setProperty(
+      '--cell-min-w',
+      `${Math.max(1, layout.mins.minW)}px`
+    );
+    els.grid.style.setProperty(
+      '--cell-min-h',
+      `${Math.max(1, layout.mins.minH)}px`
+    );
+    els.grid.style.setProperty('--cols', String(Math.max(1, layout.cols)));
+    els.grid.style.setProperty('--rows', String(Math.max(1, layout.rows)));
+    els.grid.classList.toggle('one-col', layout.n === 1);
+    applyBigTileCellSpans(layout.bigKey, layout.spanW, layout.spanH);
   }
 
   function scheduleLayoutGridToViewport() {
@@ -682,6 +688,109 @@
     });
   }
 
+  const PRIORITY_CANDIDATES_MAX = 5;
+
+  /**
+   * Pick a single "big tile" for priority mode:
+   * - only from the imported follows list (state.importedFollows) if available
+   * - only if that channel is currently online (onlineSet)
+   * - uses the same order as state.channels so it feels predictable
+   */
+  function priorityBigTileKey(visible) {
+    if (!state.priorityTiles) return null;
+    if (!apiConfigured || pollFailed) return null;
+    if (!onlineSet || onlineSet.size === 0) return null;
+
+    const followSet =
+      state.importedFollows && state.importedFollows.length
+        ? new Set(state.importedFollows)
+        : null;
+
+    const candidates = visible.filter((ch) => {
+      if (getChannelType(ch) !== 'twitch') return false;
+      const login = getTwitchLogin(ch);
+      if (followSet) return followSet.has(login);
+      return true;
+    });
+
+    // Keep it stable/predictable: first online priority candidate in state order.
+    let seen = 0;
+    for (const ch of candidates) {
+      if (seen >= PRIORITY_CANDIDATES_MAX) break;
+      const login = getTwitchLogin(ch);
+      if (onlineSet.has(login)) return channelKey(ch);
+      seen++;
+    }
+    return null;
+  }
+
+  function visibleChannelsForLayout() {
+    const v = visibleChannels();
+    const bigKey = priorityBigTileKey(v);
+    if (!bigKey) return { orderedVisible: v, bigKey: null };
+    const bigCh = v.find((ch) => channelKey(ch) === bigKey);
+    if (!bigCh) return { orderedVisible: v, bigKey: null };
+    return { orderedVisible: [bigCh, ...v.filter((ch) => ch !== bigCh)], bigKey };
+  }
+
+  function computeGridLayoutVars() {
+    const { orderedVisible, bigKey } = visibleChannelsForLayout();
+    const n = orderedVisible.length;
+    const mins = currentGridMinimums(orderedVisible);
+    const vp = gridViewportSize();
+
+    if (!bigKey) {
+      const { cols, rows } = gridDimensions(n, vp, mins);
+      return { orderedVisible, bigKey: null, mins, n, cols, rows, spanW: 1, spanH: 1 };
+    }
+
+    // Start with an initial grid, choose a span size, then recompute to ensure the
+    // explicit grid has enough capacity to place the big tile without implicit rows.
+    const base = gridDimensions(n, vp, mins);
+    let spanW = base.cols >= 2 ? 2 : 1;
+    let spanH = base.rows >= 2 ? 2 : 1;
+    let effectiveCount = n + (spanW * spanH - 1);
+    let dims = gridDimensions(effectiveCount, vp, mins);
+
+    spanW = dims.cols >= 2 ? 2 : 1;
+    spanH = dims.rows >= 2 ? 2 : 1;
+    effectiveCount = n + (spanW * spanH - 1);
+    dims = gridDimensions(effectiveCount, vp, mins);
+
+    return {
+      orderedVisible,
+      bigKey,
+      mins,
+      n,
+      cols: dims.cols,
+      rows: dims.rows,
+      spanW,
+      spanH,
+    };
+  }
+
+  function applyBigTileCellSpans(bigKey, spanW, spanH) {
+    const cells = els.grid ? Array.from(els.grid.querySelectorAll('.cell')) : [];
+    for (const cell of cells) {
+      const isBig = bigKey && cell.dataset.channelKey === bigKey;
+      cell.style.gridColumnEnd = isBig ? `span ${spanW}` : '';
+      cell.style.gridRowEnd = isBig ? `span ${spanH}` : '';
+
+      const handle = cell.querySelector('.cell-drag-handle');
+      if (handle) {
+        if (isBig) {
+          handle.style.pointerEvents = 'none';
+          handle.style.cursor = 'default';
+          handle.style.opacity = '0.5';
+        } else {
+          handle.style.pointerEvents = '';
+          handle.style.cursor = '';
+          handle.style.opacity = '';
+        }
+      }
+    }
+  }
+
   /** Reorder only channels that are currently visible in the grid; others stay in place. */
   function applyVisibleOrder(nextVisible) {
     const visibleKeys = new Set(nextVisible.map(channelKey));
@@ -695,7 +804,7 @@
   }
 
   function reorderVisibleChannelsGrid(fromIndex, toIndex) {
-    const v = visibleChannels();
+    const { orderedVisible: v, bigKey } = visibleChannelsForLayout();
     if (
       fromIndex === toIndex ||
       fromIndex < 0 ||
@@ -705,6 +814,10 @@
     ) {
       return;
     }
+    const fromKey = channelKey(v[fromIndex]);
+    const toKey = channelKey(v[toIndex]);
+    if (fromKey === bigKey || toKey === bigKey) return;
+
     const item = v[fromIndex];
     const next = v.filter((_, i) => i !== fromIndex);
     next.splice(toIndex, 0, item);
@@ -715,9 +828,8 @@
 
   /** Stable signature of the current grid — used to skip rebuild when poll didn’t change visibility. */
   function visibleChannelsSignature() {
-    return visibleChannels()
-      .map((ch) => channelKey(ch))
-      .join('\x1e');
+    const { orderedVisible } = visibleChannelsForLayout();
+    return orderedVisible.map((ch) => channelKey(ch)).join('\x1e');
   }
 
   function twitchLoginsForPoll() {
@@ -1362,15 +1474,21 @@
 
   function renderGrid() {
     disconnectCellObservers();
-    const visible = visibleChannels();
+    const layout = computeGridLayoutVars();
+    const visible = layout.orderedVisible;
     const desiredKeys = visible.map(channelKey);
     const n = visible.length;
-    const mins = currentGridMinimums(visible);
-    const { cols, rows } = gridDimensions(n, gridViewportSize(), mins);
-    els.grid.style.setProperty('--cell-min-w', `${Math.max(1, mins.minW)}px`);
-    els.grid.style.setProperty('--cell-min-h', `${Math.max(1, mins.minH)}px`);
-    els.grid.style.setProperty('--cols', String(Math.max(1, cols)));
-    els.grid.style.setProperty('--rows', String(Math.max(1, rows)));
+
+    els.grid.style.setProperty(
+      '--cell-min-w',
+      `${Math.max(1, layout.mins.minW)}px`
+    );
+    els.grid.style.setProperty(
+      '--cell-min-h',
+      `${Math.max(1, layout.mins.minH)}px`
+    );
+    els.grid.style.setProperty('--cols', String(Math.max(1, layout.cols)));
+    els.grid.style.setProperty('--rows', String(Math.max(1, layout.rows)));
     els.grid.classList.toggle('one-col', n === 1);
 
     if (n === 0) {
@@ -1382,6 +1500,7 @@
       requestAnimationFrame(() => {
         requestAnimationFrame(() => attachCellObserversToGrid());
       });
+      applyBigTileCellSpans(layout.bigKey, layout.spanW, layout.spanH);
       return;
     }
 
@@ -1402,6 +1521,7 @@
       cells.forEach((cell, i) => {
         cell.dataset.cellIndex = String(i);
       });
+      applyBigTileCellSpans(layout.bigKey, layout.spanW, layout.spanH);
       requestAnimationFrame(() => {
         requestAnimationFrame(() => attachCellObserversToGrid());
       });
@@ -1429,6 +1549,7 @@
     }
 
     requestAnimationFrame(() => {
+      applyBigTileCellSpans(layout.bigKey, layout.spanW, layout.spanH);
       requestAnimationFrame(() => attachCellObserversToGrid());
     });
   }
@@ -1608,6 +1729,16 @@
     });
   });
 
+  if (els.priorityTiles) {
+    els.priorityTiles.checked = state.priorityTiles;
+    els.priorityTiles.addEventListener('change', () => {
+      state.priorityTiles = els.priorityTiles.checked;
+      saveState();
+      // Rebuild layout so spanning changes immediately.
+      fullRender();
+    });
+  }
+
   if (els.refreshStreams) {
     els.refreshStreams.addEventListener('click', async () => {
       if (!twitchLoginsForPoll().length) return;
@@ -1692,6 +1823,9 @@
   }
 
   els.hideOffline.checked = state.hideOffline;
+  if (els.priorityTiles) {
+    els.priorityTiles.checked = state.priorityTiles;
+  }
   els.showChat.checked = state.showChat;
 
   async function fetchFollowsFromApi() {

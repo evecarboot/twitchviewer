@@ -323,6 +323,7 @@ body {
   width: 100%;
   height: 100%;
   display: grid;
+  grid-auto-flow: row dense;
   gap: 2px;
   padding: 2px;
   background: #000;
