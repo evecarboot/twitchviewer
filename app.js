@@ -598,8 +598,12 @@
   }
 
   function gridViewportSize() {
-    /** Prefer #main — .grid height can be wrong before flex distributes space (e.g. fullscreen). */
-    const primary = els.main || els.gridArea || els.grid;
+    /**
+     * Use the actual grid container (#grid-area) as the source of truth.
+     * #main can be temporarily wrong during flex/resize transitions (like entering
+     * fullscreen), which makes the layout solver pick bad cols×rows.
+     */
+    const primary = els.gridArea || els.main || els.grid;
     if (primary) {
       const r = primary.getBoundingClientRect();
       if (r.width >= 2 && r.height >= 2) {
