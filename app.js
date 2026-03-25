@@ -18,6 +18,7 @@
     importedFollows: [],
     hideOffline: false,
     priorityTiles: false,
+    prioritySelection: [],
     showChat: false,
     hideChatPanel: false,
     chatOnLeft: false,
@@ -38,6 +39,8 @@
   let twitchEmbedQueue = Promise.resolve();
   /** @type {Set<string>} */
   let followModalSelection = new Set();
+  /** @type {Set<string>} */
+  let priorityModalSelection = new Set();
   /** Debounce for layoutGridToViewport (resize + ResizeObserver). */
   let gridLayoutTimer = null;
 
@@ -46,6 +49,7 @@
     channelInput: document.getElementById('channel-input'),
     hideOffline: document.getElementById('hide-offline'),
     priorityTiles: document.getElementById('priority-tiles'),
+    priorityEditSelection: document.getElementById('edit-priority-selection'),
     refreshStreams: document.getElementById('refresh-streams'),
     showChat: document.getElementById('show-chat'),
     hideChatPanelWrap: document.getElementById('hide-chat-panel-wrap'),
@@ -84,6 +88,16 @@
     followSelectAll: document.getElementById('follow-select-all'),
     followSelectNone: document.getElementById('follow-select-none'),
     followModalRefresh: document.getElementById('follow-modal-refresh'),
+    // Priority modal
+    priorityModal: document.getElementById('priority-modal'),
+    priorityModalBackdrop: document.getElementById('priority-modal-backdrop'),
+    priorityFilter: document.getElementById('priority-filter'),
+    priorityList: document.getElementById('priority-list'),
+    priorityCount: document.getElementById('priority-count'),
+    prioritySelectAll: document.getElementById('priority-select-all'),
+    prioritySelectNone: document.getElementById('priority-select-none'),
+    priorityModalSave: document.getElementById('priority-modal-save'),
+    priorityModalCancel: document.getElementById('priority-modal-cancel'),
   };
 
   function loadState() {
@@ -688,39 +702,40 @@
     });
   }
 
-  const PRIORITY_CANDIDATES_MAX = 5;
-
   /**
-   * Pick a single "big tile" for priority mode:
-   * - only from the imported follows list (state.importedFollows) if available
-   * - only if that channel is currently online (onlineSet)
-   * - uses the same order as state.channels so it feels predictable
+   * Pick a single "big tile" for priority mode.
+   * - candidates come from state.prioritySelection
+   * - for Twitch: only pick if that channel is currently online (when onlineSet is available)
+   * - for YouTube/HLS: always available, so they can be big if selected
+   * - uses the same order as state.channels (and thus visible list) so it feels predictable
    */
   function priorityBigTileKey(visible) {
     if (!state.priorityTiles) return null;
-    if (!apiConfigured || pollFailed) return null;
-    if (!onlineSet || onlineSet.size === 0) return null;
+    const selection = Array.isArray(state.prioritySelection)
+      ? state.prioritySelection
+      : [];
+    if (!selection.length) return null;
 
-    const followSet =
-      state.importedFollows && state.importedFollows.length
-        ? new Set(state.importedFollows)
-        : null;
+    const selectionSet = new Set(selection);
+    const haveOnlineSignal = apiConfigured && !pollFailed && onlineSet.size > 0;
 
-    const candidates = visible.filter((ch) => {
-      if (getChannelType(ch) !== 'twitch') return false;
+    for (const ch of visible) {
+      const key = channelKey(ch);
+      if (!selectionSet.has(key)) continue;
+
+      if (getChannelType(ch) !== 'twitch') return key;
+
       const login = getTwitchLogin(ch);
-      if (followSet) return followSet.has(login);
-      return true;
-    });
+      if (haveOnlineSignal) {
+        if (onlineSet.has(login)) return key;
+        continue;
+      }
 
-    // Keep it stable/predictable: first online priority candidate in state order.
-    let seen = 0;
-    for (const ch of candidates) {
-      if (seen >= PRIORITY_CANDIDATES_MAX) break;
-      const login = getTwitchLogin(ch);
-      if (onlineSet.has(login)) return channelKey(ch);
-      seen++;
+      // If we don't have online signal yet, still pick the first selected tile so
+      // the layout remains useful.
+      return key;
     }
+
     return null;
   }
 
@@ -1009,6 +1024,83 @@
     if (els.editFollowSelection) {
       els.editFollowSelection.hidden = state.importedFollows.length === 0;
     }
+  }
+
+  function updatePriorityEditButtonVisibility() {
+    if (els.priorityEditSelection) {
+      els.priorityEditSelection.hidden = state.channels.length === 0;
+    }
+  }
+
+  function syncPriorityModalFromState() {
+    priorityModalSelection = new Set(state.prioritySelection || []);
+  }
+
+  function updatePriorityModalCount() {
+    if (!els.priorityCount) return;
+    els.priorityCount.textContent = `${priorityModalSelection.size} selected`;
+  }
+
+  function renderPriorityModalRows() {
+    if (!els.priorityList) return;
+    const q = (els.priorityFilter && els.priorityFilter.value.trim().toLowerCase()) || '';
+    els.priorityList.innerHTML = '';
+    const frag = document.createDocumentFragment();
+
+    for (const ch of state.channels) {
+      const key = channelKey(ch);
+      const lbl = formatChannelLabel(ch);
+      if (q && !lbl.toLowerCase().includes(q)) continue;
+
+      const row = document.createElement('label');
+      row.className = 'follow-row';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = priorityModalSelection.has(key);
+      cb.dataset.key = key;
+      cb.addEventListener('change', () => {
+        if (cb.checked) priorityModalSelection.add(key);
+        else priorityModalSelection.delete(key);
+        updatePriorityModalCount();
+      });
+
+      const span = document.createElement('span');
+      span.textContent = lbl;
+      row.appendChild(cb);
+      row.appendChild(span);
+      frag.appendChild(row);
+    }
+
+    els.priorityList.appendChild(frag);
+    updatePriorityModalCount();
+  }
+
+  function openPriorityModal() {
+    if (!els.priorityModal) return;
+    if (els.priorityFilter) els.priorityFilter.value = '';
+    syncPriorityModalFromState();
+    renderPriorityModalRows();
+    els.priorityModal.hidden = false;
+    els.priorityModal.setAttribute('aria-hidden', 'false');
+    if (els.priorityFilter) els.priorityFilter.focus();
+  }
+
+  function closePriorityModal() {
+    if (!els.priorityModal) return;
+    els.priorityModal.hidden = true;
+    els.priorityModal.setAttribute('aria-hidden', 'true');
+  }
+
+  function applyPriorityModalSave() {
+    state.prioritySelection = [...priorityModalSelection];
+    saveState();
+    closePriorityModal();
+    setMeta(
+      `${state.prioritySelection.length} priority tile(s) selected.`,
+      false
+    );
+    // Update layout immediately if priority mode is enabled.
+    if (state.priorityTiles) layoutGridToViewport();
   }
 
   function renderChannelChips() {
@@ -1617,6 +1709,7 @@
     applyToolbarLayout();
     renderGrid();
     updateFollowImportButtonsVisibility();
+    updatePriorityEditButtonVisibility();
     updateRefreshStreamsButton();
     requestAnimationFrame(() => {
       requestAnimationFrame(() => layoutGridToViewport());
@@ -1642,7 +1735,10 @@
   function schedulePoll() {
     if (pollTimer) clearInterval(pollTimer);
     pollTimer = null;
-    if (state.hideOffline && twitchLoginsForPoll().length) {
+    if (
+      (state.hideOffline || state.priorityTiles) &&
+      twitchLoginsForPoll().length
+    ) {
       pollTimer = setInterval(tick, POLL_MS);
     }
   }
@@ -1826,6 +1922,11 @@
   if (els.priorityTiles) {
     els.priorityTiles.checked = state.priorityTiles;
   }
+  if (els.priorityEditSelection) {
+    els.priorityEditSelection.addEventListener('click', () => {
+      openPriorityModal();
+    });
+  }
   els.showChat.checked = state.showChat;
 
   async function fetchFollowsFromApi() {
@@ -1919,9 +2020,44 @@
     });
   }
 
+  if (els.priorityModalCancel && els.priorityModalBackdrop) {
+    const cancel = () => closePriorityModal();
+    els.priorityModalCancel.addEventListener('click', cancel);
+    els.priorityModalBackdrop.addEventListener('click', cancel);
+  }
+
+  if (els.priorityModalSave) {
+    els.priorityModalSave.addEventListener('click', () => applyPriorityModalSave());
+  }
+
+  if (els.prioritySelectAll) {
+    els.prioritySelectAll.addEventListener('click', () => {
+      for (const ch of state.channels) {
+        priorityModalSelection.add(channelKey(ch));
+      }
+      renderPriorityModalRows();
+    });
+  }
+
+  if (els.prioritySelectNone) {
+    els.prioritySelectNone.addEventListener('click', () => {
+      priorityModalSelection.clear();
+      renderPriorityModalRows();
+    });
+  }
+
+  if (els.priorityFilter) {
+    els.priorityFilter.addEventListener('input', () => renderPriorityModalRows());
+  }
+
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape' || !els.followModal || els.followModal.hidden) return;
     closeFollowModal();
+  });
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape' || !els.priorityModal || els.priorityModal.hidden) return;
+    closePriorityModal();
   });
 
   /**

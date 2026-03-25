@@ -56,6 +56,14 @@
           <button
             type="button"
             class="ghost"
+            id="edit-priority-selection"
+            title="Choose which channels get a bigger tile when available"
+          >
+            Priority list
+          </button>
+          <button
+            type="button"
+            class="ghost"
             id="refresh-streams"
             title="Check who is live now (same as the automatic check every 45s)"
           >
@@ -171,6 +179,72 @@
           <span class="modal-actions-spacer"></span>
           <button type="button" class="ghost" id="follow-modal-cancel">Cancel</button>
           <button type="button" class="ghost primary" id="follow-modal-save">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <div
+      id="priority-modal"
+      class="modal"
+      hidden
+      aria-hidden="true"
+      aria-label="Priority tiles modal"
+    >
+      <div class="modal-backdrop" id="priority-modal-backdrop"></div>
+      <div
+        class="modal-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="priority-modal-title"
+      >
+        <h2 id="priority-modal-title" class="modal-title">Priority tiles</h2>
+        <p class="modal-hint">
+          Choose which channels/streams (from your current grid) should get a
+          bigger tile when they are available.
+        </p>
+        <div class="modal-toolbar">
+          <input
+            type="search"
+            class="follow-filter"
+            id="priority-filter"
+            placeholder="Filter list…"
+            autocomplete="off"
+            aria-label="Filter priority channels"
+          />
+          <span class="follow-count" id="priority-count"></span>
+          <button
+            type="button"
+            class="ghost"
+            id="priority-select-all"
+            title="Select all channels shown in the grid"
+          >
+            Select all
+          </button>
+          <button
+            type="button"
+            class="ghost"
+            id="priority-select-none"
+            title="Clear the priority selection"
+          >
+            Select none
+          </button>
+        </div>
+        <div class="follow-list" id="priority-list"></div>
+        <div class="modal-actions">
+          <button
+            type="button"
+            class="ghost"
+            id="priority-modal-cancel"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            class="ghost primary"
+            id="priority-modal-save"
+          >
+            Save
+          </button>
         </div>
       </div>
     </div>
