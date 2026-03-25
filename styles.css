@@ -336,6 +336,18 @@ body {
   justify-items: stretch;
 }
 
+.grid.no-dense {
+  /*
+   * When priority tiles are active (big tiles with grid spans), `dense` can
+   * backfill earlier “holes” and effectively pull non-priority tiles up into
+   * the same top area as the big tiles.
+   *
+   * This gives priority tiles a stable “top zone”, and non-priority tiles
+   * fill downward more predictably.
+   */
+  grid-auto-flow: row;
+}
+
 .grid.one-col {
   grid-template-columns: minmax(var(--cell-min-w, 1px), 1fr);
   grid-template-rows: repeat(var(--rows, 1), minmax(var(--cell-min-h, 1px), 1fr));

@@ -614,12 +614,11 @@
   }
 
   function currentGridMinimums(visible) {
-    const hasTwitchIframe =
-      twitchPlayback === 'iframe' &&
-      visible.some((ch) => getChannelType(ch) === 'twitch');
-    return hasTwitchIframe
-      ? { minW: GRID_MIN_CELL_W, minH: GRID_MIN_CELL_H }
-      : { minW: 1, minH: 1 };
+    // Historically we dropped mins to {1,1} for non-iframe modes to enable denser
+    // tiling. That can make non-priority tiles look like a compressed strip.
+    // Use a real minimum so normal tiles stay "as big as the viewport allows".
+    // (Twitch autoplay sensitivity is handled elsewhere by waiting for paint.)
+    return { minW: GRID_MIN_CELL_W, minH: GRID_MIN_CELL_H };
   }
 
   /**
@@ -672,6 +671,9 @@
   function layoutGridToViewport() {
     if (!els.grid) return;
     const layout = computeGridLayoutVars();
+    // Priority spans + `dense` auto-placement can pull non-priority tiles into the
+    // same top area as big tiles. Disable that when big tiles exist.
+    els.grid.classList.toggle('no-dense', (layout.bigKeys || []).length > 0);
     els.grid.style.setProperty(
       '--cell-min-w',
       `${Math.max(1, layout.mins.minW)}px`
