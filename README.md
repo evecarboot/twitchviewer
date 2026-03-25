@@ -95,7 +95,7 @@ Never commit `.env` or share your client secret. `.gitignore` excludes `.env`, `
 
 - **Background tab**: embeds and chat stay loaded so audio/video can keep playing while you use another tab (the browser may still throttle background tabs).
 - **Scrollable grid**: cells that scroll off-screen unload embeds (iframes blanked; HLS uses `stopLoad` / `startLoad` when visible again).
-- **Priority tiles (optional)**: enable the **`Priority tiles`** checkbox in the toolbar, then click **`Priority list`** to choose which currently-watched channels/links should get a bigger tile when available. For **Twitch**, the priority tile only becomes “big” when that channel is online.
+- **Priority tiles (optional)**: enable the **`Priority tiles`** checkbox in the toolbar, then click **`Priority list`** to choose which currently-watched channels/links should get a bigger tile when available. For **Twitch**, priority tiles become “big” only when those channels are online.
 - **Lazy loading** for Twitch/YouTube iframes where supported.
 - **CSS** `content-visibility` hints on cells to reduce off-screen work.
 - **Transcoding**: optional **`FFMPEG_MAX_HEIGHT`** / **`FFMPEG_PRESET`** in `.env` to reduce CPU for `transcode:` feeds.

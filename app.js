@@ -683,7 +683,7 @@
     els.grid.style.setProperty('--cols', String(Math.max(1, layout.cols)));
     els.grid.style.setProperty('--rows', String(Math.max(1, layout.rows)));
     els.grid.classList.toggle('one-col', layout.n === 1);
-    applyBigTileCellSpans(layout.bigKey, layout.spanW, layout.spanH);
+    applyBigTileCellSpans(layout.bigKeys, layout.spanW, layout.spanH);
   }
 
   function scheduleLayoutGridToViewport() {
@@ -703,78 +703,109 @@
   }
 
   /**
-   * Pick a single "big tile" for priority mode.
-   * - candidates come from state.prioritySelection
+   * Pick up to N "big tiles" for priority mode.
+   * - candidates come from state.prioritySelection (selection list in the modal)
    * - for Twitch: only pick if that channel is currently online (when onlineSet is available)
    * - for YouTube/HLS: always available, so they can be big if selected
    * - uses the same order as state.channels (and thus visible list) so it feels predictable
    */
-  function priorityBigTileKey(visible) {
-    if (!state.priorityTiles) return null;
+  function priorityBigTileKeys(visible) {
+    if (!state.priorityTiles) return [];
     const selection = Array.isArray(state.prioritySelection)
       ? state.prioritySelection
       : [];
-    if (!selection.length) return null;
+    if (!selection.length) return [];
 
     const selectionSet = new Set(selection);
     const haveOnlineSignal = apiConfigured && !pollFailed && onlineSet.size > 0;
 
+    const out = [];
     for (const ch of visible) {
       const key = channelKey(ch);
       if (!selectionSet.has(key)) continue;
 
-      if (getChannelType(ch) !== 'twitch') return key;
-
-      const login = getTwitchLogin(ch);
-      if (haveOnlineSignal) {
-        if (onlineSet.has(login)) return key;
+      if (getChannelType(ch) !== 'twitch') {
+        out.push(key);
         continue;
       }
 
-      // If we don't have online signal yet, still pick the first selected tile so
-      // the layout remains useful.
-      return key;
+      const login = getTwitchLogin(ch);
+      if (haveOnlineSignal) {
+        if (onlineSet.has(login)) out.push(key);
+        continue;
+      }
+      // Without online signal, keep Twitch priority disabled (prevents offline channels being promoted).
+      continue;
     }
-
-    return null;
+    return out;
   }
 
   function visibleChannelsForLayout() {
     const v = visibleChannels();
-    const bigKey = priorityBigTileKey(v);
-    if (!bigKey) return { orderedVisible: v, bigKey: null };
-    const bigCh = v.find((ch) => channelKey(ch) === bigKey);
-    if (!bigCh) return { orderedVisible: v, bigKey: null };
-    return { orderedVisible: [bigCh, ...v.filter((ch) => ch !== bigCh)], bigKey };
+    const bigKeys = priorityBigTileKeys(v);
+    if (!bigKeys.length) return { orderedVisible: v, bigKeys: [] };
+
+    const bigSet = new Set(bigKeys);
+    const ordered = [
+      ...v.filter((ch) => bigSet.has(channelKey(ch))),
+      ...v.filter((ch) => !bigSet.has(channelKey(ch))),
+    ];
+    return { orderedVisible: ordered, bigKeys };
   }
 
   function computeGridLayoutVars() {
-    const { orderedVisible, bigKey } = visibleChannelsForLayout();
+    const { orderedVisible, bigKeys } = visibleChannelsForLayout();
     const n = orderedVisible.length;
     const mins = currentGridMinimums(orderedVisible);
     const vp = gridViewportSize();
 
-    if (!bigKey) {
+    if (!bigKeys.length) {
       const { cols, rows } = gridDimensions(n, vp, mins);
-      return { orderedVisible, bigKey: null, mins, n, cols, rows, spanW: 1, spanH: 1 };
+      return {
+        orderedVisible,
+        bigKeys: [],
+        mins,
+        n,
+        cols,
+        rows,
+        spanW: 1,
+        spanH: 1,
+      };
     }
 
-    // Start with an initial grid, choose a span size, then recompute to ensure the
-    // explicit grid has enough capacity to place the big tile without implicit rows.
+    // Start with an initial grid, then choose a span size that allows multiple
+    // big tiles to coexist without wasting too much space.
     const base = gridDimensions(n, vp, mins);
-    let spanW = base.cols >= 2 ? 2 : 1;
-    let spanH = base.rows >= 2 ? 2 : 1;
-    let effectiveCount = n + (spanW * spanH - 1);
+
+    // If only 1 tile is big, use 2x2 for best readability.
+    // With 2+ big tiles, use 2x1 (or 1x2) so multiple can be promoted together.
+    let spanW = 1;
+    let spanH = 1;
+    if (bigKeys.length === 1) {
+      spanW = base.cols >= 2 ? 2 : 1;
+      spanH = base.rows >= 2 ? 2 : 1;
+    } else {
+      if (base.cols >= 2) {
+        spanW = 2;
+        spanH = 1;
+      } else if (base.rows >= 2) {
+        spanW = 1;
+        spanH = 2;
+      }
+    }
+
+    let effectiveCount = n + bigKeys.length * (spanW * spanH - 1);
     let dims = gridDimensions(effectiveCount, vp, mins);
 
-    spanW = dims.cols >= 2 ? 2 : 1;
-    spanH = dims.rows >= 2 ? 2 : 1;
-    effectiveCount = n + (spanW * spanH - 1);
+    // Safety: if tracks are 1-wide, prevent invalid spans.
+    if (dims.cols < 2) spanW = 1;
+    if (dims.rows < 2) spanH = 1;
+    effectiveCount = n + bigKeys.length * (spanW * spanH - 1);
     dims = gridDimensions(effectiveCount, vp, mins);
 
     return {
       orderedVisible,
-      bigKey,
+      bigKeys,
       mins,
       n,
       cols: dims.cols,
@@ -784,10 +815,10 @@
     };
   }
 
-  function applyBigTileCellSpans(bigKey, spanW, spanH) {
+  function applyBigTileCellSpans(bigKeys, spanW, spanH) {
     const cells = els.grid ? Array.from(els.grid.querySelectorAll('.cell')) : [];
     for (const cell of cells) {
-      const isBig = bigKey && cell.dataset.channelKey === bigKey;
+      const isBig = bigKeys && bigKeys.length > 0 && bigKeys.includes(cell.dataset.channelKey);
       cell.style.gridColumnEnd = isBig ? `span ${spanW}` : '';
       cell.style.gridRowEnd = isBig ? `span ${spanH}` : '';
 
@@ -819,7 +850,7 @@
   }
 
   function reorderVisibleChannelsGrid(fromIndex, toIndex) {
-    const { orderedVisible: v, bigKey } = visibleChannelsForLayout();
+    const { orderedVisible: v, bigKeys } = visibleChannelsForLayout();
     if (
       fromIndex === toIndex ||
       fromIndex < 0 ||
@@ -831,7 +862,7 @@
     }
     const fromKey = channelKey(v[fromIndex]);
     const toKey = channelKey(v[toIndex]);
-    if (fromKey === bigKey || toKey === bigKey) return;
+    if (bigKeys && bigKeys.length && (bigKeys.includes(fromKey) || bigKeys.includes(toKey))) return;
 
     const item = v[fromIndex];
     const next = v.filter((_, i) => i !== fromIndex);
@@ -1592,7 +1623,7 @@
       requestAnimationFrame(() => {
         requestAnimationFrame(() => attachCellObserversToGrid());
       });
-      applyBigTileCellSpans(layout.bigKey, layout.spanW, layout.spanH);
+      applyBigTileCellSpans(layout.bigKeys, layout.spanW, layout.spanH);
       return;
     }
 
@@ -1613,7 +1644,7 @@
       cells.forEach((cell, i) => {
         cell.dataset.cellIndex = String(i);
       });
-      applyBigTileCellSpans(layout.bigKey, layout.spanW, layout.spanH);
+      applyBigTileCellSpans(layout.bigKeys, layout.spanW, layout.spanH);
       requestAnimationFrame(() => {
         requestAnimationFrame(() => attachCellObserversToGrid());
       });
@@ -1641,7 +1672,7 @@
     }
 
     requestAnimationFrame(() => {
-      applyBigTileCellSpans(layout.bigKey, layout.spanW, layout.spanH);
+      applyBigTileCellSpans(layout.bigKeys, layout.spanW, layout.spanH);
       requestAnimationFrame(() => attachCellObserversToGrid());
     });
   }
