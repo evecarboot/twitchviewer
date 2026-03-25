@@ -123,7 +123,15 @@
 
       <main class="main" id="main">
         <div class="grid-area" id="grid-area">
-          <div class="grid" id="grid" aria-live="polite"></div>
+          <div class="grid-split" id="grid-split">
+            <div
+              class="grid grid-priority"
+              id="grid-priority"
+              hidden
+              aria-label="Priority streams"
+            ></div>
+            <div class="grid grid-full" id="grid" aria-live="polite"></div>
+          </div>
         </div>
         <aside class="chat-panel" id="chat-panel" hidden aria-label="Twitch chat">
           <div class="chat-panel-header">

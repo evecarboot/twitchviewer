@@ -67,6 +67,8 @@
     toolbarMeta: document.getElementById('toolbar-meta'),
     channelList: document.getElementById('channel-list'),
     grid: document.getElementById('grid'),
+    gridSplit: document.getElementById('grid-split'),
+    gridPriority: document.getElementById('grid-priority'),
     gridArea: document.getElementById('grid-area'),
     chatPanel: document.getElementById('chat-panel'),
     chatIframeWrap: document.getElementById('chat-iframe-wrap'),
@@ -735,6 +737,58 @@
   function layoutGridToViewport() {
     if (!els.grid) return;
     const layout = computeGridLayoutVars();
+    if (layout.split) {
+      if (els.gridSplit) els.gridSplit.classList.toggle('priority-only', layout.rest.channels.length === 0);
+      if (els.gridPriority) {
+        els.gridPriority.classList.toggle(
+          'no-dense',
+          (layout.bigKeys || []).length > 0
+        );
+        els.gridPriority.style.setProperty(
+          '--cell-min-w',
+          `${Math.max(1, layout.mins.minW)}px`
+        );
+        els.gridPriority.style.setProperty(
+          '--cell-min-h',
+          `${Math.max(1, layout.mins.minH)}px`
+        );
+        els.gridPriority.style.setProperty(
+          '--cols',
+          String(Math.max(1, layout.priority.cols))
+        );
+        els.gridPriority.style.setProperty(
+          '--rows',
+          String(Math.max(1, layout.priority.rows))
+        );
+        els.gridPriority.classList.toggle(
+          'one-col',
+          layout.priority.channels.length === 1
+        );
+        applyPriorityGridSpans(layout.priority.spanW, layout.priority.spanH);
+      }
+      els.grid.classList.toggle('no-dense', false);
+      els.grid.style.setProperty(
+        '--cell-min-w',
+        `${Math.max(1, layout.mins.minW)}px`
+      );
+      els.grid.style.setProperty(
+        '--cell-min-h',
+        `${Math.max(1, layout.mins.minH)}px`
+      );
+      els.grid.style.setProperty('--cols', String(Math.max(1, layout.rest.cols)));
+      els.grid.style.setProperty('--rows', String(Math.max(1, layout.rest.rows)));
+      els.grid.classList.toggle('one-col', layout.rest.channels.length === 1);
+      clearRestGridSpans();
+      return;
+    }
+
+    if (els.gridSplit) els.gridSplit.classList.remove('priority-only');
+    if (els.gridPriority) {
+      els.gridPriority.hidden = true;
+    }
+    els.grid.classList.remove('grid-rest', 'grid-rest-hidden');
+    els.grid.classList.add('grid-full');
+    els.grid.hidden = false;
     // Priority spans + `dense` auto-placement can pull non-priority tiles into the
     // same top area as big tiles. Disable that when big tiles exist.
     els.grid.classList.toggle('no-dense', (layout.bigKeys || []).length > 0);
@@ -819,6 +873,10 @@
     return { orderedVisible: ordered, bigKeys };
   }
 
+  /** Approximate vertical split between priority band and the rest (for layout math). */
+  const PRIORITY_BAND_FRAC = 0.52;
+  const REST_BAND_FRAC = 0.48;
+
   function computeGridLayoutVars() {
     const { orderedVisible, bigKeys } = visibleChannelsForLayout();
     const n = orderedVisible.length;
@@ -828,6 +886,7 @@
     if (!bigKeys.length) {
       const { cols, rows } = gridDimensionsByStreamFit(n, vp, mins);
       return {
+        split: false,
         orderedVisible,
         bigKeys: [],
         mins,
@@ -839,12 +898,22 @@
       };
     }
 
-    // Start with an initial grid, then choose a span size that allows multiple
-    // big tiles to coexist without wasting too much space.
-    const base = gridDimensions(n, vp, mins);
+    const bigSet = new Set(bigKeys);
+    const priorityChannels = orderedVisible.filter((ch) =>
+      bigSet.has(channelKey(ch))
+    );
+    const restChannels = orderedVisible.filter(
+      (ch) => !bigSet.has(channelKey(ch))
+    );
+    const nP = priorityChannels.length;
+    const nR = restChannels.length;
 
-    // If only 1 tile is big, use 2x2 for best readability.
-    // With 2+ big tiles, use 2x1 (or 1x2) so multiple can be promoted together.
+    const hPri = Math.max(220, vp.h * PRIORITY_BAND_FRAC);
+    const hRest = Math.max(200, vp.h * REST_BAND_FRAC);
+    const vpPri = { w: vp.w, h: hPri };
+    const vpRest = { w: vp.w, h: hRest };
+
+    const base = gridDimensions(nP, vpPri, mins);
     let spanW = 1;
     let spanH = 1;
     if (bigKeys.length === 1) {
@@ -860,25 +929,65 @@
       }
     }
 
-    let effectiveCount = n + bigKeys.length * (spanW * spanH - 1);
-    let dims = gridDimensions(effectiveCount, vp, mins);
-
-    // Safety: if tracks are 1-wide, prevent invalid spans.
+    let effectiveCount = nP + bigKeys.length * (spanW * spanH - 1);
+    let dims = gridDimensions(effectiveCount, vpPri, mins);
     if (dims.cols < 2) spanW = 1;
     if (dims.rows < 2) spanH = 1;
-    effectiveCount = n + bigKeys.length * (spanW * spanH - 1);
-    dims = gridDimensions(effectiveCount, vp, mins);
+    effectiveCount = nP + bigKeys.length * (spanW * spanH - 1);
+    dims = gridDimensions(effectiveCount, vpPri, mins);
+
+    const restDims =
+      nR > 0
+        ? gridDimensionsByStreamFit(nR, vpRest, mins)
+        : { cols: 1, rows: 1 };
 
     return {
+      split: true,
       orderedVisible,
       bigKeys,
       mins,
       n,
-      cols: dims.cols,
-      rows: dims.rows,
-      spanW,
-      spanH,
+      priority: {
+        channels: priorityChannels,
+        cols: dims.cols,
+        rows: dims.rows,
+        spanW,
+        spanH,
+      },
+      rest: {
+        channels: restChannels,
+        cols: restDims.cols,
+        rows: restDims.rows,
+      },
     };
+  }
+
+  function applyPriorityGridSpans(spanW, spanH) {
+    if (!els.gridPriority) return;
+    for (const cell of els.gridPriority.querySelectorAll('.cell')) {
+      cell.style.gridColumnEnd = `span ${spanW}`;
+      cell.style.gridRowEnd = `span ${spanH}`;
+      const handle = cell.querySelector('.cell-drag-handle');
+      if (handle) {
+        handle.style.pointerEvents = 'none';
+        handle.style.cursor = 'default';
+        handle.style.opacity = '0.5';
+      }
+    }
+  }
+
+  function clearRestGridSpans() {
+    if (!els.grid) return;
+    for (const cell of els.grid.querySelectorAll('.cell')) {
+      cell.style.gridColumnEnd = '';
+      cell.style.gridRowEnd = '';
+      const handle = cell.querySelector('.cell-drag-handle');
+      if (handle) {
+        handle.style.pointerEvents = '';
+        handle.style.cursor = '';
+        handle.style.opacity = '';
+      }
+    }
   }
 
   function applyBigTileCellSpans(bigKeys, spanW, spanH) {
@@ -926,9 +1035,12 @@
     ) {
       return;
     }
+    if (bigKeys && bigKeys.length) {
+      const nP = bigKeys.length;
+      if ((fromIndex < nP) !== (toIndex < nP)) return;
+    }
     const fromKey = channelKey(v[fromIndex]);
     const toKey = channelKey(v[toIndex]);
-    if (bigKeys && bigKeys.length && (bigKeys.includes(fromKey) || bigKeys.includes(toKey))) return;
 
     const item = v[fromIndex];
     const next = v.filter((_, i) => i !== fromIndex);
@@ -1196,8 +1308,8 @@
       `${state.prioritySelection.length} priority tile(s) selected.`,
       false
     );
-    // Update layout immediately if priority mode is enabled.
-    if (state.priorityTiles) layoutGridToViewport();
+    // Rebuild grid so priority / non-priority split updates immediately.
+    if (state.priorityTiles) fullRender();
   }
 
   function renderChannelChips() {
@@ -1355,7 +1467,13 @@
   function attachCellObserversToGrid() {
     if (!els.grid || typeof IntersectionObserver === 'undefined') return;
 
-    els.grid.querySelectorAll('.cell').forEach((cell) => {
+    const cells = [
+      ...els.grid.querySelectorAll('.cell'),
+      ...(els.gridPriority
+        ? els.gridPriority.querySelectorAll('.cell')
+        : []),
+    ];
+    cells.forEach((cell) => {
       const iframe = cell.querySelector('iframe');
       const video = cell.querySelector('video.cell-video');
       if (!iframe && !video) return;
@@ -1419,8 +1537,8 @@
   let gridDragBound = false;
 
   function clearGridDragOver() {
-    if (!els.grid) return;
-    els.grid.querySelectorAll('.cell.cell-drag-over').forEach((el) => {
+    if (!els.gridArea) return;
+    els.gridArea.querySelectorAll('.cell.cell-drag-over').forEach((el) => {
       el.classList.remove('cell-drag-over');
     });
   }
@@ -1431,12 +1549,20 @@
     document.removeEventListener('pointercancel', onGridPointerUp);
   }
 
+  function gridAreaContainsCell(cell) {
+    return (
+      cell &&
+      (els.grid.contains(cell) ||
+        (els.gridPriority && els.gridPriority.contains(cell)))
+    );
+  }
+
   function onGridPointerMove(e) {
     if (!gridDragState || !els.grid) return;
     clearGridDragOver();
     const under = document.elementFromPoint(e.clientX, e.clientY);
     const cell = under && under.closest('.cell');
-    if (cell && els.grid.contains(cell)) {
+    if (cell && gridAreaContainsCell(cell)) {
       cell.classList.add('cell-drag-over');
     }
   }
@@ -1458,7 +1584,7 @@
 
     const under = document.elementFromPoint(x, y);
     const targetCell = under && under.closest('.cell');
-    if (targetCell && els.grid.contains(targetCell)) {
+    if (targetCell && gridAreaContainsCell(targetCell)) {
       const toIndex = parseInt(targetCell.dataset.cellIndex || '', 10);
       if (!Number.isNaN(toIndex) && fromIndex !== toIndex) {
         reorderVisibleChannelsGrid(fromIndex, toIndex);
@@ -1469,9 +1595,9 @@
 
   function onGridPointerDown(e) {
     const handle = e.target && e.target.closest('.cell-drag-handle');
-    if (!handle || !els.grid || !els.grid.contains(handle)) return;
+    if (!handle || !gridAreaContainsCell(handle)) return;
     const cell = handle.closest('.cell');
-    if (!cell || !els.grid.contains(cell)) return;
+    if (!cell || !gridAreaContainsCell(cell)) return;
     e.preventDefault();
     const fromIndex = parseInt(cell.dataset.cellIndex || '', 10);
     if (Number.isNaN(fromIndex)) return;
@@ -1494,9 +1620,9 @@
   }
 
   function setupGridDrag() {
-    if (!els.grid || gridDragBound) return;
+    if (!els.gridArea || gridDragBound) return;
     gridDragBound = true;
-    els.grid.addEventListener('pointerdown', onGridPointerDown);
+    els.gridArea.addEventListener('pointerdown', onGridPointerDown);
   }
 
   /**
@@ -1661,12 +1787,162 @@
     return cell;
   }
 
+  function syncGridCells(gridEl, channels, globalIndexStart) {
+    if (!gridEl) return;
+    const desiredKeys = channels.map(channelKey);
+    const n = channels.length;
+
+    if (n === 0) {
+      for (const cell of [...gridEl.querySelectorAll('.cell')]) {
+        destroyCellMedia(cell);
+      }
+      gridEl.innerHTML = '';
+      return;
+    }
+
+    const desiredSet = new Set(desiredKeys);
+    for (const cell of [...gridEl.querySelectorAll('.cell')]) {
+      if (!desiredSet.has(cell.dataset.channelKey)) {
+        destroyCellMedia(cell);
+        cell.remove();
+      }
+    }
+
+    const cells = Array.from(gridEl.querySelectorAll('.cell'));
+    const keysMatch =
+      cells.length === desiredKeys.length &&
+      desiredKeys.every((k, i) => cells[i]?.dataset?.channelKey === k);
+
+    if (keysMatch) {
+      cells.forEach((cell, i) => {
+        cell.dataset.cellIndex = String(globalIndexStart + i);
+      });
+      return;
+    }
+
+    for (let i = 0; i < desiredKeys.length; i++) {
+      const wantKey = desiredKeys[i];
+      const ch = channels[i];
+      const el = gridEl.children[i];
+      if (el && el.dataset.channelKey === wantKey) {
+        el.dataset.cellIndex = String(globalIndexStart + i);
+        continue;
+      }
+      const found = Array.from(gridEl.querySelectorAll('.cell')).find(
+        (c) => c.dataset.channelKey === wantKey
+      );
+      if (found) {
+        gridEl.insertBefore(found, el || null);
+        found.dataset.cellIndex = String(globalIndexStart + i);
+        continue;
+      }
+      const newCell = buildCellForChannel(ch, globalIndexStart + i);
+      gridEl.insertBefore(newCell, gridEl.children[i] || null);
+    }
+  }
+
   function renderGrid() {
     disconnectCellObservers();
     const layout = computeGridLayoutVars();
     const visible = layout.orderedVisible;
-    const desiredKeys = visible.map(channelKey);
     const n = visible.length;
+
+    if (layout.split && els.gridPriority) {
+      if (els.gridSplit) {
+        els.gridSplit.classList.toggle(
+          'priority-only',
+          layout.rest.channels.length === 0
+        );
+      }
+      els.grid.classList.remove('grid-full');
+      els.grid.classList.add('grid-rest');
+      els.gridPriority.hidden = false;
+      els.gridPriority.classList.add('no-dense');
+
+      const nR = layout.rest.channels.length;
+      els.grid.hidden = nR === 0;
+      els.grid.classList.toggle('grid-rest-hidden', nR === 0);
+
+      if (n === 0) {
+        for (const cell of [...els.gridPriority.querySelectorAll('.cell')]) {
+          destroyCellMedia(cell);
+        }
+        els.gridPriority.innerHTML = '';
+        for (const cell of [...els.grid.querySelectorAll('.cell')]) {
+          destroyCellMedia(cell);
+        }
+        els.grid.innerHTML = '';
+        twitchEmbedQueue = Promise.resolve();
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => attachCellObserversToGrid());
+        });
+        return;
+      }
+
+      const pCh = layout.priority.channels;
+      const rCh = layout.rest.channels;
+      const nP = pCh.length;
+
+      els.gridPriority.style.setProperty(
+        '--cell-min-w',
+        `${Math.max(1, layout.mins.minW)}px`
+      );
+      els.gridPriority.style.setProperty(
+        '--cell-min-h',
+        `${Math.max(1, layout.mins.minH)}px`
+      );
+      els.gridPriority.style.setProperty(
+        '--cols',
+        String(Math.max(1, layout.priority.cols))
+      );
+      els.gridPriority.style.setProperty(
+        '--rows',
+        String(Math.max(1, layout.priority.rows))
+      );
+      els.gridPriority.classList.toggle('one-col', nP === 1);
+
+      els.grid.style.setProperty(
+        '--cell-min-w',
+        `${Math.max(1, layout.mins.minW)}px`
+      );
+      els.grid.style.setProperty(
+        '--cell-min-h',
+        `${Math.max(1, layout.mins.minH)}px`
+      );
+      els.grid.style.setProperty(
+        '--cols',
+        String(Math.max(1, layout.rest.cols))
+      );
+      els.grid.style.setProperty(
+        '--rows',
+        String(Math.max(1, layout.rest.rows))
+      );
+      els.grid.classList.toggle('one-col', nR === 1);
+
+      syncGridCells(els.gridPriority, pCh, 0);
+      syncGridCells(els.grid, rCh, nP);
+
+      requestAnimationFrame(() => {
+        applyPriorityGridSpans(layout.priority.spanW, layout.priority.spanH);
+        clearRestGridSpans();
+        requestAnimationFrame(() => attachCellObserversToGrid());
+      });
+      return;
+    }
+
+    if (els.gridSplit) els.gridSplit.classList.remove('priority-only');
+    if (els.gridPriority) {
+      for (const cell of [...els.gridPriority.querySelectorAll('.cell')]) {
+        destroyCellMedia(cell);
+      }
+      els.gridPriority.innerHTML = '';
+      els.gridPriority.hidden = true;
+    }
+    els.grid.classList.remove('grid-rest', 'grid-rest-hidden');
+    els.grid.classList.add('grid-full');
+    els.grid.hidden = false;
+
+    const desiredKeys = visible.map(channelKey);
 
     els.grid.style.setProperty(
       '--cell-min-w',
@@ -2164,11 +2440,15 @@
   function exposeTwitchAutoplayHelp() {
     window.twitchviewerAutoplayDiagnostics = function () {
       const grid = document.getElementById('grid');
+      const gridPri = document.getElementById('grid-priority');
       if (!grid) {
         console.warn('[twitchviewer] No #grid');
         return;
       }
-      const cells = grid.querySelectorAll('.cell');
+      const cells = [
+        ...grid.querySelectorAll('.cell'),
+        ...(gridPri ? gridPri.querySelectorAll('.cell') : []),
+      ];
       console.log(
         `[twitchviewer] ${cells.length} grid cell(s). Twitch mode: ${twitchPlayback} (hls = same-origin video via streamlink+ffmpeg; iframe = Twitch embed).`
       );
@@ -2236,6 +2516,7 @@
       const ro = new ResizeObserver(() => scheduleLayoutGridToViewport());
       if (els.main) ro.observe(els.main);
       if (els.gridArea) ro.observe(els.gridArea);
+      if (els.gridSplit) ro.observe(els.gridSplit);
     }
     if (urlErr) {
       try {

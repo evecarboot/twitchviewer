@@ -304,6 +304,41 @@ body {
   align-items: stretch;
 }
 
+.grid-split {
+  flex: 1 1 0;
+  min-height: 0;
+  min-width: 0;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+}
+
+/* Single-grid mode: #grid fills the area. Split mode: priority band + rest band. */
+.grid-split > .grid.grid-full {
+  flex: 1 1 100%;
+  min-height: 0;
+}
+
+.grid-split.priority-only > .grid.grid-priority:not([hidden]) {
+  flex: 1 1 100%;
+  min-height: 0;
+}
+
+.grid-split > .grid.grid-priority:not([hidden]) {
+  flex: 1 1 52%;
+  min-height: 0;
+}
+
+.grid-split > .grid.grid-rest:not([hidden]) {
+  flex: 1 1 48%;
+  min-height: 0;
+}
+
+.grid-split > .grid.grid-rest-hidden {
+  display: none !important;
+}
+
 .main.chat-on-left .grid-area {
   order: 2;
 }
