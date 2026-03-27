@@ -37,6 +37,9 @@
   let cellObservers = [];
   /** Stagger Twitch iframe mounts (Helix + browser load). */
   let twitchEmbedQueue = Promise.resolve();
+  /** `https://player.twitch.tv/js/embed/v1.js` load promise (Twitch.Player + setQuality). */
+  let twitchEmbedScriptPromise = null;
+  let twitchEmbedSeq = 0;
   /** @type {Set<string>} */
   let followModalSelection = new Set();
   /** @type {Set<string>} */
@@ -508,10 +511,107 @@
   }
 
   /**
-   * Direct iframe embed (not Twitch.Player). Chrome/Edge need `allow="autoplay"` on the
-   * iframe element; the JS API’s injected iframe often omits it, so muted autoplay fails.
+   * Interactive embed (`Twitch.Player`) so we can call setQuality (see Twitch docs).
+   * Falls back to a plain iframe if the script fails to load.
    * https://dev.twitch.tv/docs/embed/video-and-clips/
    */
+  function ensureTwitchEmbedScript() {
+    if (typeof Twitch !== 'undefined' && Twitch.Player) return Promise.resolve();
+    if (twitchEmbedScriptPromise) return twitchEmbedScriptPromise;
+    twitchEmbedScriptPromise = new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = 'https://player.twitch.tv/js/embed/v1.js';
+      s.async = true;
+      s.onload = () => resolve();
+      s.onerror = () => reject(new Error('Twitch embed script failed to load'));
+      document.head.appendChild(s);
+    });
+    return twitchEmbedScriptPromise;
+  }
+
+  function twitchQualityLabelsFromPlayer(player) {
+    try {
+      if (!player || typeof player.getQualities !== 'function') return [];
+      const raw = player.getQualities();
+      if (!Array.isArray(raw)) return [];
+      const out = [];
+      for (const item of raw) {
+        if (typeof item === 'string') out.push(item);
+        else if (item && typeof item.name === 'string') out.push(item.name);
+      }
+      return out;
+    } catch {
+      return [];
+    }
+  }
+
+  /** When Priority tiles is off, prefer ~480p to reduce bandwidth across many streams. */
+  function pickTwitchQualityPrefer480(labels) {
+    if (!labels.length) return null;
+    const lower = labels.map((l) => l.toLowerCase());
+    const tests = [
+      (i) => lower[i] === '480p60' || lower[i] === '480p30' || lower[i] === '480p',
+      (i) => /^480p\d*$/.test(lower[i]),
+      (i) => lower[i].includes('480'),
+      (i) => /^416p/.test(lower[i]),
+      (i) => /^360p\d*$/.test(lower[i]) || lower[i].includes('360'),
+      (i) => /^270p/.test(lower[i]),
+      (i) => /^160p/.test(lower[i]),
+    ];
+    for (const pred of tests) {
+      for (let i = 0; i < labels.length; i++) {
+        if (pred(i)) return labels[i];
+      }
+    }
+    const nonSource = labels.filter((l) => !/chunked|^source$/i.test(String(l)));
+    if (nonSource.length) return nonSource[nonSource.length - 1];
+    return labels[labels.length - 1];
+  }
+
+  function pickTwitchQualityAuto(labels) {
+    const lower = labels.map((l) => l.toLowerCase());
+    const idx = lower.findIndex((l) => l === 'auto');
+    return idx >= 0 ? labels[idx] : null;
+  }
+
+  function applyTwitchQualityPreference(player) {
+    if (!player || typeof player.setQuality !== 'function') return;
+    const labels = twitchQualityLabelsFromPlayer(player);
+    if (!labels.length) return;
+    try {
+      if (state.priorityTiles) {
+        const auto = pickTwitchQualityAuto(labels);
+        if (auto) player.setQuality(auto);
+      } else {
+        const q = pickTwitchQualityPrefer480(labels);
+        if (q) player.setQuality(q);
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function scheduleTwitchQualityRetries(player, cell) {
+    [120, 700, 2000, 5000].forEach((ms) => {
+      window.setTimeout(() => {
+        if (!cell.isConnected) return;
+        applyTwitchQualityPreference(player);
+      }, ms);
+    });
+  }
+
+  function syncTwitchInteractiveQualities() {
+    if (twitchPlayback !== 'iframe') return;
+    const roots = [els.grid, els.gridPriority].filter(Boolean);
+    for (const root of roots) {
+      for (const cell of root.querySelectorAll('.cell')) {
+        const p = cell._twitchPlayer;
+        if (!p || typeof p.getQualities !== 'function') continue;
+        applyTwitchQualityPreference(p);
+      }
+    }
+  }
+
   function applyTwitchIframePixelSize(wrap, iframe) {
     const r = wrap.getBoundingClientRect();
     const w = Math.max(GRID_MIN_CELL_W, Math.round(r.width));
@@ -539,7 +639,8 @@
     cell._twitchIframeResizeObserver = ro;
   }
 
-  function createTwitchIframeEmbed(cell, login, wrap) {
+  /** Plain iframe fallback if `embed/v1.js` does not load or Twitch.Player fails. */
+  function createTwitchIframeEmbedFallback(cell, login, wrap) {
     if (!cell.isConnected || !wrap.isConnected) return;
 
     try {
@@ -550,6 +651,7 @@
       /* `allow` includes fullscreen — avoid duplicate allowfullscreen (Chrome warns). */
       iframe.allow =
         'autoplay; fullscreen; picture-in-picture; clipboard-write; encrypted-media; web-share';
+      /* Optional iframe src params (muted, autoplay). https://dev.twitch.tv/docs/embed/video-and-clips/ */
       const params = new URLSearchParams();
       params.set('channel', login);
       params.set('muted', 'true');
@@ -565,6 +667,70 @@
     } catch {
       showTwitchEmbedError(wrap, login, `Twitch embed error (${login}).`);
     }
+  }
+
+  function createTwitchInteractivePlayerEmbed(cell, login, wrap) {
+    if (!cell.isConnected || !wrap.isConnected) return;
+
+    const hostId = `twitch-js-${login}-${++twitchEmbedSeq}`;
+    try {
+      wrap.innerHTML = '';
+      const host = document.createElement('div');
+      host.id = hostId;
+      host.className = 'twitch-embed-js-host';
+      host.dataset.twitchEmbed = '1';
+      wrap.appendChild(host);
+    } catch {
+      showTwitchEmbedError(wrap, login, `Twitch embed error (${login}).`);
+      return;
+    }
+
+    ensureTwitchEmbedScript()
+      .then(() => {
+        if (!cell.isConnected || !wrap.isConnected) return;
+        if (typeof Twitch === 'undefined' || !Twitch.Player) {
+          createTwitchIframeEmbedFallback(cell, login, wrap);
+          return;
+        }
+        const r = wrap.getBoundingClientRect();
+        const w = Math.max(GRID_MIN_CELL_W, Math.round(r.width));
+        const h = Math.max(GRID_MIN_CELL_H, Math.round(r.height));
+        let player;
+        try {
+          /* Optional embed params (muted, autoplay). https://dev.twitch.tv/docs/embed/video-and-clips/ */
+          player = new Twitch.Player(hostId, {
+            width: w,
+            height: h,
+            channel: login,
+            parent: parentDomainsForTwitch(),
+            muted: true,
+            autoplay: true,
+          });
+        } catch {
+          createTwitchIframeEmbedFallback(cell, login, wrap);
+          return;
+        }
+        cell._twitchPlayer = player;
+
+        const wireInnerIframe = () => {
+          const iframe = wrap.querySelector('iframe');
+          if (iframe) wireTwitchIframeResize(wrap, iframe, cell);
+        };
+
+        player.addEventListener(Twitch.Player.READY, () => {
+          wireInnerIframe();
+          applyTwitchQualityPreference(player);
+          scheduleTwitchQualityRetries(player, cell);
+        });
+        player.addEventListener(Twitch.Player.PLAYING, () => {
+          applyTwitchQualityPreference(player);
+          wireInnerIframe();
+        });
+        window.setTimeout(wireInnerIframe, 400);
+      })
+      .catch(() => {
+        createTwitchIframeEmbedFallback(cell, login, wrap);
+      });
   }
 
   function attachTwitchEmbedCell(cell, login) {
@@ -584,7 +750,7 @@
           requestAnimationFrame(() => {
             window.setTimeout(() => {
               if (!cell.isConnected || !wrap.isConnected) return;
-              createTwitchIframeEmbed(cell, login, wrap);
+              createTwitchInteractivePlayerEmbed(cell, login, wrap);
             }, 60);
           });
         });
@@ -2205,6 +2371,9 @@
       saveState();
       // Rebuild layout so spanning changes immediately.
       fullRender();
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => syncTwitchInteractiveQualities());
+      });
     });
   }
 
@@ -2463,6 +2632,10 @@
           console.log(
             `  [${i}] ${w}×${h}px ${sizeOk ? 'OK' : 'BELOW min'} | HLS <video> (muted autoplay path)`
           );
+        } else if (cell.querySelector('.twitch-embed-js-host')) {
+          console.log(
+            `  [${i}] ${w}×${h}px ${sizeOk ? 'OK' : 'BELOW min'} | Twitch.Player (setQuality; Priority tiles=${state.priorityTiles ? 'auto' : '~480p'})`
+          );
         } else if (iframe) {
           const allow = iframe.getAttribute('allow') || '';
           const hasAllowAutoplay = /\bautoplay\b/i.test(allow);
@@ -2505,7 +2678,7 @@
     fullRender();
     schedulePoll();
     console.info(
-      `[twitchviewer] Twitch playback: ${twitchPlayback}. With streamlink+ffmpeg on the server, Twitch uses HLS (reliable muted autoplay). Otherwise the official iframe embed is used. Run twitchviewerAutoplayDiagnostics().`
+      `[twitchviewer] Twitch playback: ${twitchPlayback}. Iframe mode uses Twitch.Player (setQuality: ~480p when Priority tiles off, Auto when on). HLS uses streamlink+ffmpeg. Run twitchviewerAutoplayDiagnostics().`
     );
     window.addEventListener('resize', scheduleLayoutGridToViewport);
     document.addEventListener('fullscreenchange', scheduleLayoutGridToViewport);
