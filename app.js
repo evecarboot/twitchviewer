@@ -574,18 +574,42 @@
     return idx >= 0 ? labels[idx] : null;
   }
 
-  function applyTwitchQualityPreference(player) {
+  function desiredTwitchQualityLabel(labels) {
+    if (!labels.length) return null;
+    if (state.priorityTiles) return pickTwitchQualityAuto(labels);
+    return pickTwitchQualityPrefer480(labels);
+  }
+
+  /**
+   * Apply preferred quality once per player session. Re-applying setQuality on every
+   * Twitch.Player.PLAYING event restarts the stream and looks like rapid play/pause.
+   * @param {boolean} force — reset and re-apply (e.g. Priority tiles toggle).
+   */
+  function applyTwitchQualityPreference(player, force) {
     if (!player || typeof player.setQuality !== 'function') return;
+    if (force) player._twitchQualityApplied = false;
+    else if (player._twitchQualityApplied) return;
+
     const labels = twitchQualityLabelsFromPlayer(player);
     if (!labels.length) return;
+    const desired = desiredTwitchQualityLabel(labels);
+    if (!desired) {
+      player._twitchQualityApplied = true;
+      return;
+    }
     try {
-      if (state.priorityTiles) {
-        const auto = pickTwitchQualityAuto(labels);
-        if (auto) player.setQuality(auto);
-      } else {
-        const q = pickTwitchQualityPrefer480(labels);
-        if (q) player.setQuality(q);
+      if (typeof player.getQuality === 'function') {
+        const cur = player.getQuality();
+        if (
+          cur &&
+          String(cur).toLowerCase() === String(desired).toLowerCase()
+        ) {
+          player._twitchQualityApplied = true;
+          return;
+        }
       }
+      player.setQuality(desired);
+      player._twitchQualityApplied = true;
     } catch {
       /* ignore */
     }
@@ -595,7 +619,8 @@
     [120, 700, 2000, 5000].forEach((ms) => {
       window.setTimeout(() => {
         if (!cell.isConnected) return;
-        applyTwitchQualityPreference(player);
+        if (player._twitchQualityApplied) return;
+        applyTwitchQualityPreference(player, false);
       }, ms);
     });
   }
@@ -607,7 +632,7 @@
       for (const cell of root.querySelectorAll('.cell')) {
         const p = cell._twitchPlayer;
         if (!p || typeof p.getQualities !== 'function') continue;
-        applyTwitchQualityPreference(p);
+        applyTwitchQualityPreference(p, true);
       }
     }
   }
@@ -712,21 +737,25 @@
         }
         cell._twitchPlayer = player;
 
-        const wireInnerIframe = () => {
+        const wireInnerIframeOnce = () => {
           const iframe = wrap.querySelector('iframe');
           if (iframe) wireTwitchIframeResize(wrap, iframe, cell);
         };
 
         player.addEventListener(Twitch.Player.READY, () => {
-          wireInnerIframe();
-          applyTwitchQualityPreference(player);
+          wireInnerIframeOnce();
+          try {
+            if (typeof player.setMuted === 'function') player.setMuted(true);
+            if (typeof player.play === 'function') player.play();
+          } catch {
+            /* ignore */
+          }
+          applyTwitchQualityPreference(player, true);
           scheduleTwitchQualityRetries(player, cell);
         });
-        player.addEventListener(Twitch.Player.PLAYING, () => {
-          applyTwitchQualityPreference(player);
-          wireInnerIframe();
-        });
-        window.setTimeout(wireInnerIframe, 400);
+        /* Never hook PLAYING for setQuality or resize — PLAYING fires often during live
+           playback; repeating setQuality or re-wiring resize causes visible play/stutter. */
+        window.setTimeout(wireInnerIframeOnce, 400);
       })
       .catch(() => {
         createTwitchIframeEmbedFallback(cell, login, wrap);
