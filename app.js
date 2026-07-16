@@ -798,6 +798,18 @@
           applyTwitchQualityPreference(player, true);
           scheduleTwitchQualityRetries(player, cell);
         });
+        /* When a channel drops offline the embed shows its own "offline" screen; when it
+           comes back the Twitch player does NOT resume playback on its own (autoplay only
+           applies on initial load), so without this the tile sits on a paused thumbnail
+           until someone clicks the embed's play button. Re-trigger muted play on ONLINE. */
+        player.addEventListener(Twitch.Player.ONLINE, () => {
+          try {
+            if (typeof player.setMuted === 'function') player.setMuted(true);
+            if (typeof player.play === 'function') player.play();
+          } catch {
+            /* ignore */
+          }
+        });
         /* Never hook PLAYING for setQuality or resize — PLAYING fires often during live
            playback; repeating setQuality or re-wiring resize causes visible play/stutter. */
         window.setTimeout(wireInnerIframeOnce, 400);
