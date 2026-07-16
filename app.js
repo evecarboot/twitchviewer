@@ -1559,6 +1559,12 @@
       const label = document.createElement('span');
       label.textContent = lbl;
       chip.appendChild(label);
+      if (getChannelType(ch) === 'twitch' && ch.fromCategory) {
+        const cat = state.categoryFollows.find((c) => c.id === ch.fromCategory);
+        chip.title = cat
+          ? `Auto-added: top live stream in "${cat.name}"`
+          : 'Auto-added from a followed game category';
+      }
       const rm = document.createElement('button');
       rm.type = 'button';
       rm.className = 'remove';
@@ -1600,6 +1606,148 @@
 
       els.channelList.appendChild(chip);
     });
+  }
+
+  function renderCategoryChips() {
+    if (!els.categoryList) return;
+    els.categoryList.innerHTML = '';
+    for (const cat of state.categoryFollows) {
+      const count = state.channels.filter(
+        (c) => getChannelType(c) === 'twitch' && c.fromCategory === cat.id
+      ).length;
+      const chip = document.createElement('span');
+      chip.className = 'chip category-chip';
+      chip.title = `Follows the top ${cat.limit} live stream(s) in "${cat.name}"`;
+      const label = document.createElement('span');
+      label.textContent = `🎮 ${cat.name} (${count}/${cat.limit})`;
+      chip.appendChild(label);
+      const rm = document.createElement('button');
+      rm.type = 'button';
+      rm.className = 'remove';
+      rm.setAttribute('aria-label', `Stop following ${cat.name}`);
+      rm.textContent = '×';
+      rm.addEventListener('click', () => {
+        state.categoryFollows = state.categoryFollows.filter(
+          (c) => c.id !== cat.id
+        );
+        state.channels = state.channels.filter(
+          (c) => !(getChannelType(c) === 'twitch' && c.fromCategory === cat.id)
+        );
+        const twitchChat = twitchChannelsForChat();
+        if (state.chatForLogin && !twitchChat.includes(state.chatForLogin)) {
+          state.chatForLogin = twitchChat[0] || null;
+        }
+        saveState();
+        fullRender();
+        schedulePoll();
+      });
+      chip.appendChild(rm);
+      els.categoryList.appendChild(chip);
+    }
+  }
+
+  /**
+   * Fetch top live streams for each followed game category and merge them into
+   * state.channels (tagged with `fromCategory`), adding newly-live streamers and
+   * dropping ones that fell out of the top list (unless the user also added them
+   * manually, in which case the plain entry is left alone).
+   * @returns {Promise<boolean>} whether state.channels changed
+   */
+  async function refreshCategoryFollows() {
+    if (!state.categoryFollows.length) return false;
+    let changed = false;
+    for (const cat of state.categoryFollows) {
+      try {
+        const res = await fetch(
+          `/api/category-streams?${new URLSearchParams({
+            name: cat.name,
+            first: String(cat.limit),
+          })}`,
+          FETCH_OPTS
+        );
+        const data = await res.json();
+        if (!res.ok || data.error) continue;
+
+        const desiredLogins = (data.streams || [])
+          .slice(0, cat.limit)
+          .map((s) => s.login)
+          .filter(Boolean);
+        const desiredSet = new Set(desiredLogins);
+
+        const before = state.channels.length;
+        state.channels = state.channels.filter((c) => {
+          if (getChannelType(c) !== 'twitch' || c.fromCategory !== cat.id) {
+            return true;
+          }
+          return desiredSet.has(getTwitchLogin(c));
+        });
+        if (state.channels.length !== before) changed = true;
+
+        for (const login of desiredLogins) {
+          const exists = state.channels.some(
+            (c) => getChannelType(c) === 'twitch' && getTwitchLogin(c) === login
+          );
+          if (exists) continue;
+          state.channels.push({ type: 'twitch', login, fromCategory: cat.id });
+          changed = true;
+        }
+      } catch {
+        /* keep existing channels for this category on network errors */
+      }
+    }
+    if (changed) saveState();
+    return changed;
+  }
+
+  async function promptAddCategoryFollow() {
+    const raw = window.prompt(
+      'Twitch game/category to follow (top live streams are added automatically).\n' +
+        'Optionally add :N for max streams shown, e.g. "EVE Online:4".'
+    );
+    if (raw == null) return;
+    let name = raw.trim();
+    if (!name) return;
+    let limit = 6;
+    const m = name.match(/^(.*):(\d{1,2})$/);
+    if (m) {
+      name = m[1].trim();
+      const n = parseInt(m[2], 10);
+      if (Number.isFinite(n) && n >= 1) limit = Math.min(n, 24);
+    }
+    if (!name) return;
+
+    setMeta(`Looking up "${name}"…`, false);
+    try {
+      const res = await fetch(
+        `/api/category-streams?${new URLSearchParams({
+          name,
+          first: String(limit),
+        })}`,
+        FETCH_OPTS
+      );
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        setMeta(data.error || `Could not find category "${name}"`, true);
+        return;
+      }
+      const id = data.gameId;
+      const displayName = data.gameName || name;
+      if (state.categoryFollows.some((c) => c.id === id)) {
+        setMeta(`Already following ${displayName}.`, true);
+        return;
+      }
+      state.categoryFollows.push({ id, name: displayName, limit });
+      saveState();
+      await refreshCategoryFollows();
+      setMeta(`Following ${displayName} (up to ${limit} live stream(s)).`, false);
+      fullRender();
+      schedulePoll();
+    } catch {
+      setMeta(
+        'Could not reach /api/category-streams — is the server running?',
+        true
+      );
+    }
   }
 
   function renderChatSelect() {
@@ -2302,6 +2450,7 @@
 
   function fullRender() {
     renderChannelChips();
+    renderCategoryChips();
     renderChatSelect();
     applyChatLayout();
     applyToolbarLayout();
@@ -2316,12 +2465,14 @@
 
   async function tick() {
     const before = visibleChannelsSignature();
+    const categoriesChanged = await refreshCategoryFollows();
     await refreshOnline();
     renderChannelChips();
+    renderCategoryChips();
     /* Rebuilding the grid nukes every iframe — only do it when hide-offline / live
        state actually changes who is shown. Otherwise polls every 45s would restart
        all Twitch players and feel like streams “died” for no reason. */
-    if (visibleChannelsSignature() !== before) {
+    if (categoriesChanged || visibleChannelsSignature() !== before) {
       renderGrid();
     }
   }
@@ -2333,10 +2484,11 @@
   function schedulePoll() {
     if (pollTimer) clearInterval(pollTimer);
     pollTimer = null;
-    if (
+    const needsOnlinePoll =
       (state.hideOffline || state.priorityTiles) &&
-      twitchLoginsForPoll().length
-    ) {
+      twitchLoginsForPoll().length;
+    const needsCategoryPoll = state.categoryFollows.length > 0;
+    if (needsOnlinePoll || needsCategoryPoll) {
       pollTimer = setInterval(tick, POLL_MS);
     }
   }
@@ -2447,6 +2599,12 @@
       } finally {
         updateRefreshStreamsButton();
       }
+    });
+  }
+
+  if (els.followGame) {
+    els.followGame.addEventListener('click', () => {
+      promptAddCategoryFollow();
     });
   }
 
@@ -2732,6 +2890,7 @@
     renderChatSelect();
     await ensureTranscodeHashes();
     await refreshOnly();
+    await refreshCategoryFollows();
     await refreshAuth();
     setupGridDrag();
     fullRender();
