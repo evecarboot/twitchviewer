@@ -5,3 +5,4 @@ cert/
 .sessions/
 .sessions.sqlite
 .hls-transcode/
+.env.example
