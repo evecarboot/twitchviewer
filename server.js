@@ -438,18 +438,53 @@ app.get('/api/follows', async (req, res) => {
 const gameIdCache = new Map();
 const GAME_ID_CACHE_MS = 6 * 60 * 60 * 1000;
 
-async function resolveGameId(token, clientId, name) {
-  const key = name.trim().toLowerCase();
-  const cached = gameIdCache.get(key);
-  if (cached && Date.now() < cached.expiresAt) return cached;
-  const params = new URLSearchParams({ name: name.trim() });
+async function fetchGameByExactName(token, clientId, name) {
+  const params = new URLSearchParams({ name });
   const r = await fetch(`https://api.twitch.tv/helix/games?${params.toString()}`, {
     headers: { 'Client-ID': clientId, Authorization: `Bearer ${token}` },
   });
   if (!r.ok) return null;
   const body = await r.json();
-  const game = (body.data && body.data[0]) || null;
+  return (body.data && body.data[0]) || null;
+}
+
+/** Fuzzy fallback for slugs (e.g. "eve-online") or partial/misspelled names. */
+async function searchGameCategory(token, clientId, query) {
+  const params = new URLSearchParams({ query, first: '10' });
+  const r = await fetch(
+    `https://api.twitch.tv/helix/search/categories?${params.toString()}`,
+    { headers: { 'Client-ID': clientId, Authorization: `Bearer ${token}` } }
+  );
+  if (!r.ok) return null;
+  const body = await r.json();
+  const results = body.data || [];
+  if (!results.length) return null;
+  const norm = query.trim().toLowerCase();
+  const exact = results.find((g) => (g.name || '').toLowerCase() === norm);
+  return exact || results[0];
+}
+
+/**
+ * Resolves a game/category by name. Tries an exact Helix match first (fast path for
+ * names typed exactly as Twitch shows them), then de-hyphenates (users often paste the
+ * directory URL slug, e.g. "eve-online"), then falls back to Twitch's fuzzy category
+ * search so partial names/typos still work.
+ */
+async function resolveGameId(token, clientId, name) {
+  const trimmed = name.trim();
+  const key = trimmed.toLowerCase();
+  const cached = gameIdCache.get(key);
+  if (cached && Date.now() < cached.expiresAt) return cached;
+
+  let game = await fetchGameByExactName(token, clientId, trimmed);
+  if (!game && /-/.test(trimmed)) {
+    game = await fetchGameByExactName(token, clientId, trimmed.replace(/-/g, ' '));
+  }
+  if (!game) {
+    game = await searchGameCategory(token, clientId, trimmed.replace(/-/g, ' '));
+  }
   if (!game) return null;
+
   const entry = {
     id: game.id,
     name: game.name,
@@ -479,7 +514,13 @@ app.get('/api/category-streams', async (req, res) => {
       .status(503)
       .json({ error: 'Could not obtain Twitch app token', streams: [] });
   }
-  const first = Math.min(Math.max(parseInt(req.query.first, 10) || 6, 1), 100);
+  const wantAll = req.query.all === '1' || req.query.all === 'true';
+  /** Hard safety cap so a huge category (e.g. "Just Chatting") can't flood the grid
+   *  with hundreds of tiles when the user asks to follow every live stream. */
+  const ALL_HARD_CAP = 200;
+  const cap = wantAll
+    ? ALL_HARD_CAP
+    : Math.min(Math.max(parseInt(req.query.first, 10) || 6, 1), 100);
   try {
     const game = await resolveGameId(token, clientId, name);
     if (!game) {
@@ -487,27 +528,35 @@ app.get('/api/category-streams', async (req, res) => {
         .status(404)
         .json({ error: `No Twitch category found for "${name}"`, streams: [] });
     }
-    const params = new URLSearchParams({
-      game_id: game.id,
-      first: String(first),
-    });
-    const sr = await fetch(
-      `https://api.twitch.tv/helix/streams?${params.toString()}`,
-      { headers: { 'Client-ID': clientId, Authorization: `Bearer ${token}` } }
-    );
-    if (!sr.ok) {
-      const text = await sr.text();
-      return res
-        .status(502)
-        .json({ error: `Helix error ${sr.status}: ${text}`, streams: [] });
-    }
-    const body = await sr.json();
-    const streams = (body.data || []).map((s) => ({
-      login: (s.user_login || '').toLowerCase(),
-      displayName: s.user_name,
-      title: s.title,
-      viewerCount: s.viewer_count,
-    }));
+    const streams = [];
+    let cursor = null;
+    do {
+      const params = new URLSearchParams({
+        game_id: game.id,
+        first: String(Math.min(100, cap - streams.length)),
+      });
+      if (cursor) params.set('after', cursor);
+      const sr = await fetch(
+        `https://api.twitch.tv/helix/streams?${params.toString()}`,
+        { headers: { 'Client-ID': clientId, Authorization: `Bearer ${token}` } }
+      );
+      if (!sr.ok) {
+        const text = await sr.text();
+        return res
+          .status(502)
+          .json({ error: `Helix error ${sr.status}: ${text}`, streams: [] });
+      }
+      const body = await sr.json();
+      for (const s of body.data || []) {
+        streams.push({
+          login: (s.user_login || '').toLowerCase(),
+          displayName: s.user_name,
+          title: s.title,
+          viewerCount: s.viewer_count,
+        });
+      }
+      cursor = body.pagination?.cursor || null;
+    } while (wantAll && cursor && streams.length < cap);
     return res.json({
       gameId: game.id,
       gameName: game.name,

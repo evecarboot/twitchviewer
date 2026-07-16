@@ -11,6 +11,9 @@
 
   const STORAGE_KEY = 'twitchviewer:v1';
   const POLL_MS = 45_000;
+  /** Followed categories refresh faster than the general online poll so new/ended
+   *  streams in a category show up without reloading the page. */
+  const CATEGORY_POLL_MS = 20_000;
   const FETCH_OPTS = { credentials: 'same-origin' };
 
   const defaultState = () => ({
@@ -34,6 +37,7 @@
   let pollFailed = false;
   let onlineSet = new Set();
   let pollTimer = null;
+  let categoryPollTimer = null;
   /** @type {IntersectionObserver[]} */
   let cellObservers = [];
   /** Stagger Twitch iframe mounts (Helix + browser load). */
@@ -143,14 +147,17 @@
     return out;
   }
 
+  /** `limit: null` means "follow every live stream in this category" (server still
+   *  applies a hard safety cap so a huge category can't flood the grid). */
   function normalizeCategoryFollow(c) {
     if (!c || typeof c !== 'object') return null;
     const id = typeof c.id === 'string' ? c.id : '';
     const name = typeof c.name === 'string' ? c.name.trim() : '';
     if (!id || !name) return null;
+    if (c.limit == null) return { id, name, limit: null };
     let limit = Number(c.limit);
-    if (!Number.isFinite(limit) || limit < 1) limit = 6;
-    limit = Math.min(Math.max(Math.round(limit), 1), 24);
+    if (!Number.isFinite(limit) || limit < 1) return { id, name, limit: null };
+    limit = Math.min(Math.max(Math.round(limit), 1), 100);
     return { id, name, limit };
   }
 
@@ -1617,9 +1624,13 @@
       ).length;
       const chip = document.createElement('span');
       chip.className = 'chip category-chip';
-      chip.title = `Follows the top ${cat.limit} live stream(s) in "${cat.name}"`;
+      chip.title = cat.limit
+        ? `Follows the top ${cat.limit} live stream(s) in "${cat.name}"`
+        : `Follows every live stream in "${cat.name}"`;
       const label = document.createElement('span');
-      label.textContent = `🎮 ${cat.name} (${count}/${cat.limit})`;
+      label.textContent = cat.limit
+        ? `🎮 ${cat.name} (${count}/${cat.limit})`
+        : `🎮 ${cat.name} (${count} live)`;
       chip.appendChild(label);
       const rm = document.createElement('button');
       rm.type = 'button';
@@ -1640,6 +1651,7 @@
         saveState();
         fullRender();
         schedulePoll();
+        scheduleCategoryPoll();
       });
       chip.appendChild(rm);
       els.categoryList.appendChild(chip);
@@ -1647,9 +1659,9 @@
   }
 
   /**
-   * Fetch top live streams for each followed game category and merge them into
+   * Fetch live streams for each followed game category and merge them into
    * state.channels (tagged with `fromCategory`), adding newly-live streamers and
-   * dropping ones that fell out of the top list (unless the user also added them
+   * dropping ones that fell out of the list (unless the user also added them
    * manually, in which case the plain entry is left alone).
    * @returns {Promise<boolean>} whether state.channels changed
    */
@@ -1658,18 +1670,20 @@
     let changed = false;
     for (const cat of state.categoryFollows) {
       try {
+        const params = { name: cat.name };
+        if (cat.limit) {
+          params.first = String(cat.limit);
+        } else {
+          params.all = '1';
+        }
         const res = await fetch(
-          `/api/category-streams?${new URLSearchParams({
-            name: cat.name,
-            first: String(cat.limit),
-          })}`,
+          `/api/category-streams?${new URLSearchParams(params)}`,
           FETCH_OPTS
         );
         const data = await res.json();
         if (!res.ok || data.error) continue;
 
         const desiredLogins = (data.streams || [])
-          .slice(0, cat.limit)
           .map((s) => s.login)
           .filter(Boolean);
         const desiredSet = new Set(desiredLogins);
@@ -1699,30 +1713,55 @@
     return changed;
   }
 
+  /** Faster dedicated poll for category follows so new/ended streams appear without a reload. */
+  async function categoryTick() {
+    const before = visibleChannelsSignature();
+    const changed = await refreshCategoryFollows();
+    if (changed) {
+      await refreshOnline();
+    }
+    renderChannelChips();
+    renderCategoryChips();
+    if (changed || visibleChannelsSignature() !== before) {
+      renderGrid();
+    }
+  }
+
+  function scheduleCategoryPoll() {
+    if (categoryPollTimer) clearInterval(categoryPollTimer);
+    categoryPollTimer = null;
+    if (state.categoryFollows.length > 0) {
+      categoryPollTimer = setInterval(categoryTick, CATEGORY_POLL_MS);
+    }
+  }
+
   async function promptAddCategoryFollow() {
     const raw = window.prompt(
-      'Twitch game/category to follow (top live streams are added automatically).\n' +
-        'Optionally add :N for max streams shown, e.g. "EVE Online:4".'
+      'Twitch game/category to follow — every live stream in it is added automatically.\n' +
+        'Optionally add :N to cap how many are shown, e.g. "Just Chatting:10".'
     );
     if (raw == null) return;
     let name = raw.trim();
     if (!name) return;
-    let limit = 6;
-    const m = name.match(/^(.*):(\d{1,2})$/);
+    let limit = null;
+    const m = name.match(/^(.*):(\d{1,3})$/);
     if (m) {
       name = m[1].trim();
       const n = parseInt(m[2], 10);
-      if (Number.isFinite(n) && n >= 1) limit = Math.min(n, 24);
+      if (Number.isFinite(n) && n >= 1) limit = Math.min(n, 100);
     }
     if (!name) return;
 
     setMeta(`Looking up "${name}"…`, false);
     try {
+      const params = { name };
+      if (limit) {
+        params.first = String(limit);
+      } else {
+        params.all = '1';
+      }
       const res = await fetch(
-        `/api/category-streams?${new URLSearchParams({
-          name,
-          first: String(limit),
-        })}`,
+        `/api/category-streams?${new URLSearchParams(params)}`,
         FETCH_OPTS
       );
       const data = await res.json();
@@ -1739,9 +1778,15 @@
       state.categoryFollows.push({ id, name: displayName, limit });
       saveState();
       await refreshCategoryFollows();
-      setMeta(`Following ${displayName} (up to ${limit} live stream(s)).`, false);
+      setMeta(
+        limit
+          ? `Following ${displayName} (up to ${limit} live stream(s)).`
+          : `Following ${displayName} (every live stream).`,
+        false
+      );
       fullRender();
       schedulePoll();
+      scheduleCategoryPoll();
     } catch {
       setMeta(
         'Could not reach /api/category-streams — is the server running?',
@@ -2465,14 +2510,13 @@
 
   async function tick() {
     const before = visibleChannelsSignature();
-    const categoriesChanged = await refreshCategoryFollows();
     await refreshOnline();
     renderChannelChips();
     renderCategoryChips();
     /* Rebuilding the grid nukes every iframe — only do it when hide-offline / live
        state actually changes who is shown. Otherwise polls every 45s would restart
        all Twitch players and feel like streams “died” for no reason. */
-    if (categoriesChanged || visibleChannelsSignature() !== before) {
+    if (visibleChannelsSignature() !== before) {
       renderGrid();
     }
   }
@@ -2484,11 +2528,10 @@
   function schedulePoll() {
     if (pollTimer) clearInterval(pollTimer);
     pollTimer = null;
-    const needsOnlinePoll =
+    if (
       (state.hideOffline || state.priorityTiles) &&
-      twitchLoginsForPoll().length;
-    const needsCategoryPoll = state.categoryFollows.length > 0;
-    if (needsOnlinePoll || needsCategoryPoll) {
+      twitchLoginsForPoll().length
+    ) {
       pollTimer = setInterval(tick, POLL_MS);
     }
   }
@@ -2895,6 +2938,7 @@
     setupGridDrag();
     fullRender();
     schedulePoll();
+    scheduleCategoryPoll();
     console.info(
       `[twitchviewer] Twitch playback: ${twitchPlayback}. Iframe mode uses Twitch.Player (setQuality: ~480p when Priority tiles off, Auto when on). HLS uses streamlink+ffmpeg. Run twitchviewerAutoplayDiagnostics().`
     );
