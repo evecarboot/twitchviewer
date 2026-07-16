@@ -16,6 +16,7 @@
   const defaultState = () => ({
     channels: [],
     importedFollows: [],
+    categoryFollows: [],
     hideOffline: false,
     priorityTiles: false,
     prioritySelection: [],
@@ -54,6 +55,8 @@
     priorityTiles: document.getElementById('priority-tiles'),
     priorityEditSelection: document.getElementById('edit-priority-selection'),
     refreshStreams: document.getElementById('refresh-streams'),
+    followGame: document.getElementById('follow-game'),
+    categoryList: document.getElementById('category-list'),
     showChat: document.getElementById('show-chat'),
     hideChatPanelWrap: document.getElementById('hide-chat-panel-wrap'),
     hideChatPanel: document.getElementById('hide-chat-panel'),
@@ -117,6 +120,7 @@
         importedFollows: Array.isArray(parsed.importedFollows)
           ? parsed.importedFollows
           : [],
+        categoryFollows: migrateCategoryFollows(parsed.categoryFollows),
       };
       delete merged.autoplayStreams;
       return merged;
@@ -139,6 +143,27 @@
     return out;
   }
 
+  function normalizeCategoryFollow(c) {
+    if (!c || typeof c !== 'object') return null;
+    const id = typeof c.id === 'string' ? c.id : '';
+    const name = typeof c.name === 'string' ? c.name.trim() : '';
+    if (!id || !name) return null;
+    let limit = Number(c.limit);
+    if (!Number.isFinite(limit) || limit < 1) limit = 6;
+    limit = Math.min(Math.max(Math.round(limit), 1), 24);
+    return { id, name, limit };
+  }
+
+  function migrateCategoryFollows(arr) {
+    if (!Array.isArray(arr)) return [];
+    const out = [];
+    for (const c of arr) {
+      const n = normalizeCategoryFollow(c);
+      if (n) out.push(n);
+    }
+    return out;
+  }
+
   function normalizeChannelEntry(c) {
     if (typeof c === 'string') {
       const login = normalizeLogin(c);
@@ -147,7 +172,12 @@
     if (!c || typeof c !== 'object') return null;
     if (c.type === 'twitch' && c.login) {
       const login = normalizeLogin(c.login);
-      return login ? { type: 'twitch', login } : null;
+      if (!login) return null;
+      const out = { type: 'twitch', login };
+      if (typeof c.fromCategory === 'string' && c.fromCategory) {
+        out.fromCategory = c.fromCategory;
+      }
+      return out;
     }
     if (c.type === 'youtube' && c.id && typeof c.id === 'string') {
       const id = String(c.id);

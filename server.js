@@ -434,6 +434,93 @@ app.get('/api/follows', async (req, res) => {
   }
 });
 
+/** Twitch game IDs are effectively permanent — cache name → id lookups for a while. */
+const gameIdCache = new Map();
+const GAME_ID_CACHE_MS = 6 * 60 * 60 * 1000;
+
+async function resolveGameId(token, clientId, name) {
+  const key = name.trim().toLowerCase();
+  const cached = gameIdCache.get(key);
+  if (cached && Date.now() < cached.expiresAt) return cached;
+  const params = new URLSearchParams({ name: name.trim() });
+  const r = await fetch(`https://api.twitch.tv/helix/games?${params.toString()}`, {
+    headers: { 'Client-ID': clientId, Authorization: `Bearer ${token}` },
+  });
+  if (!r.ok) return null;
+  const body = await r.json();
+  const game = (body.data && body.data[0]) || null;
+  if (!game) return null;
+  const entry = {
+    id: game.id,
+    name: game.name,
+    expiresAt: Date.now() + GAME_ID_CACHE_MS,
+  };
+  gameIdCache.set(key, entry);
+  return entry;
+}
+
+/** Top live streams for a Twitch game/category — used by "Follow game" to auto-populate the grid. */
+app.get('/api/category-streams', async (req, res) => {
+  const name = String(req.query.name || '').trim();
+  if (!name) {
+    return res.status(400).json({ error: 'Missing name', streams: [] });
+  }
+  const clientId = process.env.TWITCH_CLIENT_ID;
+  const clientSecret = process.env.TWITCH_CLIENT_SECRET;
+  if (!clientId || !clientSecret) {
+    return res.json({
+      error: 'Set TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET in .env',
+      streams: [],
+    });
+  }
+  const token = await getAppToken();
+  if (!token) {
+    return res
+      .status(503)
+      .json({ error: 'Could not obtain Twitch app token', streams: [] });
+  }
+  const first = Math.min(Math.max(parseInt(req.query.first, 10) || 6, 1), 100);
+  try {
+    const game = await resolveGameId(token, clientId, name);
+    if (!game) {
+      return res
+        .status(404)
+        .json({ error: `No Twitch category found for "${name}"`, streams: [] });
+    }
+    const params = new URLSearchParams({
+      game_id: game.id,
+      first: String(first),
+    });
+    const sr = await fetch(
+      `https://api.twitch.tv/helix/streams?${params.toString()}`,
+      { headers: { 'Client-ID': clientId, Authorization: `Bearer ${token}` } }
+    );
+    if (!sr.ok) {
+      const text = await sr.text();
+      return res
+        .status(502)
+        .json({ error: `Helix error ${sr.status}: ${text}`, streams: [] });
+    }
+    const body = await sr.json();
+    const streams = (body.data || []).map((s) => ({
+      login: (s.user_login || '').toLowerCase(),
+      displayName: s.user_name,
+      title: s.title,
+      viewerCount: s.viewer_count,
+    }));
+    return res.json({
+      gameId: game.id,
+      gameName: game.name,
+      streams,
+      error: null,
+    });
+  } catch (e) {
+    return res
+      .status(500)
+      .json({ error: e.message || String(e), streams: [] });
+  }
+});
+
 app.get('/api/streams', async (req, res) => {
   const raw = req.query.login || '';
   const logins = raw

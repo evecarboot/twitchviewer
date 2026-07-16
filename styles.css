@@ -233,6 +233,16 @@ body {
   color: #ff4d4d;
 }
 
+.category-list {
+  margin-top: 0.3rem;
+}
+
+.chip.category-chip {
+  cursor: default;
+  border-color: var(--accent);
+  color: var(--text);
+}
+
 .peek-tab {
   position: fixed;
   top: 0;

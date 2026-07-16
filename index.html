@@ -69,6 +69,14 @@
           >
             Refresh streams
           </button>
+          <button
+            type="button"
+            class="ghost"
+            id="follow-game"
+            title="Follow a Twitch game/category — top live streams for it are added to the grid automatically"
+          >
+            Follow game
+          </button>
           <label class="check">
             <input type="checkbox" id="show-chat" />
             Show chat
@@ -112,6 +120,7 @@
         </div>
         <div class="toolbar-meta" id="toolbar-meta"></div>
         <div class="channel-list" id="channel-list"></div>
+        <div class="channel-list category-list" id="category-list" aria-label="Followed game categories"></div>
       </header>
 
       <button type="button" class="peek-tab" id="peek-tab" hidden title="Show toolbar">
