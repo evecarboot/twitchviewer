@@ -23,6 +23,8 @@
     hideOffline: false,
     priorityTiles: false,
     prioritySelection: [],
+    sortByViews: false,
+    sortByViewsInvert: false,
     showChat: false,
     hideChatPanel: false,
     chatOnLeft: false,
@@ -36,6 +38,8 @@
   let twitchPlayback = 'iframe';
   let pollFailed = false;
   let onlineSet = new Set();
+  /** @type {Map<string, number>} Twitch login (lowercase) -> current viewer count. */
+  let viewerCounts = new Map();
   let pollTimer = null;
   let categoryPollTimer = null;
   /** @type {IntersectionObserver[]} */
@@ -58,6 +62,10 @@
     hideOffline: document.getElementById('hide-offline'),
     priorityTiles: document.getElementById('priority-tiles'),
     priorityEditSelection: document.getElementById('edit-priority-selection'),
+    sortByViews: document.getElementById('sort-by-views'),
+    sortByViewsWrap: document.getElementById('sort-by-views-wrap'),
+    sortByViewsInvert: document.getElementById('sort-by-views-invert'),
+    sortByViewsInvertWrap: document.getElementById('sort-by-views-invert-wrap'),
     refreshStreams: document.getElementById('refresh-streams'),
     followGame: document.getElementById('follow-game'),
     categoryList: document.getElementById('category-list'),
@@ -1047,11 +1055,25 @@
   }
 
   function visibleChannels() {
-    return state.channels.filter((ch) => {
+    const list = state.channels.filter((ch) => {
       if (getChannelType(ch) !== 'twitch') return true;
       if (!state.hideOffline || !apiConfigured || pollFailed) return true;
       return onlineSet.has(getTwitchLogin(ch));
     });
+    if (!state.sortByViews) return list;
+
+    const withIndex = list.map((ch, i) => {
+      const login = getChannelType(ch) === 'twitch' ? getTwitchLogin(ch) : null;
+      const v = login && viewerCounts.has(login) ? viewerCounts.get(login) : -1;
+      return { ch, i, v };
+    });
+    withIndex.sort((a, b) => {
+      if (b.v !== a.v) return b.v - a.v; // highest viewers first by default
+      return a.i - b.i; // stable tie-break, keeps manual order for ties
+    });
+    let ordered = withIndex.map((x) => x.ch);
+    if (state.sortByViewsInvert) ordered = ordered.reverse();
+    return ordered;
   }
 
   /**
@@ -1298,6 +1320,7 @@
     const twitchList = twitchLoginsForPoll();
     if (!twitchList.length) {
       onlineSet = new Set();
+      viewerCounts = new Map();
       pollFailed = false;
       return;
     }
@@ -1326,6 +1349,11 @@
         setMeta('', false);
       }
       onlineSet = new Set((data.online || []).map((s) => s.toLowerCase()));
+      const nextViewerCounts = new Map();
+      for (const [login, count] of Object.entries(data.viewers || {})) {
+        nextViewerCounts.set(login.toLowerCase(), count);
+      }
+      viewerCounts = nextViewerCounts;
     } catch {
       pollFailed = true;
       setMeta('Could not reach /api/streams — is the server running?', true);
@@ -2493,11 +2521,22 @@
     els.refreshStreams.disabled = !hasTwitchToPoll;
   }
 
+  function applySortControls() {
+    if (els.sortByViews) els.sortByViews.checked = state.sortByViews;
+    if (els.sortByViewsInvert) {
+      els.sortByViewsInvert.checked = state.sortByViewsInvert;
+    }
+    if (els.sortByViewsInvertWrap) {
+      els.sortByViewsInvertWrap.hidden = !state.sortByViews;
+    }
+  }
+
   function fullRender() {
     renderChannelChips();
     renderCategoryChips();
     renderChatSelect();
     applyChatLayout();
+    applySortControls();
     applyToolbarLayout();
     renderGrid();
     updateFollowImportButtonsVisibility();
@@ -2628,6 +2667,24 @@
       requestAnimationFrame(() => {
         requestAnimationFrame(() => syncTwitchInteractiveQualities());
       });
+    });
+  }
+
+  if (els.sortByViews) {
+    els.sortByViews.checked = state.sortByViews;
+    els.sortByViews.addEventListener('change', () => {
+      state.sortByViews = els.sortByViews.checked;
+      saveState();
+      fullRender();
+    });
+  }
+
+  if (els.sortByViewsInvert) {
+    els.sortByViewsInvert.checked = state.sortByViewsInvert;
+    els.sortByViewsInvert.addEventListener('change', () => {
+      state.sortByViewsInvert = els.sortByViewsInvert.checked;
+      saveState();
+      fullRender();
     });
   }
 

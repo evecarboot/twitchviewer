@@ -578,7 +578,7 @@ app.get('/api/streams', async (req, res) => {
     .filter(Boolean);
 
   if (!logins.length) {
-    return res.json({ online: [], configured: false, error: null });
+    return res.json({ online: [], viewers: {}, configured: false, error: null });
   }
 
   const clientId = process.env.TWITCH_CLIENT_ID;
@@ -586,6 +586,7 @@ app.get('/api/streams', async (req, res) => {
   if (!clientId || !clientSecret) {
     return res.json({
       online: [],
+      viewers: {},
       configured: false,
       error: 'Set TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET in .env',
     });
@@ -595,6 +596,7 @@ app.get('/api/streams', async (req, res) => {
   if (!token) {
     return res.status(503).json({
       online: [],
+      viewers: {},
       configured: true,
       error: 'Could not obtain Twitch app token',
     });
@@ -602,6 +604,7 @@ app.get('/api/streams', async (req, res) => {
 
   const chunkSize = 100;
   const online = [];
+  const viewers = {};
   try {
     for (let i = 0; i < logins.length; i += chunkSize) {
       const chunk = logins.slice(i, i + chunkSize);
@@ -621,19 +624,23 @@ app.get('/api/streams', async (req, res) => {
         const text = await helix.text();
         return res.status(502).json({
           online: [],
+          viewers: {},
           configured: true,
           error: `Helix error ${helix.status}: ${text}`,
         });
       }
       const body = await helix.json();
       for (const s of body.data || []) {
-        online.push(s.user_login.toLowerCase());
+        const login = s.user_login.toLowerCase();
+        online.push(login);
+        viewers[login] = s.viewer_count;
       }
     }
-    return res.json({ online, configured: true, error: null });
+    return res.json({ online, viewers, configured: true, error: null });
   } catch (e) {
     return res.status(500).json({
       online: [],
+      viewers: {},
       configured: true,
       error: e.message || String(e),
     });
