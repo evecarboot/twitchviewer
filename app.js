@@ -670,6 +670,28 @@
     });
   }
 
+  /**
+   * A freshly mounted Twitch.Player is constructed with `muted`/`autoplay: true`, but the
+   * very first `play()` call right after READY can silently lose a race with Twitch’s own
+   * player init (the postMessage handshake to the embed iframe hasn’t settled yet), leaving
+   * the tile sitting on its paused/"play button" thumbnail until someone clicks it. Retry a
+   * few times — re-calling play()/setMuted() on an already-playing player is a harmless no-op —
+   * and stop once PLAYING actually fires.
+   */
+  function scheduleTwitchPlayRetries(player, cell) {
+    [150, 500, 1200, 2500, 5000].forEach((ms) => {
+      window.setTimeout(() => {
+        if (!cell.isConnected || player._twitchPlaybackStarted) return;
+        try {
+          if (typeof player.setMuted === 'function') player.setMuted(true);
+          if (typeof player.play === 'function') player.play();
+        } catch {
+          /* ignore */
+        }
+      }, ms);
+    });
+  }
+
   function syncTwitchInteractiveQualities() {
     if (twitchPlayback !== 'iframe') return;
     const roots = [els.grid, els.gridPriority].filter(Boolean);
@@ -797,6 +819,12 @@
           }
           applyTwitchQualityPreference(player, true);
           scheduleTwitchQualityRetries(player, cell);
+          scheduleTwitchPlayRetries(player, cell);
+        });
+        /* Mark actual playback start so the play-retry loop above stops nudging it — this
+           is just a flag read, not a re-trigger, so it's fine to hook PLAYING for this. */
+        player.addEventListener(Twitch.Player.PLAYING, () => {
+          player._twitchPlaybackStarted = true;
         });
         /* When a channel drops offline the embed shows its own "offline" screen; when it
            comes back the Twitch player does NOT resume playback on its own (autoplay only
@@ -809,6 +837,7 @@
           } catch {
             /* ignore */
           }
+          scheduleTwitchPlayRetries(player, cell);
         });
         /* Never hook PLAYING for setQuality or resize — PLAYING fires often during live
            playback; repeating setQuality or re-wiring resize causes visible play/stutter. */
