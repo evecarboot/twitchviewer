@@ -21,6 +21,7 @@
     importedFollows: [],
     categoryFollows: [],
     hideOffline: false,
+    autoplay: true,
     priorityTiles: false,
     prioritySelection: [],
     sortByViews: false,
@@ -60,6 +61,7 @@
     addForm: document.getElementById('add-form'),
     channelInput: document.getElementById('channel-input'),
     hideOffline: document.getElementById('hide-offline'),
+    autoplayToggle: document.getElementById('autoplay-toggle'),
     priorityTiles: document.getElementById('priority-tiles'),
     priorityEditSelection: document.getElementById('edit-priority-selection'),
     sortByViews: document.getElementById('sort-by-views'),
@@ -335,7 +337,7 @@
 
   function youtubeEmbedSrc(id) {
     const params = new URLSearchParams({
-      autoplay: '1',
+      autoplay: state.autoplay ? '1' : '0',
       mute: '1',
       playsinline: '1',
     });
@@ -708,6 +710,20 @@
     const r = wrap.getBoundingClientRect();
     const w = Math.max(GRID_MIN_CELL_W, Math.round(r.width));
     const h = Math.max(GRID_MIN_CELL_H, Math.round(r.height));
+    /* Skip redundant attribute writes. CSS already stretches the iframe to fill
+       its cell (width/height: 100%) — these attributes only feed Twitch's own
+       internal sizing logic. Reordering tiles without changing the grid's
+       cols/rows (e.g. sort-by-viewers reshuffling, drag reorder) still fires
+       this ResizeObserver for every surviving cell even though nothing actually
+       changed size; re-writing identical width/height attributes on Twitch's
+       iframe can make its player show the paused/play-button overlay for no
+       reason. Only touch the attributes when the size genuinely changed. */
+    if (
+      iframe.getAttribute('width') === String(w) &&
+      iframe.getAttribute('height') === String(h)
+    ) {
+      return;
+    }
     iframe.setAttribute('width', String(w));
     iframe.setAttribute('height', String(h));
   }
@@ -747,7 +763,7 @@
       const params = new URLSearchParams();
       params.set('channel', login);
       params.set('muted', 'true');
-      params.set('autoplay', 'true');
+      params.set('autoplay', state.autoplay ? 'true' : 'false');
       for (const p of parentDomainsForTwitch()) {
         params.append('parent', p);
       }
@@ -796,7 +812,7 @@
             channel: login,
             parent: parentDomainsForTwitch(),
             muted: true,
-            autoplay: true,
+            autoplay: state.autoplay,
           });
         } catch {
           createTwitchIframeEmbedFallback(cell, login, wrap);
@@ -811,15 +827,17 @@
 
         player.addEventListener(Twitch.Player.READY, () => {
           wireInnerIframeOnce();
-          try {
-            if (typeof player.setMuted === 'function') player.setMuted(true);
-            if (typeof player.play === 'function') player.play();
-          } catch {
-            /* ignore */
+          if (state.autoplay) {
+            try {
+              if (typeof player.setMuted === 'function') player.setMuted(true);
+              if (typeof player.play === 'function') player.play();
+            } catch {
+              /* ignore */
+            }
+            scheduleTwitchPlayRetries(player, cell);
           }
           applyTwitchQualityPreference(player, true);
           scheduleTwitchQualityRetries(player, cell);
-          scheduleTwitchPlayRetries(player, cell);
         });
         /* Mark actual playback start so the play-retry loop above stops nudging it — this
            is just a flag read, not a re-trigger, so it's fine to hook PLAYING for this. */
@@ -831,6 +849,7 @@
            applies on initial load), so without this the tile sits on a paused thumbnail
            until someone clicks the embed's play button. Re-trigger muted play on ONLINE. */
         player.addEventListener(Twitch.Player.ONLINE, () => {
+          if (!state.autoplay) return;
           try {
             if (typeof player.setMuted === 'function') player.setMuted(true);
             if (typeof player.play === 'function') player.play();
@@ -2138,7 +2157,7 @@
     video.muted = true;
     video.playsInline = true;
     video.setAttribute('playsinline', '');
-    video.autoplay = true;
+    video.autoplay = state.autoplay;
 
     const fail = (msg) => {
       if (cell.querySelector('.cell-hls-error')) return;
@@ -2201,14 +2220,14 @@
       hls.attachMedia(video);
       video._hls = hls;
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        video.play().catch(() => {});
+        if (state.autoplay) video.play().catch(() => {});
       });
       hls.on(Hls.Events.ERROR, (_, data) => {
         if (data.fatal) fail(formatHlsFatalError(data));
       });
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
       video.src = playbackUrl;
-      video.play().catch(() => {});
+      if (state.autoplay) video.play().catch(() => {});
     } else {
       fail('HLS not supported in this browser.');
     }
@@ -2309,36 +2328,27 @@
       }
     }
 
-    const cells = Array.from(gridEl.querySelectorAll('.cell'));
-    const keysMatch =
-      cells.length === desiredKeys.length &&
-      desiredKeys.every((k, i) => cells[i]?.dataset?.channelKey === k);
-
-    if (keysMatch) {
-      cells.forEach((cell, i) => {
-        cell.dataset.cellIndex = String(globalIndexStart + i);
-      });
-      return;
+    /* Never move an already-mounted cell to a different DOM position — even a
+       same-parent insertBefore can make embedded Twitch/YouTube players show
+       a paused/play-button overlay. Surviving cells stay exactly where they
+       already are in the DOM; only their CSS `order` (grid items honor `order`
+       just like flex items) changes to reflect the new visual position. */
+    const existingByKey = new Map();
+    for (const cell of gridEl.querySelectorAll('.cell')) {
+      existingByKey.set(cell.dataset.channelKey, cell);
     }
 
     for (let i = 0; i < desiredKeys.length; i++) {
       const wantKey = desiredKeys[i];
-      const ch = channels[i];
-      const el = gridEl.children[i];
-      if (el && el.dataset.channelKey === wantKey) {
-        el.dataset.cellIndex = String(globalIndexStart + i);
-        continue;
+      const idx = globalIndexStart + i;
+      let cell = existingByKey.get(wantKey);
+      if (!cell) {
+        cell = buildCellForChannel(channels[i], idx);
+        gridEl.appendChild(cell);
+      } else {
+        cell.dataset.cellIndex = String(idx);
       }
-      const found = Array.from(gridEl.querySelectorAll('.cell')).find(
-        (c) => c.dataset.channelKey === wantKey
-      );
-      if (found) {
-        gridEl.insertBefore(found, el || null);
-        found.dataset.cellIndex = String(globalIndexStart + i);
-        continue;
-      }
-      const newCell = buildCellForChannel(ch, globalIndexStart + i);
-      gridEl.insertBefore(newCell, gridEl.children[i] || null);
+      cell.style.order = String(idx);
     }
   }
 
@@ -2478,40 +2488,24 @@
       }
     }
 
-    let cells = Array.from(els.grid.querySelectorAll('.cell'));
-    const keysMatch =
-      cells.length === desiredKeys.length &&
-      desiredKeys.every((k, i) => cells[i]?.dataset?.channelKey === k);
-
-    if (keysMatch) {
-      cells.forEach((cell, i) => {
-        cell.dataset.cellIndex = String(i);
-      });
-      applyBigTileCellSpans(layout.bigKeys, layout.spanW, layout.spanH);
-      requestAnimationFrame(() => {
-        requestAnimationFrame(() => attachCellObserversToGrid());
-      });
-      return;
+    /* Never move an already-mounted cell to a different DOM position — see
+       syncGridCells for why (can make embedded players show a paused overlay).
+       Surviving cells stay put; only their CSS `order` changes. */
+    const existingByKey = new Map();
+    for (const cell of els.grid.querySelectorAll('.cell')) {
+      existingByKey.set(cell.dataset.channelKey, cell);
     }
-
     for (let i = 0; i < desiredKeys.length; i++) {
       const wantKey = desiredKeys[i];
       const ch = visible[i];
-      const el = els.grid.children[i];
-      if (el && el.dataset.channelKey === wantKey) {
-        el.dataset.cellIndex = String(i);
-        continue;
+      let cell = existingByKey.get(wantKey);
+      if (!cell) {
+        cell = buildCellForChannel(ch, i);
+        els.grid.appendChild(cell);
+      } else {
+        cell.dataset.cellIndex = String(i);
       }
-      const found = Array.from(els.grid.querySelectorAll('.cell')).find(
-        (c) => c.dataset.channelKey === wantKey
-      );
-      if (found) {
-        els.grid.insertBefore(found, el || null);
-        found.dataset.cellIndex = String(i);
-        continue;
-      }
-      const newCell = buildCellForChannel(ch, i);
-      els.grid.insertBefore(newCell, els.grid.children[i] || null);
+      cell.style.order = String(i);
     }
 
     requestAnimationFrame(() => {
