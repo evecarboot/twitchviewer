@@ -1316,10 +1316,24 @@
     fullRender();
   }
 
-  /** Stable signature of the current grid — used to skip rebuild when poll didn’t change visibility. */
+  /**
+   * Stable signature of the current grid — used to skip rebuild when polling
+   * didn’t actually change *who* is shown. Intentionally order-independent: with
+   * "sort by viewers" on, viewer counts (and thus rank order) shift constantly,
+   * which must NOT by itself trigger a grid rebuild (that reorders/moves every
+   * cell and can leave Twitch embeds paused). Only membership — which channels
+   * are visible, and which are big/priority tiles — should trigger a rebuild.
+   */
   function visibleChannelsSignature() {
-    const { orderedVisible } = visibleChannelsForLayout();
-    return orderedVisible.map((ch) => channelKey(ch)).join('\x1e');
+    const { orderedVisible, bigKeys } = visibleChannelsForLayout();
+    const bigSet = new Set(bigKeys);
+    return orderedVisible
+      .map((ch) => {
+        const key = channelKey(ch);
+        return bigSet.has(key) ? `${key}*` : key;
+      })
+      .sort()
+      .join('\x1e');
   }
 
   function twitchLoginsForPoll() {
