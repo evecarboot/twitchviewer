@@ -407,11 +407,13 @@
   }
 
   /**
-   * Twitch docs recommend ~400x300 minimum for embeds, but that can force very sparse
-   * layouts on ultrawide/fullscreen. Use a softer minimum so 5+ streams can still tile.
+   * Twitch enforces a hard ~400x300 minimum for embed autoplay — tiles smaller than this
+   * get rejected with "Autoplay disabled... style visibility" every time, requiring a
+   * manual click. Matching Twitch's real minimum here means fewer/larger columns on
+   * narrow viewports, but autoplay actually works instead of silently failing.
    */
-  const GRID_MIN_CELL_W = 320;
-  const GRID_MIN_CELL_H = 180;
+  const GRID_MIN_CELL_W = 400;
+  const GRID_MIN_CELL_H = 300;
   // For non-iframe modes (HLS <video> path, YouTube embeds, etc.) we can allow
   // smaller cells than the Twitch autoplay-sensitive iframe minimum.
   // This prevents "single-line strip" layouts on shorter viewports.
