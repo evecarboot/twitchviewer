@@ -818,7 +818,10 @@
         const h = Math.max(GRID_MIN_CELL_H, Math.round(r.height));
         let player;
         try {
-          /* Optional embed params (muted, autoplay). https://dev.twitch.tv/docs/embed/video-and-clips/ */
+          /* Optional embed params (muted, autoplay). https://dev.twitch.tv/docs/embed/video-and-clips/
+             `controls: false` is a confirmed workaround for Twitch's "style visibility"
+             autoplay rejection — Twitch's own control-bar overlay on the player apparently
+             trips their internal visibility check (see twitchdev/issues#1127 discussion). */
           player = new Twitch.Player(hostId, {
             width: w,
             height: h,
@@ -826,6 +829,7 @@
             parent: parentDomainsForTwitch(),
             muted: true,
             autoplay: state.autoplay,
+            controls: false,
           });
         } catch {
           createTwitchIframeEmbedFallback(cell, login, wrap);
