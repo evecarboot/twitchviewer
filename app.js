@@ -822,7 +822,17 @@
 
         const wireInnerIframeOnce = () => {
           const iframe = wrap.querySelector('iframe');
-          if (iframe) wireTwitchIframeResize(wrap, iframe, cell);
+          if (!iframe) return;
+          /* Twitch.Player's own iframe doesn't always set `allow="autoplay"` — without it,
+             some Chromium builds (Edge included) treat autoplay as a delegated permission
+             that's missing on this cross-origin frame and silently block even muted play(),
+             leaving the tile on its paused thumbnail until manually clicked. */
+          const wantedAllow =
+            'autoplay; fullscreen; picture-in-picture; clipboard-write; encrypted-media; web-share';
+          if (iframe.getAttribute('allow') !== wantedAllow) {
+            iframe.setAttribute('allow', wantedAllow);
+          }
+          wireTwitchIframeResize(wrap, iframe, cell);
         };
 
         player.addEventListener(Twitch.Player.READY, () => {
@@ -850,6 +860,12 @@
            until someone clicks the embed's play button. Re-trigger muted play on ONLINE. */
         player.addEventListener(Twitch.Player.ONLINE, () => {
           if (!state.autoplay) return;
+          /* Reset so scheduleTwitchPlayRetries actually retries below — this flag was
+             already set true by the PLAYING event from the stream's previous online
+             session, so without resetting it the retry loop bails after a single
+             immediate play() call, which is exactly the race that leaves a tile
+             stuck on its paused thumbnail when a stream resumes. */
+          player._twitchPlaybackStarted = false;
           try {
             if (typeof player.setMuted === 'function') player.setMuted(true);
             if (typeof player.play === 'function') player.play();
