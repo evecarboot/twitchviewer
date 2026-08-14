@@ -407,13 +407,11 @@
   }
 
   /**
-   * Twitch enforces a hard ~400x300 minimum for embed autoplay — tiles smaller than this
-   * get rejected with "Autoplay disabled... style visibility" every time, requiring a
-   * manual click. Matching Twitch's real minimum here means fewer/larger columns on
-   * narrow viewports, but autoplay actually works instead of silently failing.
+   * Twitch docs recommend ~400x300 minimum for embeds, but that can force very sparse
+   * layouts on ultrawide/fullscreen. Use a softer minimum so 5+ streams can still tile.
    */
-  const GRID_MIN_CELL_W = 400;
-  const GRID_MIN_CELL_H = 300;
+  const GRID_MIN_CELL_W = 320;
+  const GRID_MIN_CELL_H = 180;
   // For non-iframe modes (HLS <video> path, YouTube embeds, etc.) we can allow
   // smaller cells than the Twitch autoplay-sensitive iframe minimum.
   // This prevents "single-line strip" layouts on shorter viewports.
@@ -818,10 +816,7 @@
         const h = Math.max(GRID_MIN_CELL_H, Math.round(r.height));
         let player;
         try {
-          /* Optional embed params (muted, autoplay). https://dev.twitch.tv/docs/embed/video-and-clips/
-             `controls: false` is a confirmed workaround for Twitch's "style visibility"
-             autoplay rejection — Twitch's own control-bar overlay on the player apparently
-             trips their internal visibility check (see twitchdev/issues#1127 discussion). */
+          /* Optional embed params (muted, autoplay). https://dev.twitch.tv/docs/embed/video-and-clips/ */
           player = new Twitch.Player(hostId, {
             width: w,
             height: h,
@@ -829,7 +824,8 @@
             parent: parentDomainsForTwitch(),
             muted: true,
             autoplay: state.autoplay,
-            controls: false,
+            // controls: false, // tried as a workaround for the "style visibility"
+            // autoplay rejection (twitchdev/issues#1127) — did not fix it, reverted.
           });
         } catch {
           createTwitchIframeEmbedFallback(cell, login, wrap);
