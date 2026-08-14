@@ -749,6 +749,17 @@
     cell._twitchIframeResizeObserver = ro;
   }
 
+  /** Debug toggle: `localStorage.setItem('twitchviewer:forcePlainIframe','1')` then reload —
+   *  skips the Twitch.Player JS SDK entirely to test whether the "style visibility" autoplay
+   *  rejection comes from the SDK wrapper or from player.twitch.tv itself. */
+  function forcePlainTwitchIframe() {
+    try {
+      return localStorage.getItem('twitchviewer:forcePlainIframe') === '1';
+    } catch {
+      return false;
+    }
+  }
+
   /** Plain iframe fallback if `embed/v1.js` does not load or Twitch.Player fails. */
   function createTwitchIframeEmbedFallback(cell, login, wrap) {
     if (!cell.isConnected || !wrap.isConnected) return;
@@ -902,7 +913,11 @@
           requestAnimationFrame(() => {
             window.setTimeout(() => {
               if (!cell.isConnected || !wrap.isConnected) return;
-              createTwitchInteractivePlayerEmbed(cell, login, wrap);
+              if (forcePlainTwitchIframe()) {
+                createTwitchIframeEmbedFallback(cell, login, wrap);
+              } else {
+                createTwitchInteractivePlayerEmbed(cell, login, wrap);
+              }
             }, 60);
           });
         });
