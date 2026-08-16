@@ -710,8 +710,9 @@
   // Twitch's HLS is already H.264/AAC, so the server proxies it unchanged (no ffmpeg).
   // To keep 15+ simultaneous tiles from melting the browser decoder, small tiles fetch a
   // lower variant (360p/480p) and only large tiles fetch 720p60. Thresholds are in CSS px².
-  const TWITCH_PROXY_TIER_360 = 240000; // ~480x500 — small grid tiles
-  const TWITCH_PROXY_TIER_480 = 600000; // ~800x750 — medium tiles
+  // Tuned for weaker CPUs (e.g. i5-6400): a 2x2 grid on 1080p gets 360p30 per tile, not 480p30.
+  const TWITCH_PROXY_TIER_360 = 550000; // ~960x570 — covers typical 2x2/3x2 grid tiles
+  const TWITCH_PROXY_TIER_480 = 1200000; // ~1280x940 — big tiles / 1x2 layouts
   // Above 480 tier → 720p60 (or env default if TWITCH_STREAMLINK_QUALITY is set higher).
 
   function twitchQualityForCell(w, h) {
