@@ -2346,12 +2346,18 @@
 
     if (typeof Hls !== 'undefined' && Hls.isSupported()) {
       const hls = new Hls({
-        enableWorker: false,
+        // Offload MPEG-TS demuxing + fMP4 remuxing to a Web Worker per stream.
+        // With this disabled, 4+ streams do all demux work on the main thread
+        // and compete with rendering → high CPU and jank.
+        enableWorker: true,
+        // Reuse the worker for MSE buffer append ops too (less main-thread work).
+        // (hls.js default is already true; kept explicit for clarity.)
+        // workerPath defaults to the bundled worker in hls.min.js.
         ...(twitchHls
           ? {
-              maxBufferLength: 45,
-              maxMaxBufferLength: 120,
-              backBufferLength: 60,
+              maxBufferLength: 30,
+              maxMaxBufferLength: 60,
+              backBufferLength: 30,
               liveSyncDurationCount: 4,
               liveMaxLatencyDurationCount: 12,
               maxLiveSyncPlaybackRate: 1.5,
