@@ -232,17 +232,24 @@ function streamlinkWorks() {
   return streamlinkCached;
 }
 
+/** Current Twitch playback mode: 'proxy' (default, direct API or streamlink + pass-through,
+ *  no ffmpeg), 'hls' (legacy streamlink + ffmpeg transcode), or 'iframe' (official embed).
+ *  Proxy mode works without Streamlink installed — it uses Twitch's GQL + usher API directly. */
+function currentTwitchPlayback() {
+  const force = (process.env.TWITCH_PLAYBACK || '').trim().toLowerCase();
+  if (force === 'iframe') return 'iframe';
+  if (force === 'hls') return 'hls';
+  return 'proxy';
+}
+
 app.get('/api/status', (req, res) => {
   const configured = Boolean(
     process.env.TWITCH_CLIENT_ID && process.env.TWITCH_CLIENT_SECRET
   );
-  const forceIframe = process.env.TWITCH_PLAYBACK === 'iframe';
   const sl = streamlinkWorks();
-  const twitchPlayback =
-    !forceIframe && sl ? 'hls' : 'iframe';
   res.json({
     configured,
-    twitchPlayback,
+    twitchPlayback: currentTwitchPlayback(),
     twitchHlsAvailable: sl,
   });
 });
@@ -907,9 +914,10 @@ function streamlinkQualityArg() {
   return /^[a-zA-Z0-9][a-zA-Z0-9_+-]*$/.test(raw) ? raw : '720p60';
 }
 
-/** Twitch often exposes 720p60 / 480p30, not a bare "720p" — try fallbacks if the preferred name fails. */
-function streamlinkQualityCandidates() {
-  const primary = streamlinkQualityArg();
+/** Twitch often exposes 720p60 / 480p30, not a bare "720p" — try fallbacks if the preferred name fails.
+ *  @param {string} [preferred] — quality requested by the client (e.g. '360p30'); falls back upward if unavailable. */
+function streamlinkQualityCandidates(preferred) {
+  const primary = (preferred && String(preferred).trim()) || streamlinkQualityArg();
   const fallbacks = [
     '720p60',
     '720p30',
@@ -917,6 +925,8 @@ function streamlinkQualityCandidates() {
     '480p30',
     '480p',
     '360p30',
+    '360p',
+    '160p',
     'best',
   ];
   const seen = new Set();
@@ -973,8 +983,8 @@ function resolveStreamlinkStreamUrlOnce(login, quality) {
   });
 }
 
-async function resolveStreamlinkStreamUrl(login) {
-  const candidates = streamlinkQualityCandidates();
+async function resolveStreamlinkStreamUrl(login, preferred) {
+  const candidates = streamlinkQualityCandidates(preferred);
   let lastErr = '';
   for (const quality of candidates) {
     try {
@@ -987,8 +997,353 @@ async function resolveStreamlinkStreamUrl(login) {
 }
 
 /**
- * Twitch → HLS in-browser: streamlink resolves a temporary CDN URL, ffmpeg re-segments
- * to same-origin /api/twitch-live/:login/… (reliable muted autoplay vs iframe embed).
+ * --- Twitch pass-through proxy (proxy mode) ---
+ * The server resolves a CDN media-playlist URL per (login, quality), fetches it, rewrites
+ * segment URIs to point back through /api/twitch-live, and pipes .ts bytes through unchanged.
+ * No ffmpeg, no transcode — just HTTP proxying. The client picks the quality per tile pixel
+ * size so small tiles only decode 360p/480p, big tiles get 720p60.
+ *
+ * URL resolution has two strategies, tried in order:
+ *  1. Direct API (no install needed): Twitch GQL → playback token → usher master playlist →
+ *     pick the variant matching the requested quality. Uses the well-known web client_id.
+ *  2. Streamlink fallback: `streamlink --stream-url <quality>` — requires Streamlink installed.
+ *     Catches cases where the direct API breaks (Twitch schema changes, etc.).
+ */
+
+/** Well-known Twitch web client_id used by youtube-dl/streamlink for GQL queries. */
+const TWITCH_WEB_CLIENT_ID = 'kimne78kx3ncx6brgo4mv6wki5h1ko';
+
+/** @type {Map<string, {url: string, promise: Promise<string>|null, ts: number}>} key = `${login}|${quality}` */
+const twitchProxyCache = new Map();
+/** Re-resolve periodically so CDN URL expiry (403/404) doesn't strand a tile. */
+const TWITCH_PROXY_TTL_MS = 4 * 60 * 1000;
+/** Whitelist of quality names the client is allowed to request via ?q=. */
+const TWITCH_PROXY_QUALITIES = new Set([
+  '160p', '360p30', '360p', '480p30', '480p', '720p60', '720p30', '720p', 'best',
+]);
+
+function sanitizeProxyQuality(q) {
+  const s = String(q || '').trim().toLowerCase();
+  return TWITCH_PROXY_QUALITIES.has(s) ? s : streamlinkQualityArg();
+}
+
+/* --- Direct API: GQL playback token (cached per login) --- */
+/** @type {Map<string, {token: {value: string, signature: string}, ts: number}>} */
+const twitchTokenCache = new Map();
+const TWITCH_TOKEN_TTL_MS = 5 * 60 * 1000;
+
+async function fetchTwitchPlaybackToken(login) {
+  const now = Date.now();
+  const cached = twitchTokenCache.get(login);
+  if (cached && now - cached.ts < TWITCH_TOKEN_TTL_MS) return cached.token;
+
+  const query = {
+    operationName: 'PlaybackAccessToken',
+    query:
+      'query PlaybackAccessToken($login: String!) { streamPlaybackAccessToken(channelName: $login, params: {platform: "web", playerBackend: "mediaplayer", playerType: "site"}) { value signature } }',
+    variables: { login },
+  };
+  const r = await fetchBuffer('https://gql.twitch.tv/gql', 0);
+  // fetchBuffer does a GET — we need POST for GQL. Use a dedicated POST helper instead.
+  const postRes = await new Promise((resolve, reject) => {
+    const body = JSON.stringify(query);
+    const req = https.request(
+      'https://gql.twitch.tv/gql',
+      {
+        method: 'POST',
+        headers: {
+          'Client-ID': TWITCH_WEB_CLIENT_ID,
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+        },
+      },
+      (resp) => {
+        const chunks = [];
+        resp.on('data', (c) => chunks.push(c));
+        resp.on('end', () => {
+          resolve({ status: resp.statusCode, body: Buffer.concat(chunks).toString('utf8') });
+        });
+      }
+    );
+    req.on('error', reject);
+    req.setTimeout(10000, () => req.destroy(new Error('GQL timeout')));
+    req.write(body);
+    req.end();
+  });
+
+  if (postRes.status !== 200) {
+    throw new Error(`Twitch GQL returned ${postRes.status}: ${postRes.body.slice(0, 200)}`);
+  }
+  const j = JSON.parse(postRes.body);
+  const spat = j.data && j.data.streamPlaybackAccessToken;
+  if (!spat || !spat.value || !spat.signature) {
+    const errs = j.errors ? j.errors.map((e) => e.message).join('; ') : 'unknown';
+    throw new Error(`Twitch GQL: no playback token (${errs})`);
+  }
+  const token = { value: spat.value, signature: spat.signature };
+  twitchTokenCache.set(login, { token, ts: now });
+  return token;
+}
+
+/** Parse a Twitch master playlist and return the variant URL matching `quality`.
+ *  Twitch names variants like "720p60", "480p30", "360p30", "160p30", "audio_only", "chunked".
+ *  If the exact name isn't found, pick the closest by resolution. `best` → `chunked` (source). */
+function pickTwitchVariant(masterText, quality) {
+  const lines = masterText.split(/\r?\n/);
+  const variants = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.startsWith('#EXT-X-STREAM-INF:')) continue;
+    const url = lines[i + 1];
+    if (!url || url.startsWith('#')) continue;
+    const attrs = {};
+    const rest = line.slice('#EXT-X-STREAM-INF:'.length);
+    for (const m of rest.matchAll(/([A-Z0-9-]+)=("[^"]*"|[^,]*)/g)) {
+      attrs[m[1]] = m[2].replace(/^"|"$/g, '');
+    }
+    variants.push({
+      url,
+      bandwidth: parseInt(attrs.BANDWIDTH || '0', 10),
+      video: attrs.VIDEO || '',
+      resolution: attrs.RESOLUTION || '',
+    });
+  }
+  if (variants.length === 0) return null;
+
+  // Direct name match (e.g. "720p60" → VIDEO="720p60")
+  if (quality === 'best') {
+    const chunked = variants.find((v) => v.video === 'chunked');
+    if (chunked) return chunked.url;
+    // Fallback: highest bandwidth
+    return variants.reduce((a, b) => (b.bandwidth > a.bandwidth ? b : a)).url;
+  }
+  const exact = variants.find((v) => v.video === quality);
+  if (exact) return exact.url;
+
+  // Fuzzy match by resolution height (e.g. "480p30" → any variant with 480p height)
+  const heightMatch = quality.match(/^(\d+)p/);
+  if (heightMatch) {
+    const wantH = parseInt(heightMatch[1], 10);
+    const byHeight = variants
+      .filter((v) => {
+        const m = v.resolution.match(/x(\d+)$/);
+        return m && parseInt(m[1], 10) === wantH;
+      })
+      .sort((a, b) => b.bandwidth - a.bandwidth);
+    if (byHeight.length > 0) return byHeight[0].url;
+    // If no exact height match, pick the closest lower variant (don't overshoot)
+    const lower = variants
+      .filter((v) => {
+        const m = v.resolution.match(/x(\d+)$/);
+        return m && parseInt(m[1], 10) <= wantH && v.video !== 'audio_only';
+      })
+      .sort((a, b) => b.bandwidth - a.bandwidth);
+    if (lower.length > 0) return lower[0].url;
+  }
+
+  // Ultimate fallback: first non-audio variant
+  const nonAudio = variants.find((v) => v.video !== 'audio_only');
+  return nonAudio ? nonAudio.url : variants[0].url;
+}
+
+/** Resolve a Twitch CDN media-playlist URL via the direct API (no Streamlink needed).
+ *  Returns a URL string or throws on error. */
+async function resolveTwitchDirectApi(login, quality) {
+  const token = await fetchTwitchPlaybackToken(login);
+  const params = new URLSearchParams({
+    allow_source: 'true',
+    allow_audio_only: 'true',
+    player: 'twitchweb',
+    playlist_include_framerate: 'true',
+    supported_codecs: 'avc1',
+    token: token.value,
+    sig: token.signature,
+  });
+  const usherUrl = `https://usher.ttvnw.net/api/channel/hls/${encodeURIComponent(login)}.m3u8?${params}`;
+  const r = await fetchBuffer(usherUrl);
+  if (r.status === 404) {
+    throw new Error(`Twitch: channel "${login}" is offline or does not exist.`);
+  }
+  if (r.status !== 200) {
+    throw new Error(`Twitch usher returned ${r.status}`);
+  }
+  const masterText = r.body.toString('utf8');
+  const variantUrl = pickTwitchVariant(masterText, quality);
+  if (!variantUrl) {
+    throw new Error(`Twitch: no playable stream variant for "${login}" (quality: ${quality}).`);
+  }
+  return variantUrl;
+}
+
+/** Resolve a Twitch CDN media-playlist URL. Tries the direct API first (no install needed),
+ *  falls back to Streamlink if installed. Caches the result per (login, quality). */
+async function resolveTwitchProxyUrl(login, quality) {
+  const key = `${login}|${quality}`;
+  const now = Date.now();
+  const cached = twitchProxyCache.get(key);
+  if (cached && cached.url && now - cached.ts < TWITCH_PROXY_TTL_MS) return cached.url;
+  if (cached && cached.promise) {
+    try {
+      return await cached.promise;
+    } catch {
+      /* fall through and re-resolve */
+    }
+  }
+  const promise = (async () => {
+    // 1. Direct API (no install needed) — primary path
+    try {
+      const url = await resolveTwitchDirectApi(login, quality);
+      twitchProxyCache.set(key, { url, promise: null, ts: Date.now() });
+      return url;
+    } catch (directErr) {
+      // 2. Streamlink fallback (if installed)
+      if (streamlinkWorks()) {
+        const url = await resolveStreamlinkStreamUrl(login, quality);
+        twitchProxyCache.set(key, { url, promise: null, ts: Date.now() });
+        return url;
+      }
+      throw directErr;
+    }
+  })();
+  twitchProxyCache.set(key, { url: '', promise, ts: now });
+  return promise;
+}
+
+function invalidateTwitchProxy(login, quality) {
+  if (quality) {
+    twitchProxyCache.delete(`${login}|${quality}`);
+    return;
+  }
+  for (const k of [...twitchProxyCache.keys()]) {
+    if (k.startsWith(`${login}|`)) twitchProxyCache.delete(k);
+  }
+}
+
+/** Fetch a URL as text/buffer with redirect + timeout handling. Returns {status, headers, body}. */
+function fetchBuffer(url, maxRedirects = 5) {
+  return new Promise((resolve, reject) => {
+    const lib = url.startsWith('https:') ? https : http;
+    const req = lib.get(
+      url,
+      {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) twitchviewer/1.0',
+          Accept: '*/*',
+        },
+      },
+      (resp) => {
+        const status = resp.statusCode || 0;
+        if (status >= 300 && status < 400 && resp.headers.location && maxRedirects > 0) {
+          resp.resume();
+          const next = new URL(resp.headers.location, url).toString();
+          fetchBuffer(next, maxRedirects - 1).then(resolve, reject);
+          return;
+        }
+        const chunks = [];
+        resp.on('data', (c) => chunks.push(c));
+        resp.on('end', () => resolve({ status, headers: resp.headers, body: Buffer.concat(chunks) }));
+        resp.on('error', reject);
+      }
+    );
+    req.on('error', reject);
+    req.setTimeout(15000, () => req.destroy(new Error('proxy fetch timeout')));
+  });
+}
+
+/** Stream a remote URL response straight into the Express `res` (zero buffering for segments). */
+function pipeRemoteTo(url, res, maxRedirects = 5) {
+  const lib = url.startsWith('https:') ? https : http;
+  const req = lib.get(
+    url,
+    {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) twitchviewer/1.0',
+        Accept: '*/*',
+      },
+    },
+    (resp) => {
+      const status = resp.statusCode || 0;
+      if (status >= 300 && status < 400 && resp.headers.location && maxRedirects > 0) {
+        resp.resume();
+        const next = new URL(resp.headers.location, url).toString();
+        pipeRemoteTo(next, res, maxRedirects - 1);
+        return;
+      }
+      if (status !== 200) {
+        resp.resume();
+        res.status(status).end();
+        return;
+      }
+      const ct = resp.headers['content-type'];
+      if (ct) res.type(ct);
+      resp.pipe(res);
+    }
+  );
+  req.on('error', () => {
+    if (!res.headersSent) res.status(502).end();
+  });
+  req.setTimeout(20000, () => req.destroy(new Error('pipe timeout')));
+}
+
+/** Rewrite every segment/sub-playlist URI in a media playlist to route through the proxy.
+ *  Encodes the fully-resolved absolute URI as base64url so segment fetches are stateless. */
+function rewriteTwitchPlaylist(playlistText, baseUrl, login, quality) {
+  const lines = playlistText.split(/\r?\n/);
+  const out = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) {
+      out.push(line);
+      continue;
+    }
+    // URI line (segment or sub-playlist) — resolve against baseUrl, then rewrite.
+    const abs = new URL(trimmed, baseUrl).toString();
+    const enc = Buffer.from(abs).toString('base64url');
+    out.push(`/api/twitch-live/${encodeURIComponent(login)}/seg/${enc}?q=${encodeURIComponent(quality)}`);
+  }
+  return out.join('\n');
+}
+
+/** Proxy a segment: decode the encoded absolute URL and pipe it through.
+ *  On 403/404 (CDN URL expired), invalidate the playlist cache so the next playlist poll
+ *  re-resolves via streamlink; return 503 so hls.js reloads the playlist. */
+app.get('/api/twitch-live/:login/seg/:enc', async (req, res) => {
+  const login = normalizeTwitchLoginParam(req.params.login);
+  if (!login) return res.status(400).type('text').send('Invalid login');
+  const quality = sanitizeProxyQuality(req.query.q);
+  let segUrl;
+  try {
+    segUrl = Buffer.from(String(req.params.enc), 'base64url').toString('utf8');
+    if (!/^https?:\/\//i.test(segUrl)) throw new Error('bad');
+  } catch {
+    return res.status(400).type('text').send('Bad segment reference');
+  }
+  // Probe with a HEAD-ish GET via fetchBuffer to detect expiry cheaply, then pipe on success.
+  try {
+    const probe = await fetchBuffer(segUrl);
+    if (probe.status === 403 || probe.status === 404) {
+      invalidateTwitchProxy(login, quality);
+      return res.status(503).type('text').send('Segment URL expired — playlist will reload.');
+    }
+    if (probe.status !== 200) {
+      return res.status(502).type('text').send(`Upstream ${probe.status}`);
+    }
+    // Serve the already-fetched buffer (segments are small, typically <2MB).
+    const ct = probe.headers['content-type'] || 'video/mp2t';
+    res.type(ct);
+    res.send(probe.body);
+  } catch {
+    invalidateTwitchProxy(login, quality);
+    if (!res.headersSent) res.status(502).type('text').send('Segment fetch failed');
+  }
+});
+
+/**
+ * Twitch → HLS in-browser. Two implementations share this route:
+ *  - proxy mode (default): direct API (GQL+usher) or streamlink resolves a CDN URL per
+ *    quality; server rewrites the playlist and pipes segments. No ffmpeg, no install needed.
+ *    Client picks quality via ?q= based on tile size.
+ *  - hls mode (legacy, TWITCH_PLAYBACK=hls): streamlink + ffmpeg re-segments to disk.
  */
 app.get('/api/twitch-live/:login/:file', async (req, res) => {
   const login = normalizeTwitchLoginParam(req.params.login);
@@ -996,15 +1351,58 @@ app.get('/api/twitch-live/:login/:file', async (req, res) => {
   if (!login) {
     return res.status(400).type('text').send('Invalid login');
   }
-  if (!streamlinkWorks()) {
+  const mode = currentTwitchPlayback();
+  // Legacy hls mode requires streamlink + ffmpeg
+  if (mode === 'hls' && !streamlinkWorks()) {
     return res
       .status(503)
       .type('text')
       .send(
-        'streamlink not found. Install from https://streamlink.github.io/ , set STREAMLINK_PATH in .env to streamlink.exe, or TWITCH_PLAYBACK=iframe'
+        'streamlink not found. Install from https://streamlink.github.io/ , set STREAMLINK_PATH in .env to streamlink.exe, or use TWITCH_PLAYBACK=proxy (default, no install needed)'
       );
   }
 
+  /* --- proxy mode: direct API or streamlink resolves CDN URL, server rewrites + pipes --- */
+  if (mode === 'proxy') {
+    if (file !== 'playlist.m3u8') {
+      // Segments are served by the /seg/:enc route above; legacy seg_N.ts names aren't used.
+      return res.status(404).end();
+    }
+    const quality = sanitizeProxyQuality(req.query.q);
+    let streamUrl;
+    try {
+      streamUrl = await resolveTwitchProxyUrl(login, quality);
+    } catch (e) {
+      return res.status(503).type('text').send(String(e.message));
+    }
+    try {
+      const r = await fetchBuffer(streamUrl);
+      if (r.status === 403 || r.status === 404) {
+        // CDN URL expired — invalidate and re-resolve once.
+        invalidateTwitchProxy(login, quality);
+        try {
+          streamUrl = await resolveTwitchProxyUrl(login, quality);
+        } catch (e) {
+          return res.status(503).type('text').send(String(e.message));
+        }
+        const r2 = await fetchBuffer(streamUrl);
+        if (r2.status !== 200) {
+          return res.status(502).type('text').send(`Upstream playlist ${r2.status}`);
+        }
+        res.type('application/vnd.apple.mpegurl');
+        return res.send(rewriteTwitchPlaylist(r2.body.toString('utf8'), streamUrl, login, quality));
+      }
+      if (r.status !== 200) {
+        return res.status(502).type('text').send(`Upstream playlist ${r.status}`);
+      }
+      res.type('application/vnd.apple.mpegurl');
+      return res.send(rewriteTwitchPlaylist(r.body.toString('utf8'), streamUrl, login, quality));
+    } catch (e) {
+      return res.status(502).type('text').send(`Playlist fetch failed: ${String(e.message || e)}`);
+    }
+  }
+
+  /* --- legacy hls mode: streamlink + ffmpeg transcode to disk --- */
   const sourceKey = twitchLiveSourceKey(login);
   const hash = transcodeHash(sourceKey);
 
@@ -1215,21 +1613,12 @@ function printStartupTips(scheme, tlsInfo) {
   console.log(
     'HLS transcode: install ffmpeg and add to PATH, then add streams as transcode:https://…/playlist.m3u8'
   );
-  if (streamlinkWorks()) {
-    console.log(
-      'Twitch channels: streamlink detected — playback uses HLS (same-origin) for muted autoplay. Set TWITCH_PLAYBACK=iframe in .env to force the official embed instead.'
-    );
-  } else {
-    console.log(
-      'Twitch channels: streamlink not found — using the official Twitch iframe embed.'
-    );
-    console.log(
-      '  Install: https://streamlink.github.io/ or run install-streamlink.bat (Windows). Then restart the server.'
-    );
-    console.log(
-      '  If streamlink.exe is installed but not on PATH, set STREAMLINK_PATH in .env to the full path.'
-    );
-  }
+  const sl = streamlinkWorks();
+  console.log(
+    sl
+      ? 'Twitch channels: pass-through proxy (same-origin HLS, no ffmpeg). Resolves via direct Twitch API with Streamlink as fallback. Quality adapts to each tile size. Set TWITCH_PLAYBACK=iframe for the official embed, or TWITCH_PLAYBACK=hls for the legacy ffmpeg transcode.'
+      : 'Twitch channels: pass-through proxy (same-origin HLS, no ffmpeg, no install needed). Resolves via direct Twitch API (GQL + usher). Quality adapts to each tile size. Set TWITCH_PLAYBACK=iframe for the official embed, or TWITCH_PLAYBACK=hls for the legacy ffmpeg transcode (needs Streamlink + ffmpeg).'
+  );
 }
 
 async function startServer() {

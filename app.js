@@ -706,6 +706,99 @@
     }
   }
 
+  /* --- Twitch pass-through proxy: pick streamlink quality per tile pixel size --- */
+  // Twitch's HLS is already H.264/AAC, so the server proxies it unchanged (no ffmpeg).
+  // To keep 15+ simultaneous tiles from melting the browser decoder, small tiles fetch a
+  // lower variant (360p/480p) and only large tiles fetch 720p60. Thresholds are in CSS px².
+  const TWITCH_PROXY_TIER_360 = 240000; // ~480x500 — small grid tiles
+  const TWITCH_PROXY_TIER_480 = 600000; // ~800x750 — medium tiles
+  // Above 480 tier → 720p60 (or env default if TWITCH_STREAMLINK_QUALITY is set higher).
+
+  function twitchQualityForCell(w, h) {
+    const px = Math.max(0, w | 0) * Math.max(0, h | 0);
+    if (px < TWITCH_PROXY_TIER_360) return '360p30';
+    if (px < TWITCH_PROXY_TIER_480) return '480p30';
+    return '720p60';
+  }
+
+  function twitchProxyPlaybackUrl(login, quality) {
+    const q = encodeURIComponent(quality || '720p60');
+    return `${location.origin}/api/twitch-live/${encodeURIComponent(login)}/playlist.m3u8?q=${q}`;
+  }
+
+  /** Mount HLS into a proxy cell once it has a measurable size (deferred from buildCellForChannel). */
+  function mountTwitchProxyCell(cell, login, ch) {
+    const w = cell.clientWidth;
+    const h = cell.clientHeight;
+    if (w < 2 || h < 2) return false; // not laid out yet — retry on next layout pass
+    const quality = twitchQualityForCell(w, h);
+    const url = twitchProxyPlaybackUrl(login, quality);
+    mountHlsVideoInCell(cell, ch, url, { twitchHls: true });
+    const video = cell.querySelector('video.cell-video');
+    if (video) {
+      video._twitchQuality = quality;
+      video._twitchLogin = login;
+      // The grid IntersectionObserver attaches before this deferred mount runs, so its
+      // initial callback already missed this video. If the cell is off-screen, pause now
+      // to avoid decoding tiles the user can't see (matters at 15+ streams).
+      const r = cell.getBoundingClientRect();
+      const onScreen =
+        r.bottom > -120 && r.top < window.innerHeight + 120 &&
+        r.right > -120 && r.left < window.innerWidth + 120;
+      if (!onScreen) {
+        try {
+          video.pause();
+          if (video._hls && typeof video._hls.stopLoad === 'function') video._hls.stopLoad();
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    return true;
+  }
+
+  /** Re-evaluate quality for already-mounted proxy cells after a layout change.
+   *  Only reloads the HLS source when the tile crossed a quality tier (avoids thrash). */
+  function refreshTwitchProxyQualities() {
+    if (twitchPlayback !== 'proxy') return;
+    const roots = [els.grid, els.gridPriority].filter(Boolean);
+    for (const root of roots) {
+      for (const cell of root.querySelectorAll('.cell')) {
+        const video = cell.querySelector('video.cell-video');
+        if (!video || !video._hls) continue;
+        const want = twitchQualityForCell(cell.clientWidth, cell.clientHeight);
+        if (video._twitchQuality === want) continue;
+        const login = video._twitchLogin;
+        if (!login) continue;
+        video._twitchQuality = want;
+        try {
+          video._hls.loadSource(twitchProxyPlaybackUrl(login, want));
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  }
+
+  /** Mount any proxy cells that were deferred (cell had no size at build time). */
+  function mountPendingTwitchProxyCells() {
+    if (twitchPlayback !== 'proxy') return;
+    const roots = [els.grid, els.gridPriority].filter(Boolean);
+    for (const root of roots) {
+      for (const cell of root.querySelectorAll('.cell')) {
+        const pending = cell._pendingTwitchProxy;
+        if (!pending) continue;
+        if (cell.querySelector('video.cell-video')) {
+          cell._pendingTwitchProxy = null;
+          continue;
+        }
+        if (mountTwitchProxyCell(cell, pending.login, pending.ch)) {
+          cell._pendingTwitchProxy = null;
+        }
+      }
+    }
+  }
+
   function applyTwitchIframePixelSize(wrap, iframe) {
     const r = wrap.getBoundingClientRect();
     const w = Math.max(GRID_MIN_CELL_W, Math.round(r.width));
@@ -1112,6 +1205,7 @@
       els.grid.style.setProperty('--rows', String(Math.max(1, layout.rest.rows)));
       els.grid.classList.toggle('one-col', layout.rest.channels.length === 1);
       clearRestGridSpans();
+      scheduleTwitchProxyRefresh();
       return;
     }
 
@@ -1137,6 +1231,21 @@
     els.grid.style.setProperty('--rows', String(Math.max(1, layout.rows)));
     els.grid.classList.toggle('one-col', layout.n === 1);
     applyBigTileCellSpans(layout.bigKeys, layout.spanW, layout.spanH);
+    scheduleTwitchProxyRefresh();
+  }
+
+  /** After a layout pass, mount deferred proxy cells and re-tier existing ones. */
+  let twitchProxyRefreshTimer = null;
+  function scheduleTwitchProxyRefresh() {
+    if (twitchPlayback !== 'proxy') return;
+    if (twitchProxyRefreshTimer) return;
+    twitchProxyRefreshTimer = window.setTimeout(() => {
+      twitchProxyRefreshTimer = null;
+      requestAnimationFrame(() => {
+        mountPendingTwitchProxyCells();
+        refreshTwitchProxyQualities();
+      });
+    }, 80);
   }
 
   function scheduleLayoutGridToViewport() {
@@ -2210,7 +2319,7 @@
           details.includes('fragLoadError') ||
           typ === 'networkError'
         ) {
-          return 'Twitch HLS: could not load playlist (offline stream, or install streamlink + ffmpeg on the server — see server log).';
+          return 'Twitch HLS: could not load playlist (offline stream, or streamlink not working on the server — see server log).';
         }
         return `Twitch HLS failed: ${details || typ || 'unknown'}.`;
       }
@@ -2289,7 +2398,15 @@
 
     if (t === 'twitch') {
       const login = getTwitchLogin(ch);
-      if (twitchPlayback === 'hls') {
+      if (twitchPlayback === 'proxy') {
+        // Deferred: the cell has no size until the grid lays it out, and the quality tier
+        // depends on that size. Stash the info and mount on the next layout pass.
+        cell._pendingTwitchProxy = { login, ch };
+        const lab = document.createElement('div');
+        lab.className = 'cell-label';
+        lab.textContent = login;
+        cell.appendChild(lab);
+      } else if (twitchPlayback === 'hls') {
         const playbackUrl = `${location.origin}/api/twitch-live/${encodeURIComponent(login)}/playlist.m3u8`;
         mountHlsVideoInCell(cell, ch, playbackUrl, { twitchHls: true });
       } else {
@@ -3018,7 +3135,7 @@
         ...(gridPri ? gridPri.querySelectorAll('.cell') : []),
       ];
       console.log(
-        `[twitchviewer] ${cells.length} grid cell(s). Twitch mode: ${twitchPlayback} (hls = same-origin video via streamlink+ffmpeg; iframe = Twitch embed).`
+        `[twitchviewer] ${cells.length} grid cell(s). Twitch mode: ${twitchPlayback} (proxy = same-origin HLS via streamlink pass-through, quality adapts to tile size; hls = streamlink+ffmpeg transcode; iframe = Twitch embed).`
       );
       cells.forEach((cell, i) => {
         const r = cell.getBoundingClientRect();
@@ -3063,7 +3180,7 @@
       const st = await fetch('/api/status', FETCH_OPTS);
       const j = await st.json();
       apiConfigured = Boolean(j.configured);
-      if (j.twitchPlayback === 'hls' || j.twitchPlayback === 'iframe') {
+      if (j.twitchPlayback === 'proxy' || j.twitchPlayback === 'hls' || j.twitchPlayback === 'iframe') {
         twitchPlayback = j.twitchPlayback;
       }
     } catch {
@@ -3079,7 +3196,7 @@
     schedulePoll();
     scheduleCategoryPoll();
     console.info(
-      `[twitchviewer] Twitch playback: ${twitchPlayback}. Iframe mode uses Twitch.Player (setQuality: ~480p when Priority tiles off, Auto when on). HLS uses streamlink+ffmpeg. Run twitchviewerAutoplayDiagnostics().`
+      `[twitchviewer] Twitch playback: ${twitchPlayback}. proxy = streamlink pass-through (no ffmpeg, quality per tile size); iframe = Twitch.Player (setQuality: ~480p when Priority tiles off, Auto when on); hls = legacy streamlink+ffmpeg transcode. Run twitchviewerAutoplayDiagnostics().`
     );
     window.addEventListener('resize', scheduleLayoutGridToViewport);
     document.addEventListener('fullscreenchange', scheduleLayoutGridToViewport);

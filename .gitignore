@@ -6,3 +6,4 @@ cert/
 .sessions.sqlite
 .hls-transcode/
 .env.example
+AGENTS.md
