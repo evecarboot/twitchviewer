@@ -2329,14 +2329,38 @@
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         if (state.autoplay) video.play().catch(() => {});
       });
+      // Log pause events for diagnostics — the user reports random pauses with no
+      // console errors, so we need to see what state the video/hls is in when it pauses.
+      if (twitchHls) {
+        video.addEventListener('pause', () => {
+          const r = cell.getBoundingClientRect();
+          const onScreen = r.bottom > 0 && r.top < window.innerHeight && r.right > 0 && r.left < window.innerWidth;
+          console.log(
+            `[twitchviewer] PAUSE ch=${video._twitchLogin || '?'} q=${video._twitchQuality || '?'} ` +
+            `onScreen=${onScreen} autoplay=${state.autoplay} ` +
+            `readyState=${video.readyState} networkState=${video.networkState} ` +
+            `paused=${video.paused} ended=${video.ended} ` +
+            `hlsCurrentLevel=${hls.currentLevel} hlsLoadLevel=${hls.loadLevel} ` +
+            `bufferEnd=${hls.bufferEnd ? hls.bufferEnd.toFixed(1) : '?'}`
+          );
+        });
+        video.addEventListener('play', () => {
+          console.log(`[twitchviewer] PLAY  ch=${video._twitchLogin || '?'} q=${video._twitchQuality || '?'}`);
+        });
+      }
       hls.on(Hls.Events.ERROR, (_, data) => {
+        // Log ALL errors (fatal and non-fatal) for Twitch streams so we can see what's
+        // happening before the video pauses.
+        if (twitchHls) {
+          console.log(
+            `[twitchviewer] HLS ERROR ch=${video._twitchLogin || '?'} ` +
+            `fatal=${data.fatal} type=${data.type} details=${data.details}`
+          );
+        }
         if (!data.fatal) return;
         // hls.js's recommended recovery: network error → startLoad() (reloads playlist,
         // which hits our proxy with a fresh resolve → fresh CDN URLs). Media error →
-        // recoverMediaError() (resets the media element internally). These are the only
-        // two recovery paths the hls.js docs recommend — extra play() calls here can race
-        // with hls.js's own recovery and cause more stalls. MANIFEST_PARSED already calls
-        // play() when the reloaded playlist is ready.
+        // recoverMediaError() (resets the media element internally).
         if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
           try { hls.startLoad(); } catch { /* ignore */ }
           return;
