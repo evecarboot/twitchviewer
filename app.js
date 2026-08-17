@@ -727,37 +727,6 @@
     return `${location.origin}/api/twitch-live/${encodeURIComponent(login)}/playlist.m3u8?q=${q}`;
   }
 
-  /** Mount HLS into a proxy cell once it has a measurable size (deferred from buildCellForChannel). */
-  function mountTwitchProxyCell(cell, login, ch) {
-    const w = cell.clientWidth;
-    const h = cell.clientHeight;
-    if (w < 2 || h < 2) return false; // not laid out yet — retry on next layout pass
-    const quality = twitchQualityForCell(w, h);
-    const url = twitchProxyPlaybackUrl(login, quality);
-    mountHlsVideoInCell(cell, ch, url, { twitchHls: true });
-    const video = cell.querySelector('video.cell-video');
-    if (video) {
-      video._twitchQuality = quality;
-      video._twitchLogin = login;
-      // The grid IntersectionObserver attaches before this deferred mount runs, so its
-      // initial callback already missed this video. If the cell is off-screen, pause now
-      // to avoid decoding tiles the user can't see (matters at 15+ streams).
-      const r = cell.getBoundingClientRect();
-      const onScreen =
-        r.bottom > -120 && r.top < window.innerHeight + 120 &&
-        r.right > -120 && r.left < window.innerWidth + 120;
-      if (!onScreen) {
-        try {
-          video.pause();
-          if (video._hls && typeof video._hls.stopLoad === 'function') video._hls.stopLoad();
-        } catch {
-          /* ignore */
-        }
-      }
-    }
-    return true;
-  }
-
   /** Re-evaluate quality for already-mounted proxy cells after a layout change.
    *  Only reloads the HLS source when the tile crossed a quality tier (avoids thrash). */
   function refreshTwitchProxyQualities() {
@@ -776,25 +745,6 @@
           video._hls.loadSource(twitchProxyPlaybackUrl(login, want));
         } catch {
           /* ignore */
-        }
-      }
-    }
-  }
-
-  /** Mount any proxy cells that were deferred (cell had no size at build time). */
-  function mountPendingTwitchProxyCells() {
-    if (twitchPlayback !== 'proxy') return;
-    const roots = [els.grid, els.gridPriority].filter(Boolean);
-    for (const root of roots) {
-      for (const cell of root.querySelectorAll('.cell')) {
-        const pending = cell._pendingTwitchProxy;
-        if (!pending) continue;
-        if (cell.querySelector('video.cell-video')) {
-          cell._pendingTwitchProxy = null;
-          continue;
-        }
-        if (mountTwitchProxyCell(cell, pending.login, pending.ch)) {
-          cell._pendingTwitchProxy = null;
         }
       }
     }
@@ -1235,7 +1185,7 @@
     scheduleTwitchProxyRefresh();
   }
 
-  /** After a layout pass, mount deferred proxy cells and re-tier existing ones. */
+  /** After a layout pass, re-tier proxy cells to match their new pixel size. */
   let twitchProxyRefreshTimer = null;
   function scheduleTwitchProxyRefresh() {
     if (twitchPlayback !== 'proxy') return;
@@ -1243,7 +1193,6 @@
     twitchProxyRefreshTimer = window.setTimeout(() => {
       twitchProxyRefreshTimer = null;
       requestAnimationFrame(() => {
-        mountPendingTwitchProxyCells();
         refreshTwitchProxyQualities();
       });
     }, 80);
@@ -2437,9 +2386,18 @@
     if (t === 'twitch') {
       const login = getTwitchLogin(ch);
       if (twitchPlayback === 'proxy') {
-        // Deferred: the cell has no size until the grid lays it out, and the quality tier
-        // depends on that size. Stash the info and mount on the next layout pass.
-        cell._pendingTwitchProxy = { login, ch };
+        // Mount immediately with a conservative default quality (360p30). The cell may not
+        // have a size yet (CSS grid hasn't reflowed), so we can't pick the right quality tier
+        // — but a black screen is worse than starting at 360p and upgrading later.
+        // refreshTwitchProxyQualities() runs after layout settles and reloads at the correct
+        // quality for the tile's actual pixel size.
+        const url = twitchProxyPlaybackUrl(login, '360p30');
+        mountHlsVideoInCell(cell, ch, url, { twitchHls: true });
+        const video = cell.querySelector('video.cell-video');
+        if (video) {
+          video._twitchQuality = '360p30';
+          video._twitchLogin = login;
+        }
         const lab = document.createElement('div');
         lab.className = 'cell-label';
         lab.textContent = login;
