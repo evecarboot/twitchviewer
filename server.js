@@ -1029,25 +1029,31 @@ function sanitizeProxyQuality(q) {
   return TWITCH_PROXY_QUALITIES.has(s) ? s : streamlinkQualityArg();
 }
 
-/* --- Direct API: GQL playback token (cached per login) --- */
-/** @type {Map<string, {token: {value: string, signature: string}, ts: number}>} */
+/* --- Direct API: GQL playback token (cached per login+playerType) --- */
+/** @type {Map<string, {token: {value: string, signature: string}, ts: number}>} key = `${login}|${playerType}` */
 const twitchTokenCache = new Map();
 /** Tokens are cheap to fetch (one GQL POST); cache briefly to avoid rate limits. */
 const TWITCH_TOKEN_TTL_MS = 2 * 60 * 1000;
 
-async function fetchTwitchPlaybackToken(login) {
+/** Fetch a Twitch playback token via GQL. playerType controls which "player" Twitch thinks
+ *  is requesting the stream — different types get different ad insertion policies.
+ *  'embed' = source quality (may have ads), 'autoplay' = 360p only (usually ad-free),
+ *  'popout' = source quality (sometimes ad-free). Used by the ad-blocking fallback. */
+async function fetchTwitchPlaybackToken(login, playerType = 'embed') {
+  const cacheKey = `${login}|${playerType}`;
   const now = Date.now();
-  const cached = twitchTokenCache.get(login);
+  const cached = twitchTokenCache.get(cacheKey);
   if (cached && now - cached.ts < TWITCH_TOKEN_TTL_MS) return cached.token;
 
+  // 'autoplay' uses platform 'android' (matches what vaft/TwitchAdSolutions does —
+  // the android player type reliably gets ad-free 360p streams).
+  const platform = playerType === 'autoplay' ? 'android' : 'web';
   const query = {
     operationName: 'PlaybackAccessToken',
     query:
-      'query PlaybackAccessToken($login: String!) { streamPlaybackAccessToken(channelName: $login, params: {platform: "web", playerBackend: "mediaplayer", playerType: "embed"}) { value signature } }',
+      `query PlaybackAccessToken($login: String!) { streamPlaybackAccessToken(channelName: $login, params: {platform: "${platform}", playerBackend: "mediaplayer", playerType: "${playerType}"}) { value signature } }`,
     variables: { login },
   };
-  const r = await fetchBuffer('https://gql.twitch.tv/gql', 0);
-  // fetchBuffer does a GET — we need POST for GQL. Use a dedicated POST helper instead.
   const postRes = await new Promise((resolve, reject) => {
     const body = JSON.stringify(query);
     const req = https.request(
@@ -1084,7 +1090,7 @@ async function fetchTwitchPlaybackToken(login) {
     throw new Error(`Twitch GQL: no playback token (${errs})`);
   }
   const token = { value: spat.value, signature: spat.signature };
-  twitchTokenCache.set(login, { token, ts: now });
+  twitchTokenCache.set(cacheKey, { token, ts: now });
   return token;
 }
 
@@ -1151,10 +1157,11 @@ function pickTwitchVariant(masterText, quality) {
 
 /** Resolve a Twitch CDN media-playlist URL via the direct API (no Streamlink needed).
  *  Returns a URL string or throws on error. Handles token expiry by invalidating the
- *  token cache and retrying once if the usher call fails with a non-404 error. */
-async function resolveTwitchDirectApi(login, quality) {
+ *  token cache and retrying once if the usher call fails with a non-404 error.
+ *  playerType controls which player Twitch thinks is requesting (for ad-blocking). */
+async function resolveTwitchDirectApi(login, quality, playerType = 'embed') {
   for (let attempt = 0; attempt < 2; attempt++) {
-    const token = await fetchTwitchPlaybackToken(login);
+    const token = await fetchTwitchPlaybackToken(login, playerType);
     const params = new URLSearchParams({
       allow_source: 'true',
       allow_audio_only: 'true',
@@ -1180,12 +1187,55 @@ async function resolveTwitchDirectApi(login, quality) {
     }
     // Non-200, non-404 (e.g. 403) — likely an expired token. Invalidate and retry once.
     if (attempt === 0) {
-      twitchTokenCache.delete(login);
+      twitchTokenCache.delete(`${login}|${playerType}`);
       continue;
     }
     throw new Error(`Twitch usher returned ${r.status}`);
   }
   throw new Error(`Twitch usher failed for "${login}" after retry.`);
+}
+
+/* --- Ad blocking (vaft-style) ---
+ * Twitch "stitches" ads into HLS playlists via #EXT-X-DATERANGE tags containing the
+ * string "stitched". When detected, we try alternate playerType values to get an
+ * ad-free stream (same approach as pixeltris/TwitchAdSolutions vaft script).
+ * Different player types get different ad insertion policies from Twitch's backend.
+ * 'embed' and 'popout' keep source quality; 'autoplay' is 360p only but reliably
+ * ad-free. We try them in order and serve the first ad-free playlist we find. */
+const TWITCH_AD_SIGNIFIER = 'stitched';
+const TWITCH_AD_BLOCK_PLAYER_TYPES = ['embed', 'popout', 'autoplay'];
+
+/** Check if a media playlist contains stitched ad markers. */
+function twitchPlaylistHasAds(playlistText) {
+  return playlistText.includes(TWITCH_AD_SIGNIFIER);
+}
+
+/** Fetch a media playlist for (login, quality) using a specific playerType.
+ *  Returns the playlist text, or null on error. */
+async function fetchMediaPlaylistForPlayerType(login, quality, playerType) {
+  try {
+    const variantUrl = await resolveTwitchDirectApi(login, quality, playerType);
+    const r = await fetchBuffer(variantUrl);
+    if (r.status === 200) return r.body.toString('utf8');
+  } catch {
+    /* ignore — try next player type */
+  }
+  return null;
+}
+
+/** Given a media playlist that contains ads, try alternate player types to find an
+ *  ad-free version at the same quality. Returns the ad-free playlist text, or the
+ *  original playlist if no ad-free version is found. */
+async function resolveAdFreeMediaPlaylist(login, quality, originalPlaylist) {
+  for (const playerType of TWITCH_AD_BLOCK_PLAYER_TYPES) {
+    const playlist = await fetchMediaPlaylistForPlayerType(login, quality, playerType);
+    if (playlist && !twitchPlaylistHasAds(playlist)) {
+      console.log(`[twitchviewer] Ad block: found ad-free stream for ${login} via playerType=${playerType}`);
+      return playlist;
+    }
+  }
+  console.log(`[twitchviewer] Ad block: no ad-free stream found for ${login}, serving original playlist`);
+  return originalPlaylist;
 }
 
 /** Resolve a Twitch CDN media-playlist URL. Tries the direct API first (no install needed),
@@ -1338,7 +1388,9 @@ app.get('/api/twitch-live/:login/seg/:enc', async (req, res) => {
       // Segment URL expired — invalidate everything so the next playlist poll re-resolves
       // with a fresh token + CDN URL + fresh segment URLs.
       invalidateTwitchProxy(login, quality);
-      twitchTokenCache.delete(login);
+      for (const pt of ['embed', 'popout', 'autoplay']) {
+        twitchTokenCache.delete(`${login}|${pt}`);
+      }
       return res.status(503).type('text').send('Segment URL expired — playlist will reload.');
     }
     if (probe.status !== 200) {
@@ -1349,7 +1401,9 @@ app.get('/api/twitch-live/:login/seg/:enc', async (req, res) => {
     res.send(probe.body);
   } catch {
     invalidateTwitchProxy(login, quality);
-    twitchTokenCache.delete(login);
+    for (const pt of ['embed', 'popout', 'autoplay']) {
+      twitchTokenCache.delete(`${login}|${pt}`);
+    }
     if (!res.headersSent) res.status(502).type('text').send('Segment fetch failed');
   }
 });
@@ -1392,28 +1446,45 @@ app.get('/api/twitch-live/:login/:file', async (req, res) => {
       return res.status(503).type('text').send(String(e.message));
     }
     try {
-      const r = await fetchBuffer(streamUrl);
+      let r = await fetchBuffer(streamUrl);
       if (r.status === 403 || r.status === 404) {
         // CDN URL expired — invalidate everything (token might be stale too) and re-resolve.
         invalidateTwitchProxy(login, quality);
-        twitchTokenCache.delete(login);
+        for (const pt of ['embed', 'popout', 'autoplay']) {
+          twitchTokenCache.delete(`${login}|${pt}`);
+        }
         try {
           streamUrl = await resolveTwitchProxyUrl(login, quality);
         } catch (e) {
           return res.status(503).type('text').send(String(e.message));
         }
-        const r2 = await fetchBuffer(streamUrl);
-        if (r2.status !== 200) {
-          return res.status(502).type('text').send(`Upstream playlist ${r2.status}`);
+        r = await fetchBuffer(streamUrl);
+        if (r.status !== 200) {
+          return res.status(502).type('text').send(`Upstream playlist ${r.status}`);
         }
-        res.type('application/vnd.apple.mpegurl');
-        return res.send(rewriteTwitchPlaylist(r2.body.toString('utf8'), streamUrl, login, quality));
       }
       if (r.status !== 200) {
         return res.status(502).type('text').send(`Upstream playlist ${r.status}`);
       }
+
+      // Ad blocking: check the media playlist for stitched ad markers. If found,
+      // try alternate player types to get an ad-free playlist (vaft-style).
+      let playlistText = r.body.toString('utf8');
+      let rewriteBaseUrl = streamUrl;
+      if (twitchPlaylistHasAds(playlistText)) {
+        console.log(`[twitchviewer] Ad block: detected ads in playlist for ${login} (quality: ${quality})`);
+        const adFree = await resolveAdFreeMediaPlaylist(login, quality, playlistText);
+        if (adFree !== playlistText) {
+          playlistText = adFree;
+          // The ad-free playlist came from a different CDN URL — we need to use that
+          // URL as the base for segment rewriting. Re-resolve to get the current URL.
+          // (The ad-free playlist's segment URLs are already absolute, so the base
+          // only matters for resolving any relative URLs — which Twitch doesn't use.)
+        }
+      }
+
       res.type('application/vnd.apple.mpegurl');
-      return res.send(rewriteTwitchPlaylist(r.body.toString('utf8'), streamUrl, login, quality));
+      return res.send(rewriteTwitchPlaylist(playlistText, rewriteBaseUrl, login, quality));
     } catch (e) {
       return res.status(502).type('text').send(`Playlist fetch failed: ${String(e.message || e)}`);
     }
