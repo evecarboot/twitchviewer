@@ -16,10 +16,10 @@ if errorlevel 1 (
 
 echo.
 echo Starting the viewer...
-start "Twitch viewer" cmd /k "cd /d %~dp0 && node server.js"
-timeout /t 2 /nobreak >nul
+echo The browser will open automatically in a few seconds.
+echo Close this window to stop the server.
 start "" "https://127.0.0.1:3000/"
-exit /b 0
+node server.js
 
 :EnsureNode
 where node >nul 2>nul
