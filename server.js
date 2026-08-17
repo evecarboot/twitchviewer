@@ -1043,7 +1043,7 @@ async function fetchTwitchPlaybackToken(login) {
   const query = {
     operationName: 'PlaybackAccessToken',
     query:
-      'query PlaybackAccessToken($login: String!) { streamPlaybackAccessToken(channelName: $login, params: {platform: "web", playerBackend: "mediaplayer", playerType: "site"}) { value signature } }',
+      'query PlaybackAccessToken($login: String!) { streamPlaybackAccessToken(channelName: $login, params: {platform: "web", playerBackend: "mediaplayer", playerType: "embed"}) { value signature } }',
     variables: { login },
   };
   const r = await fetchBuffer('https://gql.twitch.tv/gql', 0);
