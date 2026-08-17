@@ -2357,6 +2357,23 @@
             `fatal=${data.fatal} type=${data.type} details=${data.details}`
           );
         }
+        // Non-fatal buffer stall: the browser auto-pauses when the buffer underruns.
+        // hls.js refills the buffer but does NOT call video.play() — so the video stays
+        // paused. Wait for hls.js to append new data, then resume playback.
+        if (!data.fatal && twitchHls && data.details === 'bufferStalledError') {
+          if (state.autoplay) {
+            const resumeOnBuffer = () => {
+              if (!video.isConnected) return;
+              if (video.paused && !video.ended && state.autoplay) {
+                video.play().catch(() => {});
+                console.log(`[twitchviewer] RESUME after stall ch=${video._twitchLogin || '?'}`);
+              }
+            };
+            // Give hls.js 2s to append new segments, then resume.
+            setTimeout(resumeOnBuffer, 2000);
+          }
+          return;
+        }
         if (!data.fatal) return;
         // hls.js's recommended recovery: network error → startLoad() (reloads playlist,
         // which hits our proxy with a fresh resolve → fresh CDN URLs). Media error →
