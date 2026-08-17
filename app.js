@@ -2330,6 +2330,17 @@
         if (state.autoplay) video.play().catch(() => {});
       });
       hls.on(Hls.Events.ERROR, (_, data) => {
+        // Non-fatal buffer stalls: hls.js can stall waiting for segments (e.g. during CDN
+        // URL rotation) without declaring a fatal error. Nudge it to reload the playlist.
+        if (!data.fatal && twitchHls && data.details === 'bufferStalledError') {
+          try {
+            hls.startLoad();
+            if (state.autoplay) video.play().catch(() => {});
+          } catch {
+            /* ignore */
+          }
+          return;
+        }
         if (!data.fatal) return;
         // Attempt recovery before showing an error. Twitch CDN URLs expire periodically;
         // this manifests as network errors (fragment/playlist load failures). startLoad()
@@ -2337,6 +2348,9 @@
         if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
           try {
             hls.startLoad();
+            // startLoad reloads the manifest but doesn't resume playback — the video stays
+            // paused on the last frame. Resume explicitly (muted autoplay is always allowed).
+            if (state.autoplay) video.play().catch(() => {});
           } catch {
             /* ignore */
           }
@@ -2347,6 +2361,7 @@
         if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
           try {
             hls.recoverMediaError();
+            if (state.autoplay) video.play().catch(() => {});
           } catch {
             /* ignore */
           }
@@ -2770,6 +2785,42 @@
     }
   }
 
+  /** Watchdog: every 15s, check for stuck/paused Twitch proxy videos that should be playing.
+   *  Catches cases where hls.js stalls silently (no fatal error fired) or the video paused
+   *  during CDN URL rotation and never resumed. Only nudges on-screen, autoplay-enabled tiles. */
+  let stuckWatchdogTimer = null;
+  function startStuckWatchdog() {
+    if (stuckWatchdogTimer) clearInterval(stuckWatchdogTimer);
+    stuckWatchdogTimer = setInterval(() => {
+      if (twitchPlayback !== 'proxy' || !state.autoplay) return;
+      const roots = [els.grid, els.gridPriority].filter(Boolean);
+      for (const root of roots) {
+        for (const cell of root.querySelectorAll('.cell')) {
+          const video = cell.querySelector('video.cell-video');
+          if (!video || !video._hls || video._twitchLogin === undefined) continue;
+          // Only nudge on-screen tiles (off-screen ones are intentionally paused by the
+          // IntersectionObserver — don't fight it).
+          const r = cell.getBoundingClientRect();
+          const onScreen =
+            r.bottom > 0 && r.top < window.innerHeight &&
+            r.right > 0 && r.left < window.innerWidth;
+          if (!onScreen) continue;
+          if (video.paused && !video.ended) {
+            // Stuck paused — reload the HLS source (forces a fresh playlist resolve) and play.
+            const login = video._twitchLogin;
+            const quality = video._twitchQuality || '360p30';
+            try {
+              video._hls.loadSource(twitchProxyPlaybackUrl(login, quality));
+              video.play().catch(() => {});
+            } catch {
+              /* ignore */
+            }
+          }
+        }
+      }
+    }, 15000);
+  }
+
   async function ensureTranscodeHashes() {
     let changed = false;
     for (const ch of state.channels) {
@@ -3191,6 +3242,7 @@
     fullRender();
     schedulePoll();
     scheduleCategoryPoll();
+    startStuckWatchdog();
     console.info(
       `[twitchviewer] Twitch playback: ${twitchPlayback}. proxy = streamlink pass-through (no ffmpeg, quality per tile size); iframe = Twitch.Player (setQuality: ~480p when Priority tiles off, Auto when on); hls = legacy streamlink+ffmpeg transcode. Run twitchviewerAutoplayDiagnostics().`
     );
