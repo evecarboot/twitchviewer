@@ -2351,9 +2351,6 @@
         // With this disabled, 4+ streams do all demux work on the main thread
         // and compete with rendering → high CPU and jank.
         enableWorker: true,
-        // Reuse the worker for MSE buffer append ops too (less main-thread work).
-        // (hls.js default is already true; kept explicit for clarity.)
-        // workerPath defaults to the bundled worker in hls.min.js.
         ...(twitchHls
           ? {
               maxBufferLength: 30,
@@ -2362,6 +2359,18 @@
               liveSyncDurationCount: 4,
               liveMaxLatencyDurationCount: 12,
               maxLiveSyncPlaybackRate: 1.5,
+              // Twitch CDN URLs expire after ~1-2 min. When a segment fetch fails (503 from
+              // our proxy), hls.js retries the same URL. With the default 6 retries it gives
+              // up in ~30s and declares a fatal error — killing the tile. Bump retries so
+              // it survives until the playlist reloads with fresh segment URLs (the server
+              // invalidates its cache on 403/404, so the next playlist poll re-resolves).
+              fragLoadingMaxRetry: 20,
+              fragLoadingRetryDelay: 500,
+              fragLoadingMaxRetryTimeout: 8000,
+              manifestLoadingMaxRetry: 8,
+              manifestLoadingRetryDelay: 500,
+              levelLoadingMaxRetry: 8,
+              levelLoadingRetryDelay: 500,
             }
           : {}),
       });
@@ -2372,7 +2381,29 @@
         if (state.autoplay) video.play().catch(() => {});
       });
       hls.on(Hls.Events.ERROR, (_, data) => {
-        if (data.fatal) fail(formatHlsFatalError(data));
+        if (!data.fatal) return;
+        // Attempt recovery before showing an error. Twitch CDN URLs expire periodically;
+        // this manifests as network errors (fragment/playlist load failures). startLoad()
+        // reloads the playlist, which hits our proxy with a fresh resolve → fresh segments.
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+          try {
+            hls.startLoad();
+          } catch {
+            /* ignore */
+          }
+          return;
+        }
+        // Media errors (decode glitches, buffer corruption) can often be recovered by
+        // resetting the media element internally without a full reload.
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+          try {
+            hls.recoverMediaError();
+          } catch {
+            /* ignore */
+          }
+          return;
+        }
+        fail(formatHlsFatalError(data));
       });
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
       video.src = playbackUrl;

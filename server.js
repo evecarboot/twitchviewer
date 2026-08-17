@@ -1015,8 +1015,10 @@ const TWITCH_WEB_CLIENT_ID = 'kimne78kx3ncx6brgo4mv6wki5h1ko';
 
 /** @type {Map<string, {url: string, promise: Promise<string>|null, ts: number}>} key = `${login}|${quality}` */
 const twitchProxyCache = new Map();
-/** Re-resolve periodically so CDN URL expiry (403/404) doesn't strand a tile. */
-const TWITCH_PROXY_TTL_MS = 4 * 60 * 1000;
+/** Re-resolve frequently so segment URLs embedded in the playlist don't expire before the
+ *  cache does. Twitch CDN segment URLs are short-lived (~1-2 min); caching the CDN URL for
+ *  30s means hls.js gets fresh segment URLs on every other playlist poll. */
+const TWITCH_PROXY_TTL_MS = 30 * 1000;
 /** Whitelist of quality names the client is allowed to request via ?q=. */
 const TWITCH_PROXY_QUALITIES = new Set([
   '160p', '360p30', '360p', '480p30', '480p', '720p60', '720p30', '720p', 'best',
@@ -1030,7 +1032,8 @@ function sanitizeProxyQuality(q) {
 /* --- Direct API: GQL playback token (cached per login) --- */
 /** @type {Map<string, {token: {value: string, signature: string}, ts: number}>} */
 const twitchTokenCache = new Map();
-const TWITCH_TOKEN_TTL_MS = 5 * 60 * 1000;
+/** Tokens are cheap to fetch (one GQL POST); cache briefly to avoid rate limits. */
+const TWITCH_TOKEN_TTL_MS = 2 * 60 * 1000;
 
 async function fetchTwitchPlaybackToken(login) {
   const now = Date.now();
@@ -1147,32 +1150,42 @@ function pickTwitchVariant(masterText, quality) {
 }
 
 /** Resolve a Twitch CDN media-playlist URL via the direct API (no Streamlink needed).
- *  Returns a URL string or throws on error. */
+ *  Returns a URL string or throws on error. Handles token expiry by invalidating the
+ *  token cache and retrying once if the usher call fails with a non-404 error. */
 async function resolveTwitchDirectApi(login, quality) {
-  const token = await fetchTwitchPlaybackToken(login);
-  const params = new URLSearchParams({
-    allow_source: 'true',
-    allow_audio_only: 'true',
-    player: 'twitchweb',
-    playlist_include_framerate: 'true',
-    supported_codecs: 'avc1',
-    token: token.value,
-    sig: token.signature,
-  });
-  const usherUrl = `https://usher.ttvnw.net/api/channel/hls/${encodeURIComponent(login)}.m3u8?${params}`;
-  const r = await fetchBuffer(usherUrl);
-  if (r.status === 404) {
-    throw new Error(`Twitch: channel "${login}" is offline or does not exist.`);
-  }
-  if (r.status !== 200) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const token = await fetchTwitchPlaybackToken(login);
+    const params = new URLSearchParams({
+      allow_source: 'true',
+      allow_audio_only: 'true',
+      player: 'twitchweb',
+      playlist_include_framerate: 'true',
+      supported_codecs: 'avc1',
+      token: token.value,
+      sig: token.signature,
+    });
+    const usherUrl = `https://usher.ttvnw.net/api/channel/hls/${encodeURIComponent(login)}.m3u8?${params}`;
+    const r = await fetchBuffer(usherUrl);
+    if (r.status === 404) {
+      // Channel is genuinely offline — not a token issue, don't retry.
+      throw new Error(`Twitch: channel "${login}" is offline or does not exist.`);
+    }
+    if (r.status === 200) {
+      const masterText = r.body.toString('utf8');
+      const variantUrl = pickTwitchVariant(masterText, quality);
+      if (!variantUrl) {
+        throw new Error(`Twitch: no playable stream variant for "${login}" (quality: ${quality}).`);
+      }
+      return variantUrl;
+    }
+    // Non-200, non-404 (e.g. 403) — likely an expired token. Invalidate and retry once.
+    if (attempt === 0) {
+      twitchTokenCache.delete(login);
+      continue;
+    }
     throw new Error(`Twitch usher returned ${r.status}`);
   }
-  const masterText = r.body.toString('utf8');
-  const variantUrl = pickTwitchVariant(masterText, quality);
-  if (!variantUrl) {
-    throw new Error(`Twitch: no playable stream variant for "${login}" (quality: ${quality}).`);
-  }
-  return variantUrl;
+  throw new Error(`Twitch usher failed for "${login}" after retry.`);
 }
 
 /** Resolve a Twitch CDN media-playlist URL. Tries the direct API first (no install needed),
@@ -1305,8 +1318,9 @@ function rewriteTwitchPlaylist(playlistText, baseUrl, login, quality) {
 }
 
 /** Proxy a segment: decode the encoded absolute URL and pipe it through.
- *  On 403/404 (CDN URL expired), invalidate the playlist cache so the next playlist poll
- *  re-resolves via streamlink; return 503 so hls.js reloads the playlist. */
+ *  On 403/404 (CDN URL expired), invalidate the playlist + token caches so the next playlist
+ *  poll re-resolves with a fresh CDN URL; return 503 so hls.js treats it as a fragment error
+ *  and (with the client-side error recovery) reloads the playlist. */
 app.get('/api/twitch-live/:login/seg/:enc', async (req, res) => {
   const login = normalizeTwitchLoginParam(req.params.login);
   if (!login) return res.status(400).type('text').send('Invalid login');
@@ -1318,22 +1332,24 @@ app.get('/api/twitch-live/:login/seg/:enc', async (req, res) => {
   } catch {
     return res.status(400).type('text').send('Bad segment reference');
   }
-  // Probe with a HEAD-ish GET via fetchBuffer to detect expiry cheaply, then pipe on success.
   try {
     const probe = await fetchBuffer(segUrl);
     if (probe.status === 403 || probe.status === 404) {
+      // Segment URL expired — invalidate everything so the next playlist poll re-resolves
+      // with a fresh token + CDN URL + fresh segment URLs.
       invalidateTwitchProxy(login, quality);
+      twitchTokenCache.delete(login);
       return res.status(503).type('text').send('Segment URL expired — playlist will reload.');
     }
     if (probe.status !== 200) {
       return res.status(502).type('text').send(`Upstream ${probe.status}`);
     }
-    // Serve the already-fetched buffer (segments are small, typically <2MB).
     const ct = probe.headers['content-type'] || 'video/mp2t';
     res.type(ct);
     res.send(probe.body);
   } catch {
     invalidateTwitchProxy(login, quality);
+    twitchTokenCache.delete(login);
     if (!res.headersSent) res.status(502).type('text').send('Segment fetch failed');
   }
 });
@@ -1378,8 +1394,9 @@ app.get('/api/twitch-live/:login/:file', async (req, res) => {
     try {
       const r = await fetchBuffer(streamUrl);
       if (r.status === 403 || r.status === 404) {
-        // CDN URL expired — invalidate and re-resolve once.
+        // CDN URL expired — invalidate everything (token might be stale too) and re-resolve.
         invalidateTwitchProxy(login, quality);
+        twitchTokenCache.delete(login);
         try {
           streamUrl = await resolveTwitchProxyUrl(login, quality);
         } catch (e) {
