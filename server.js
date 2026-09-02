@@ -330,6 +330,7 @@ app.post('/api/points/watch', (req, res) => {
       .filter((l) => typeof l === 'string' && l.trim())
       .map((l) => l.trim().toLowerCase())
   );
+  console.info(`[points] Watch list updated: ${pointsWatchLogins.size} channels (${[...pointsWatchLogins].slice(0, 5).join(', ')}${pointsWatchLogins.size > 5 ? '…' : ''})`);
   res.json({ watching: [...pointsWatchLogins] });
 });
 
@@ -1193,11 +1194,55 @@ async function fetchTwitchPlaybackToken(login, playerType = 'embed') {
  *
  * Only bonus points (free claims) are auto-collected. We do NOT auto-redeem
  * rewards (spending points on channel-specific rewards) — that would be
- * destructive and channel-specific. */
+ * destructive and channel-specific.
+ *
+ * GQL operations use Twitch's persisted-query system (sha256Hash) rather than
+ * raw query strings — this is what Twitch's own clients send, and it's more
+ * stable. The hashes are defined as constants below so they can be updated
+ * easily when Twitch changes them. */
 
 /** Twitch's Android TV client_id — used for the device code flow because GQL
  *  only accepts tokens issued by Twitch's own clients, not developer apps. */
 const TWITCH_ANDROID_CLIENT_ID = 'kd1unb4b3q4t58fwlpcbzcbnm76a8fp';
+
+/* --- Persisted GQL operation hashes ---
+ * These are Twitch's internal persisted-query hashes. If Twitch changes their
+ * GQL schema, these hashes may need updating. Source: TwitchChannelPointsMiner
+ * (Tkd-Alex/Twitch-Channel-Points-Miner-v2, master branch). */
+const GQL_HASH_CHANNEL_POINTS_CONTEXT = '9988086babc615a918a1e9a722ff41d98847acac822645209ac7379eecb27152';
+const GQL_HASH_CLAIM_COMMUNITY_POINTS = '46aaeebe02c99afdf4fc97c7c0cba964124bf6b0af229395f1f6d1feed05b3d0';
+
+/** Build a persisted-query GQL operation object. */
+function gqlPersistedOp(operationName, sha256Hash, variables) {
+  return {
+    operationName,
+    variables,
+    extensions: {
+      persistedQuery: { version: 1, sha256Hash },
+    },
+  };
+}
+
+/** Generate a random hex string of the given length (for device IDs). */
+function randomHexId(length) {
+  const bytes = crypto.randomBytes(Math.ceil(length / 2));
+  return bytes.toString('hex').slice(0, length);
+}
+
+/* --- First-party device identifiers ---
+ * Twitch's web/TV clients send persistent device + session IDs with GQL calls.
+ * We generate and persist these to mimic a real first-party client, which helps
+ * avoid Twitch flagging GQL requests as suspicious. */
+const pointsDeviceIdPath = path.join(sessionSqliteDir, 'points-device-id.txt');
+let pointsDeviceId = (() => {
+  try { return fs.readFileSync(pointsDeviceIdPath, 'utf8').trim(); } catch { return null; }
+})();
+if (!pointsDeviceId) {
+  pointsDeviceId = randomHexId(32);
+  try { fs.writeFileSync(pointsDeviceIdPath, pointsDeviceId); } catch { /* ignore */ }
+}
+/** Per-poll session ID (regenerated each poll cycle, like Twitch's web client). */
+let pointsClientSessionId = randomHexId(16);
 
 /** Path to the persisted points token (JSON file in the app data directory). */
 const pointsTokenPath = path.join(sessionSqliteDir, 'points-token.json');
@@ -1209,7 +1254,8 @@ function loadPointsToken() {
     const parsed = JSON.parse(raw);
     if (parsed.accessToken && parsed.refreshToken) return parsed;
     return null;
-  } catch {
+  } catch (e) {
+    console.warn(`[points] Could not load token from disk: ${e.message}`);
     return null;
   }
 }
@@ -1219,7 +1265,7 @@ function savePointsToken(token) {
   try {
     fs.writeFileSync(pointsTokenPath, JSON.stringify(token, null, 2));
   } catch (e) {
-    console.warn('[points] Could not save token:', e.message);
+    console.warn(`[points] Could not save token: ${e.message}`);
   }
 }
 
@@ -1236,21 +1282,28 @@ let pointsWatchLogins = new Set();
 let pointsLastPoll = 0;
 
 /** Start the Twitch device code flow. Returns the verification URL + user code
- *  for the user to enter at twitch.tv/activate. */
+ *  for the user to enter at twitch.tv/activate.
+ *
+ *  NOTE: Twitch's DCF is non-standard — it uses `scopes` (plural) instead of
+ *  the RFC 8628 `scope` parameter. Using `scope` silently results in a token
+ *  with no scopes. */
 async function startPointsDeviceFlow() {
   const res = await fetch('https://id.twitch.tv/oauth2/device', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
       client_id: TWITCH_ANDROID_CLIENT_ID,
-      scope: 'user:read:email',
+      scopes: 'user:read:email',
     }),
   });
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`Device code flow failed (${res.status}): ${text}`);
+    throw new Error(`Device code flow failed (${res.status}): ${text.slice(0, 300)}`);
   }
   const data = await res.json();
+  if (!data.device_code || !data.user_code) {
+    throw new Error(`Device code flow returned unexpected response: ${JSON.stringify(data).slice(0, 300)}`);
+  }
   deviceCodeState = {
     deviceCode: data.device_code,
     userCode: data.user_code,
@@ -1296,20 +1349,16 @@ async function pollPointsDeviceFlow() {
   let data;
   try {
     data = JSON.parse(rawBody);
-  } catch {
-    console.warn(`[points] Token endpoint returned non-JSON (${res.status}): ${rawBody.slice(0, 300)}`);
+  } catch (e) {
+    console.warn(`[points] Token endpoint returned non-JSON (${res.status}): ${rawBody.slice(0, 500)}`);
     deviceCodeState = null;
     return { status: 'error', error: 'Twitch returned invalid response' };
   }
 
-  /* Debug: log the full response when it's not a standard pending */
-  const msg = data.message || data.error || '';
-  if (msg !== 'authorization_pending' && msg !== 'slow_down') {
-    console.info(`[points] Token endpoint response (${res.status}): ${rawBody.slice(0, 300)}`);
-  }
-
   /* Twitch's device code flow uses {status, message} instead of the standard
      OAuth {error, error_description} format. Handle both for safety. */
+  const msg = data.message || data.error || '';
+
   if (msg === 'authorization_pending') return { status: 'pending' };
   if (msg === 'slow_down') {
     deviceCodeState.interval += 5000;
@@ -1320,12 +1369,14 @@ async function pollPointsDeviceFlow() {
     return { status: 'expired' };
   }
   if (data.error || (data.status && data.status >= 400 && !data.access_token)) {
+    console.warn(`[points] Device auth error (${res.status}): ${rawBody.slice(0, 500)}`);
     deviceCodeState = null;
     return { status: 'error', error: data.error_description || data.message || data.error || 'Unknown error' };
   }
   if (!data.access_token) {
+    console.warn(`[points] Token endpoint returned no access_token (${res.status}): ${rawBody.slice(0, 500)}`);
     deviceCodeState = null;
-    return { status: 'error', error: `No access token in response: ${rawBody.slice(0, 200)}` };
+    return { status: 'error', error: `No access token in response` };
   }
 
   /* Clear device code state immediately so concurrent polls don't double-link. */
@@ -1343,9 +1394,11 @@ async function pollPointsDeviceFlow() {
     if (userRes.ok) {
       const userBody = await userRes.json();
       login = userBody.data?.[0]?.login || 'unknown';
+    } else {
+      console.warn(`[points] Helix user lookup failed (${userRes.status}) — token is valid but login unknown`);
     }
-  } catch {
-    /* non-critical — we have the token even if we can't resolve the login */
+  } catch (e) {
+    console.warn(`[points] Helix user lookup error: ${e.message} — token is valid but login unknown`);
   }
 
   pointsToken = {
@@ -1357,12 +1410,12 @@ async function pollPointsDeviceFlow() {
     login,
   };
   savePointsToken(pointsToken);
-  deviceCodeState = null;
-  console.info(`[points] Linked Twitch account: ${login}`);
+  console.info(`[points] linked as ${login}`);
   return { status: 'linked', login };
 }
 
-/** Refresh the points token using the refresh token. */
+/** Refresh the points token using the refresh token. Returns the new access
+ *  token string, or null if refresh failed (token cleared, re-link needed). */
 async function refreshPointsToken() {
   if (!pointsToken?.refreshToken) return null;
   try {
@@ -1377,14 +1430,14 @@ async function refreshPointsToken() {
     });
     if (!res.ok) {
       const text = await res.text();
-      console.warn(`[points] Token refresh failed (${res.status}): ${text.slice(0, 200)} — re-link needed`);
+      console.warn(`[points] Token refresh failed (${res.status}): ${text.slice(0, 500)} — re-link needed`);
       pointsToken = null;
       try { fs.unlinkSync(pointsTokenPath); } catch { /* ignore */ }
       return null;
     }
     const data = await res.json();
     if (!data.access_token) {
-      console.warn(`[points] Token refresh returned no access_token — re-link needed`);
+      console.warn(`[points] Token refresh returned no access_token: ${JSON.stringify(data).slice(0, 500)} — re-link needed`);
       pointsToken = null;
       try { fs.unlinkSync(pointsTokenPath); } catch { /* ignore */ }
       return null;
@@ -1397,9 +1450,12 @@ async function refreshPointsToken() {
       login: pointsToken.login,
     };
     savePointsToken(pointsToken);
+    console.info(`[points] Token refreshed for ${pointsToken.login}`);
     return pointsToken.accessToken;
   } catch (e) {
-    console.warn(`[points] Token refresh error: ${e.message}`);
+    console.warn(`[points] Token refresh error: ${e.message} — re-link needed`);
+    pointsToken = null;
+    try { fs.unlinkSync(pointsTokenPath); } catch { /* ignore */ }
     return null;
   }
 }
@@ -1413,12 +1469,12 @@ async function getValidPointsToken() {
   return pointsToken.accessToken;
 }
 
-/** POST a GQL query/mutation using the points token + Android client_id.
- *  Unlike the developer OAuth token, this token is accepted by GQL because
- *  it was issued by Twitch's own client. */
+/** POST a GQL operation using the points token + Android client_id, including
+ *  first-party headers (X-Device-Id, Client-Session-Id) that Twitch's own
+ *  clients send. Returns { status, body } or throws on network error. */
 async function gqlWithPointsToken(queryObj) {
   const token = await getValidPointsToken();
-  if (!token) throw new Error('No points token');
+  if (!token) throw new Error('No points token — re-link needed');
   const body = JSON.stringify(queryObj);
   return new Promise((resolve, reject) => {
     const req = https.request(
@@ -1430,6 +1486,10 @@ async function gqlWithPointsToken(queryObj) {
           Authorization: `OAuth ${token}`,
           'Content-Type': 'application/json',
           'Content-Length': Buffer.byteLength(body),
+          /* First-party headers that Twitch's web/TV clients send with GQL
+             calls. These help avoid Twitch flagging requests as suspicious. */
+          'X-Device-Id': pointsDeviceId,
+          'Client-Session-Id': pointsClientSessionId,
         },
       },
       (resp) => {
@@ -1450,64 +1510,148 @@ async function gqlWithPointsToken(queryObj) {
   });
 }
 
-/** Check all watched channels for available bonus claims and auto-claim them. */
+/** Check all watched channels for available bonus claims and auto-claim them.
+ *  Uses Twitch's persisted GQL operations (ChannelPointsContext + ClaimCommunityPoints)
+ *  with proper operationName, variables, and extensions.persistedQuery. */
 async function pollChannelPoints() {
-  if (pointsWatchLogins.size === 0) return;
+  if (pointsWatchLogins.size === 0) {
+    console.info('[points] Poll skipped — no channels in watch list');
+    return;
+  }
   const token = await getValidPointsToken();
-  if (!token) return;
+  if (!token) {
+    console.warn('[points] Poll skipped — no valid token');
+    return;
+  }
+  /* Regenerate session ID for each poll cycle (like Twitch's web client). */
+  pointsClientSessionId = randomHexId(16);
+  const logins = [...pointsWatchLogins];
+  console.info(`[points] Polling ${logins.length} channels: ${logins.slice(0, 5).join(', ')}${logins.length > 5 ? '…' : ''}`);
 
-  for (const login of pointsWatchLogins) {
+  for (const login of logins) {
     try {
-      /* Query the channel's community points context — returns the channel ID
-         and any available bonus claims (the "+50" buttons). */
-      const queryRes = await gqlWithPointsToken({
-        query: `query { user(login: "${login}") { id channel { self { communityPoints { availableClaims { id } } } } } }`,
-      });
+      /* ChannelPointsContext: persisted query that returns the channel's points
+         context, including any available bonus claim (the "+50" button). */
+      const queryRes = await gqlWithPointsToken(
+        gqlPersistedOp('ChannelPointsContext', GQL_HASH_CHANNEL_POINTS_CONTEXT, {
+          channelLogin: login,
+        })
+      );
+
       if (queryRes.status !== 200) {
+        console.warn(`[points] ${login}: ChannelPointsContext HTTP ${queryRes.status}: ${queryRes.body.slice(0, 500)}`);
         if (queryRes.status === 401) {
-          console.warn('[points] GQL returned 401 — token may be invalid, will refresh on next poll');
+          /* Token may be invalid — try refreshing once, then skip this cycle. */
+          console.warn(`[points] ${login}: 401 — attempting token refresh…`);
+          const refreshed = await refreshPointsToken();
+          if (!refreshed) {
+            console.warn(`[points] ${login}: refresh failed — stopping poll`);
+            return;
+          }
         }
         continue;
       }
-      const j = JSON.parse(queryRes.body);
-      if (j.errors) continue;
-      const user = j.data && j.data.user;
-      if (!user || !user.id) continue;
-      const available =
-        user.channel &&
-        user.channel.self &&
-        user.channel.self.communityPoints &&
-        user.channel.self.communityPoints.availableClaims;
-      if (!available || !available.length) continue;
 
-      const channelId = user.id;
-      for (const claim of available) {
-        const claimRes = await gqlWithPointsToken({
-          query: `mutation { claimCommunityPoints(input: { channelId: "${channelId}", claimId: "${claim.id}" }) { claim { id pointsEarned } } }`,
-        });
-        if (claimRes.status === 200) {
-          const cj = JSON.parse(claimRes.body);
-          if (cj.errors) continue;
-          const earned =
-            cj.data?.claimCommunityPoints?.claim?.pointsEarned || 0;
-          console.info(`[points] ${login}: claimed ${earned} points`);
-          pointsClaims.unshift({ login, pointsEarned: earned, ts: Date.now() });
-          if (pointsClaims.length > 50) pointsClaims.length = 50;
-        }
+      let j;
+      try {
+        j = JSON.parse(queryRes.body);
+      } catch (e) {
+        console.warn(`[points] ${login}: ChannelPointsContext returned non-JSON: ${queryRes.body.slice(0, 500)}`);
+        continue;
       }
-    } catch {
-      /* ignore individual channel errors */
+
+      if (j.errors && j.errors.length) {
+        console.warn(`[points] ${login}: ChannelPointsContext GQL errors: ${j.errors.map((e) => e.message).join('; ')}`);
+        continue;
+      }
+
+      if (!j.data) {
+        console.warn(`[points] ${login}: ChannelPointsContext no data object: ${queryRes.body.slice(0, 500)}`);
+        continue;
+      }
+
+      /* The response structure is: data.community.channel.self.communityPoints
+         (community is an alias for the user query). */
+      const community = j.data.community;
+      if (!community || !community.id) {
+        console.warn(`[points] ${login}: no community/user in GQL response: ${queryRes.body.slice(0, 500)}`);
+        continue;
+      }
+      const channelId = community.id;
+      const cp =
+        community.channel &&
+        community.channel.self &&
+        community.channel.self.communityPoints;
+
+      if (!cp) {
+        /* Channel may not have community points enabled — normal, don't log. */
+        continue;
+      }
+
+      /* availableClaim is a single object (not array) in the current schema. */
+      const claim = cp.availableClaim;
+      if (!claim || !claim.id) {
+        /* No bonus available right now — normal. */
+        continue;
+      }
+
+      console.info(`[points] ${login}: bonus claim ${claim.id} found`);
+      console.info(`[points] ${login}: ClaimCommunityPoints…`);
+
+      /* ClaimCommunityPoints: persisted mutation that claims the bonus. */
+      const claimRes = await gqlWithPointsToken(
+        gqlPersistedOp('ClaimCommunityPoints', GQL_HASH_CLAIM_COMMUNITY_POINTS, {
+          input: { channelID: channelId, claimID: claim.id },
+        })
+      );
+
+      if (claimRes.status !== 200) {
+        console.warn(`[points] ${login}: ClaimCommunityPoints HTTP ${claimRes.status}: ${claimRes.body.slice(0, 500)}`);
+        continue;
+      }
+
+      let cj;
+      try {
+        cj = JSON.parse(claimRes.body);
+      } catch (e) {
+        console.warn(`[points] ${login}: ClaimCommunityPoints returned non-JSON: ${claimRes.body.slice(0, 500)}`);
+        continue;
+      }
+
+      if (cj.errors && cj.errors.length) {
+        console.warn(`[points] ${login}: ClaimCommunityPoints GQL errors: ${cj.errors.map((e) => e.message).join('; ')}`);
+        continue;
+      }
+
+      if (!cj.data || !cj.data.claimCommunityPoints) {
+        console.warn(`[points] ${login}: ClaimCommunityPoints no data object: ${claimRes.body.slice(0, 500)}`);
+        continue;
+      }
+
+      const earned = cj.data.claimCommunityPoints.claim?.pointsEarned || 0;
+      console.info(`[points] ${login}: claimed +${earned}`);
+      pointsClaims.unshift({ login, pointsEarned: earned, ts: Date.now() });
+      if (pointsClaims.length > 50) pointsClaims.length = 50;
+    } catch (e) {
+      /* Log the full exception — do NOT swallow. */
+      console.warn(`[points] ${login}: error during poll: ${e.message || e}`);
+      console.warn(`[points] ${login}: stack: ${e.stack || '(no stack)'}`);
     }
   }
 }
 
-/** Background poller: checks watched channels every 60s for available claims. */
+/** Background poller: checks watched channels every 60s for available claims.
+ *  The interval fires every 15s but each watcher is polled at most once per 60s. */
 setInterval(() => {
   if (pointsWatchLogins.size === 0) return;
   if (Date.now() - pointsLastPoll < 60_000) return;
   if (!pointsToken) return;
   pointsLastPoll = Date.now();
-  pollChannelPoints().catch(() => {});
+  pollChannelPoints().catch((e) => {
+    /* Log the full exception — do NOT swallow. */
+    console.warn(`[points] pollChannelPoints() outer error: ${e.message || e}`);
+    console.warn(`[points] stack: ${e.stack || '(no stack)'}`);
+  });
 }, 15_000);
 
 /** Parse a Twitch master playlist and return the variant URL matching `quality`.
