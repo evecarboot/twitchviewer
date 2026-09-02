@@ -1292,7 +1292,20 @@ async function pollPointsDeviceFlow() {
       grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
     }),
   });
-  const data = await res.json();
+  const rawBody = await res.text();
+  let data;
+  try {
+    data = JSON.parse(rawBody);
+  } catch {
+    console.warn(`[points] Token endpoint returned non-JSON (${res.status}): ${rawBody.slice(0, 300)}`);
+    deviceCodeState = null;
+    return { status: 'error', error: 'Twitch returned invalid response' };
+  }
+
+  /* Debug: log the full response when it's not a standard pending/slow_down */
+  if (data.error !== 'authorization_pending' && data.error !== 'slow_down') {
+    console.info(`[points] Token endpoint response (${res.status}): ${rawBody.slice(0, 300)}`);
+  }
 
   if (data.error === 'authorization_pending') return { status: 'pending' };
   if (data.error === 'slow_down') {
