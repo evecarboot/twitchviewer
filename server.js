@@ -1232,6 +1232,26 @@ async function pollChannelPointsForWatcher(watcher) {
     return;
   }
 
+  /* Diagnostic: validate the token via Helix first. If Helix accepts it but
+     GQL rejects it, the issue is that Twitch's GQL endpoint doesn't accept
+     tokens from our client_id (GQL is an internal API, not a public one). */
+  const clientId = process.env.TWITCH_CLIENT_ID || TWITCH_WEB_CLIENT_ID;
+  try {
+    const helixRes = await fetch('https://api.twitch.tv/helix/users', {
+      headers: { Authorization: `Bearer ${token}`, 'Client-ID': clientId },
+    });
+    if (helixRes.ok) {
+      const helixBody = await helixRes.json();
+      const u = helixBody.data && helixBody.data[0];
+      console.info(`[channel-points] Token valid via Helix (user: ${u ? u.login : '?'}, client_id: ${clientId.slice(0, 8)}…). GQL rejection is a client_id issue.`);
+    } else {
+      const helixText = await helixRes.text();
+      console.warn(`[channel-points] Token ALSO rejected by Helix (${helixRes.status}): ${helixText.slice(0, 200)}. Token is genuinely invalid/expired.`);
+    }
+  } catch (e) {
+    console.warn(`[channel-points] Helix validation failed: ${e.message}`);
+  }
+
   for (const login of watcher.logins) {
     try {
       /* Query the channel's community points context — returns the channel ID
