@@ -507,15 +507,15 @@ body.grid-dragging .cell video.cell-video {
 }
 
 /* The chat pane docks on the right of the tile; video shrinks to the left.
-   Fixed width matching a Twitch popout (~400px) so Twitch's in-chat popups
-   (channel points rewards panel, etc.) fit with their close button visible.
-   The 65% cap prevents overflow on very narrow tiles in a dense grid. */
+   Fixed width wide enough for Twitch's in-chat popups (channel points rewards
+   panel, etc.) to show their close button. The 70% cap prevents overflow on
+   very narrow tiles in a dense grid. */
 .cell-chat-wrap {
   position: absolute;
   top: 0;
   right: 0;
   bottom: 0;
-  width: var(--cell-chat-w, min(400px, 65%));
+  width: var(--cell-chat-w, min(450px, 70%));
   z-index: 10;
   display: none;
   background: #0e0e10;
@@ -535,7 +535,7 @@ body.grid-dragging .cell video.cell-video {
 /* When chat is open: shrink the video/iframe + embed hosts to the left portion,
    reveal the chat wrap, and hide the drag handle (it would overlap the chat). */
 .cell.cell-chat-open {
-  --cell-chat-w: min(400px, 65%);
+  --cell-chat-w: min(450px, 70%);
 }
 
 .cell.cell-chat-open .twitch-embed-host,
@@ -572,7 +572,7 @@ body.grid-dragging .cell video.cell-video {
    usable. The toggle button stays accessible on top of the chat pane. */
 @media (max-width: 700px) {
   .cell.cell-chat-open {
-    --cell-chat-w: min(400px, 70%);
+    --cell-chat-w: min(450px, 75%);
   }
 }
 

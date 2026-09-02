@@ -1223,7 +1223,10 @@ const channelPointsWatchers = new Map();
 /** Query a channel for available bonus claims and auto-claim them. */
 async function pollChannelPointsForWatcher(watcher) {
   const token = await getValidToken(watcher.token);
-  if (!token) return;
+  if (!token) {
+    console.warn('[channel-points] No valid token — is the user logged in?');
+    return;
+  }
 
   for (const login of watcher.logins) {
     try {
@@ -1232,16 +1235,26 @@ async function pollChannelPointsForWatcher(watcher) {
       const queryRes = await gqlWithUserToken(token, {
         query: `query { user(login: "${login}") { id channel { self { communityPoints { availableClaims { id } } } } } }`,
       });
-      if (queryRes.status !== 200) continue;
+      if (queryRes.status !== 200) {
+        console.warn(`[channel-points] ${login}: GQL query returned ${queryRes.status}: ${queryRes.body.slice(0, 200)}`);
+        continue;
+      }
       const j = JSON.parse(queryRes.body);
+      if (j.errors) {
+        console.warn(`[channel-points] ${login}: GQL errors: ${j.errors.map((e) => e.message).join('; ')}`);
+        continue;
+      }
       const user = j.data && j.data.user;
-      if (!user || !user.id) continue;
+      if (!user || !user.id) {
+        console.warn(`[channel-points] ${login}: no user data in GQL response`);
+        continue;
+      }
       const available =
         user.channel &&
         user.channel.self &&
         user.channel.self.communityPoints &&
         user.channel.self.communityPoints.availableClaims;
-      if (!available || !available.length) continue;
+      if (!available || !available.length) continue; /* no bonus available right now — normal */
 
       const channelId = user.id;
       for (const claim of available) {
@@ -1252,21 +1265,28 @@ async function pollChannelPointsForWatcher(watcher) {
         });
         if (claimRes.status === 200) {
           const cj = JSON.parse(claimRes.body);
+          if (cj.errors) {
+            console.warn(`[channel-points] ${login}: claim mutation errors: ${cj.errors.map((e) => e.message).join('; ')}`);
+            continue;
+          }
           const earned =
             cj.data &&
             cj.data.claimCommunityPoints &&
             cj.data.claimCommunityPoints.claim &&
             cj.data.claimCommunityPoints.claim.pointsEarned;
+          console.info(`[channel-points] ${login}: claimed ${earned || 0} points`);
           watcher.claims.unshift({
             login,
             pointsEarned: earned || 0,
             ts: Date.now(),
           });
           if (watcher.claims.length > 50) watcher.claims.length = 50;
+        } else {
+          console.warn(`[channel-points] ${login}: claim mutation returned ${claimRes.status}: ${claimRes.body.slice(0, 200)}`);
         }
       }
-    } catch {
-      /* ignore individual channel errors — one bad channel shouldn't stop others */
+    } catch (e) {
+      console.warn(`[channel-points] ${login}: error: ${e.message || e}`);
     }
   }
 }
