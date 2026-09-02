@@ -1520,6 +1520,9 @@
         setMeta('', false);
       }
       onlineSet = new Set((data.online || []).map((s) => s.toLowerCase()));
+      /* Online status changed — update the points watch list so the server
+         only polls live channels for bonus claims. */
+      syncPointsWatch();
       const nextViewerCounts = new Map();
       for (const [login, count] of Object.entries(data.viewers || {})) {
         nextViewerCounts.set(login.toLowerCase(), count);
@@ -1699,7 +1702,13 @@
    *  channels to watch for bonus claims. */
   async function syncPointsWatch() {
     if (!pointsLinked) return;
-    const logins = twitchChannelsForChat();
+    /* Only watch ONLINE channels — Twitch only awards bonus channel points
+       while watching a live stream, so polling offline channels wastes GQL
+       requests. onlineSet is populated by the stream status poll. */
+    const allLogins = twitchChannelsForChat();
+    const logins = onlineSet.size > 0
+      ? allLogins.filter((l) => onlineSet.has(l.toLowerCase()))
+      : allLogins; /* fallback: if we don't have online status yet, watch all */
     if (!logins.length) return;
     try {
       await fetch('/api/points/watch', {
