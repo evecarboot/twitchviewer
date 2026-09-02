@@ -1208,11 +1208,43 @@ const TWITCH_ANDROID_CLIENT_ID = 'kd1unb4b3q4t58fwlpcbzcbnm76a8fp';
 /* --- Persisted GQL operation hashes ---
  * These are Twitch's internal persisted-query hashes. If Twitch changes their
  * GQL schema, these hashes may need updating. Source: TwitchChannelPointsMiner
- * (Tkd-Alex/Twitch-Channel-Points-Miner-v2, master branch). */
+ * (Tkd-Alex/Twitch-Channel-Points-Miner-v2, master branch).
+ *
+ * If Twitch returns PersistedQueryNotFound, the standard persisted-query
+ * protocol requires the client to retry with the full query text included
+ * alongside the hash — Twitch then caches the query for future use. The raw
+ * query text for each operation is included below as a fallback. */
 const GQL_HASH_CHANNEL_POINTS_CONTEXT = '9988086babc615a918a1e9a722ff41d98847acac822645209ac7379eecb27152';
 const GQL_HASH_CLAIM_COMMUNITY_POINTS = '46aaeebe02c99afdf4fc97c7c0cba964124bf6b0af229395f1f6d1feed05b3d0';
 
-/** Build a persisted-query GQL operation object. */
+/* Raw query text for fallback when PersistedQueryNotFound is returned.
+ * ChannelPointsContext uses a raw query (not persisted) in some miner forks,
+ * so we include the full text. ClaimCommunityPoints is persisted in all known
+ * implementations, but we include the text for safety. */
+const GQL_RAW_CHANNEL_POINTS_CONTEXT = `query ChannelPointsContext($channelLogin: String!) {
+  community: user(login: $channelLogin) {
+    id
+    channel {
+      self {
+        communityPoints {
+          balance
+          activeMultipliers { factor }
+          availableClaim { id }
+        }
+      }
+    }
+  }
+}`;
+const GQL_RAW_CLAIM_COMMUNITY_POINTS = `mutation ClaimCommunityPoints($input: ClaimCommunityPointsInput!) {
+  claimCommunityPoints(input: $input) {
+    claim {
+      id
+      pointsEarned
+    }
+  }
+}`;
+
+/** Build a persisted-query GQL operation object (hash only, no query text). */
 function gqlPersistedOp(operationName, sha256Hash, variables) {
   return {
     operationName,
@@ -1221,6 +1253,34 @@ function gqlPersistedOp(operationName, sha256Hash, variables) {
       persistedQuery: { version: 1, sha256Hash },
     },
   };
+}
+
+/** Build a GQL operation with both the query text and the persisted-query
+ *  extension. This is sent as a fallback when Twitch returns
+ *  PersistedQueryNotFound — Twitch caches the query text against the hash
+ *  so subsequent requests can use the hash alone. */
+function gqlPersistedOpWithText(operationName, sha256Hash, queryText, variables) {
+  return {
+    operationName,
+    variables,
+    query: queryText,
+    extensions: {
+      persistedQuery: { version: 1, sha256Hash },
+    },
+  };
+}
+
+/** Check if a GQL response contains a PersistedQueryNotFound error. */
+function isPersistedQueryNotFound(body) {
+  try {
+    const j = JSON.parse(body);
+    return Array.isArray(j.errors) && j.errors.some(
+      (e) => e.message === 'PersistedQueryNotFound' ||
+             (typeof e.message === 'string' && e.message.includes('PersistedQueryNotFound'))
+    );
+  } catch {
+    return false;
+  }
 }
 
 /** Generate a random hex string of the given length (for device IDs). */
@@ -1513,6 +1573,10 @@ async function gqlWithPointsToken(queryObj) {
 /** Check all watched channels for available bonus claims and auto-claim them.
  *  Uses Twitch's persisted GQL operations (ChannelPointsContext + ClaimCommunityPoints)
  *  with proper operationName, variables, and extensions.persistedQuery. */
+/** Track whether we've logged the first successful ChannelPointsContext
+ *  response structure (for debugging the data path). Reset on server start. */
+let pointsLoggedFirstResponse = false;
+
 async function pollChannelPoints() {
   if (pointsWatchLogins.size === 0) {
     console.info('[points] Poll skipped — no channels in watch list');
@@ -1531,24 +1595,43 @@ async function pollChannelPoints() {
   for (const login of logins) {
     try {
       /* ChannelPointsContext: persisted query that returns the channel's points
-         context, including any available bonus claim (the "+50" button). */
-      const queryRes = await gqlWithPointsToken(
+         context, including any available bonus claim (the "+50" button).
+         Send hash-only first; if Twitch returns PersistedQueryNotFound, retry
+         with the full query text included (standard persisted-query protocol). */
+      let queryRes = await gqlWithPointsToken(
         gqlPersistedOp('ChannelPointsContext', GQL_HASH_CHANNEL_POINTS_CONTEXT, {
           channelLogin: login,
         })
       );
 
+      if (queryRes.status === 200 && isPersistedQueryNotFound(queryRes.body)) {
+        console.info(`[points] ${login}: PersistedQueryNotFound — retrying with full query text`);
+        queryRes = await gqlWithPointsToken(
+          gqlPersistedOpWithText(
+            'ChannelPointsContext',
+            GQL_HASH_CHANNEL_POINTS_CONTEXT,
+            GQL_RAW_CHANNEL_POINTS_CONTEXT,
+            { channelLogin: login }
+          )
+        );
+      }
+
+      console.info(`[points] ${login}: ChannelPointsContext HTTP ${queryRes.status}`);
+
+      if (queryRes.status === 401 || queryRes.status === 403) {
+        /* Genuine auth failure — try refreshing once, then skip this cycle.
+           Do NOT wipe the token for GQL errors or PersistedQueryNotFound. */
+        console.warn(`[points] ${login}: ${queryRes.status} — attempting token refresh…`);
+        const refreshed = await refreshPointsToken();
+        if (!refreshed) {
+          console.warn(`[points] ${login}: refresh failed — stopping poll`);
+          return;
+        }
+        continue;
+      }
+
       if (queryRes.status !== 200) {
         console.warn(`[points] ${login}: ChannelPointsContext HTTP ${queryRes.status}: ${queryRes.body.slice(0, 500)}`);
-        if (queryRes.status === 401) {
-          /* Token may be invalid — try refreshing once, then skip this cycle. */
-          console.warn(`[points] ${login}: 401 — attempting token refresh…`);
-          const refreshed = await refreshPointsToken();
-          if (!refreshed) {
-            console.warn(`[points] ${login}: refresh failed — stopping poll`);
-            return;
-          }
-        }
         continue;
       }
 
@@ -1560,6 +1643,8 @@ async function pollChannelPoints() {
         continue;
       }
 
+      /* GQL errors array — log but do NOT wipe the token. PersistedQueryNotFound
+         was already handled above; other errors are schema/permission issues. */
       if (j.errors && j.errors.length) {
         console.warn(`[points] ${login}: ChannelPointsContext GQL errors: ${j.errors.map((e) => e.message).join('; ')}`);
         continue;
@@ -1568,6 +1653,16 @@ async function pollChannelPoints() {
       if (!j.data) {
         console.warn(`[points] ${login}: ChannelPointsContext no data object: ${queryRes.body.slice(0, 500)}`);
         continue;
+      }
+
+      /* Log the first successful response structure once so we can verify the
+         correct data path for channel ID, points balance, and available claim. */
+      if (!pointsLoggedFirstResponse) {
+        pointsLoggedFirstResponse = true;
+        console.info(`[points] First successful ChannelPointsContext response for ${login}:`);
+        console.info(`[points]   raw: ${queryRes.body.slice(0, 1000)}`);
+        const community = j.data.community;
+        console.info(`[points]   data.community: ${JSON.stringify(community).slice(0, 500)}`);
       }
 
       /* The response structure is: data.community.channel.self.communityPoints
@@ -1598,12 +1693,25 @@ async function pollChannelPoints() {
       console.info(`[points] ${login}: bonus claim ${claim.id} found`);
       console.info(`[points] ${login}: ClaimCommunityPoints…`);
 
-      /* ClaimCommunityPoints: persisted mutation that claims the bonus. */
-      const claimRes = await gqlWithPointsToken(
+      /* ClaimCommunityPoints: persisted mutation that claims the bonus.
+         Same PersistedQueryNotFound fallback as above. */
+      let claimRes = await gqlWithPointsToken(
         gqlPersistedOp('ClaimCommunityPoints', GQL_HASH_CLAIM_COMMUNITY_POINTS, {
           input: { channelID: channelId, claimID: claim.id },
         })
       );
+
+      if (claimRes.status === 200 && isPersistedQueryNotFound(claimRes.body)) {
+        console.info(`[points] ${login}: ClaimCommunityPoints PersistedQueryNotFound — retrying with full query text`);
+        claimRes = await gqlWithPointsToken(
+          gqlPersistedOpWithText(
+            'ClaimCommunityPoints',
+            GQL_HASH_CLAIM_COMMUNITY_POINTS,
+            GQL_RAW_CLAIM_COMMUNITY_POINTS,
+            { input: { channelID: channelId, claimID: claim.id } }
+          )
+        );
+      }
 
       if (claimRes.status !== 200) {
         console.warn(`[points] ${login}: ClaimCommunityPoints HTTP ${claimRes.status}: ${claimRes.body.slice(0, 500)}`);
