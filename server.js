@@ -1178,8 +1178,8 @@ async function fetchTwitchPlaybackToken(login, playerType = 'embed') {
  *
  * This subsystem is architecturally separate from the existing developer OAuth
  * (which handles follows/profile via Helix). It uses Twitch's device code flow
- * with the Android TV client_id (kd1unb4b3q4t58fwlpcbzcbnm76a8fp), which is the
- * same approach used by TwitchChannelPointsMiner and similar tools. The user
+ * with the TV client_id (ue6666qo983tsx6so1t0vnawi233wa), which is the same
+ * approach used by rdavydov's Twitch-Channel-Points-Miner-v2. The user
  * links their Twitch account once via a device code (like Netflix/YouTube on a
  * TV), and the resulting token is persisted to disk and used for GQL channel-
  * points operations.
@@ -1201,48 +1201,30 @@ async function fetchTwitchPlaybackToken(login, playerType = 'embed') {
  * stable. The hashes are defined as constants below so they can be updated
  * easily when Twitch changes them. */
 
-/** Twitch's Android TV client_id — used for the device code flow because GQL
- *  only accepts tokens issued by Twitch's own clients, not developer apps. */
-const TWITCH_ANDROID_CLIENT_ID = 'kd1unb4b3q4t58fwlpcbzcbnm76a8fp';
+/** Twitch TV client_id — used for the device code flow and all GQL calls in
+ *  the points subsystem. This is the same client_id used by rdavydov's
+ *  Twitch-Channel-Points-Miner-v2. The token and client ID must remain paired:
+ *  a token obtained with this client_id must only be used with this client_id. */
+const TWITCH_POINTS_CLIENT_ID = 'ue6666qo983tsx6so1t0vnawi233wa';
+
+/** Client-Version header value — matches rdavydov's browser client version. */
+const TWITCH_POINTS_CLIENT_VERSION = 'ef928475-9403-42f2-8a34-55784bd08e16';
+
+/** User-Agent header value — matches rdavydov's Windows Chrome user agent. */
+const TWITCH_POINTS_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36';
 
 /* --- Persisted GQL operation hashes ---
- * These are Twitch's internal persisted-query hashes. If Twitch changes their
- * GQL schema, these hashes may need updating. Source: TwitchChannelPointsMiner
- * (Tkd-Alex/Twitch-Channel-Points-Miner-v2, master branch).
+ * These are Twitch's internal persisted-query hashes from rdavydov's
+ * Twitch-Channel-Points-Miner-v2 (master branch). If Twitch changes their GQL
+ * schema, these hashes may need updating.
  *
- * If Twitch returns PersistedQueryNotFound, the standard persisted-query
- * protocol requires the client to retry with the full query text included
- * alongside the hash — Twitch then caches the query for future use. The raw
- * query text for each operation is included below as a fallback. */
-const GQL_HASH_CHANNEL_POINTS_CONTEXT = '9988086babc615a918a1e9a722ff41d98847acac822645209ac7379eecb27152';
+ * We send ONLY the persisted operation (operationName + variables + extensions.
+ * persistedQuery). No raw query text is sent alongside the hash — a persisted
+ * hash describes an exact GraphQL document and sending arbitrary query text
+ * with an unrelated hash produces "persistedQuery sha256 hash does not match
+ * query body". */
+const GQL_HASH_CHANNEL_POINTS_CONTEXT = '7fe050e3761eb2cf258d70ee1a21cbd76fa8cf3d7e7b12fc437e7029d446b5e3';
 const GQL_HASH_CLAIM_COMMUNITY_POINTS = '46aaeebe02c99afdf4fc97c7c0cba964124bf6b0af229395f1f6d1feed05b3d0';
-
-/* Raw query text for fallback when PersistedQueryNotFound is returned.
- * ChannelPointsContext uses a raw query (not persisted) in some miner forks,
- * so we include the full text. ClaimCommunityPoints is persisted in all known
- * implementations, but we include the text for safety. */
-const GQL_RAW_CHANNEL_POINTS_CONTEXT = `query ChannelPointsContext($channelLogin: String!) {
-  community: user(login: $channelLogin) {
-    id
-    channel {
-      self {
-        communityPoints {
-          balance
-          activeMultipliers { factor }
-          availableClaim { id }
-        }
-      }
-    }
-  }
-}`;
-const GQL_RAW_CLAIM_COMMUNITY_POINTS = `mutation ClaimCommunityPoints($input: ClaimCommunityPointsInput!) {
-  claimCommunityPoints(input: $input) {
-    claim {
-      id
-      pointsEarned
-    }
-  }
-}`;
 
 /** Build a persisted-query GQL operation object (hash only, no query text). */
 function gqlPersistedOp(operationName, sha256Hash, variables) {
@@ -1255,35 +1237,19 @@ function gqlPersistedOp(operationName, sha256Hash, variables) {
   };
 }
 
-/** Build a GQL operation with both the query text and the persisted-query
- *  extension. This is sent as a fallback when Twitch returns
- *  PersistedQueryNotFound — Twitch caches the query text against the hash
- *  so subsequent requests can use the hash alone. */
-function gqlPersistedOpWithText(operationName, sha256Hash, queryText, variables) {
-  return {
-    operationName,
-    variables,
-    query: queryText,
-    extensions: {
-      persistedQuery: { version: 1, sha256Hash },
-    },
-  };
-}
-
-/** Check if a GQL response contains a PersistedQueryNotFound error. */
-function isPersistedQueryNotFound(body) {
-  try {
-    const j = JSON.parse(body);
-    return Array.isArray(j.errors) && j.errors.some(
-      (e) => e.message === 'PersistedQueryNotFound' ||
-             (typeof e.message === 'string' && e.message.includes('PersistedQueryNotFound'))
-    );
-  } catch {
-    return false;
+/** Generate a random alphanumeric string of the given length (for X-Device-Id).
+ *  rdavydov uses `choice(string.ascii_letters + string.digits)` for 32 chars. */
+function randomAlnumId(length) {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let result = '';
+  const bytes = crypto.randomBytes(length);
+  for (let i = 0; i < length; i++) {
+    result += chars[bytes[i] % chars.length];
   }
+  return result;
 }
 
-/** Generate a random hex string of the given length (for device IDs). */
+/** Generate a random hex string of the given length (for Client-Session-Id). */
 function randomHexId(length) {
   const bytes = crypto.randomBytes(Math.ceil(length / 2));
   return bytes.toString('hex').slice(0, length);
@@ -1291,18 +1257,22 @@ function randomHexId(length) {
 
 /* --- First-party device identifiers ---
  * Twitch's web/TV clients send persistent device + session IDs with GQL calls.
- * We generate and persist these to mimic a real first-party client, which helps
- * avoid Twitch flagging GQL requests as suspicious. */
+ * We generate and persist these to mimic a real first-party client:
+ *  - X-Device-Id: 32 alphanumeric chars, generated ONCE per persisted points
+ *    installation (survives server restarts)
+ *  - Client-Session-Id: 32 hex chars, generated ONCE per application session
+ *    (regenerated on server restart, not per channel/request) */
 const pointsDeviceIdPath = path.join(sessionSqliteDir, 'points-device-id.txt');
 let pointsDeviceId = (() => {
   try { return fs.readFileSync(pointsDeviceIdPath, 'utf8').trim(); } catch { return null; }
 })();
-if (!pointsDeviceId) {
-  pointsDeviceId = randomHexId(32);
+if (!pointsDeviceId || pointsDeviceId.length !== 32) {
+  pointsDeviceId = randomAlnumId(32);
   try { fs.writeFileSync(pointsDeviceIdPath, pointsDeviceId); } catch { /* ignore */ }
 }
-/** Per-poll session ID (regenerated each poll cycle, like Twitch's web client). */
-let pointsClientSessionId = randomHexId(16);
+/** Per-application-session session ID (generated once on server start, not
+ *  regenerated per poll cycle or per channel). */
+const pointsClientSessionId = randomHexId(32);
 
 /** Path to the persisted points token (JSON file in the app data directory). */
 const pointsTokenPath = path.join(sessionSqliteDir, 'points-token.json');
@@ -1329,8 +1299,17 @@ function savePointsToken(token) {
   }
 }
 
-/** @type {{accessToken: string, refreshToken: string, expiresAt: number, login: string} | null} */
+/** @type {{accessToken: string, refreshToken: string, expiresAt: number, login: string, clientId: string} | null} */
 let pointsToken = loadPointsToken();
+
+/* If the persisted token was obtained with a different client_id (e.g. the old
+   Android TV client), it's invalid for the current client — delete it so the
+   user re-links with the correct client. The token and client ID must be paired. */
+if (pointsToken && pointsToken.clientId && pointsToken.clientId !== TWITCH_POINTS_CLIENT_ID) {
+  console.info(`[points] Persisted token was for client ${pointsToken.clientId.slice(0, 8)}… — clearing (now using ${TWITCH_POINTS_CLIENT_ID.slice(0, 8)}…)`);
+  pointsToken = null;
+  try { fs.unlinkSync(pointsTokenPath); } catch { /* ignore */ }
+}
 
 /** In-memory state for the device code flow (short-lived, expires in ~5 min). */
 let deviceCodeState = null;
@@ -1352,7 +1331,7 @@ async function startPointsDeviceFlow() {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
-      client_id: TWITCH_ANDROID_CLIENT_ID,
+      client_id: TWITCH_POINTS_CLIENT_ID,
       scopes: 'user:read:email',
     }),
   });
@@ -1400,7 +1379,7 @@ async function pollPointsDeviceFlow() {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
-      client_id: TWITCH_ANDROID_CLIENT_ID,
+      client_id: TWITCH_POINTS_CLIENT_ID,
       device_code: deviceCodeState.deviceCode,
       grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
     }),
@@ -1448,7 +1427,7 @@ async function pollPointsDeviceFlow() {
     const userRes = await fetch('https://api.twitch.tv/helix/users', {
       headers: {
         Authorization: `Bearer ${data.access_token}`,
-        'Client-ID': TWITCH_ANDROID_CLIENT_ID,
+        'Client-ID': TWITCH_POINTS_CLIENT_ID,
       },
     });
     if (userRes.ok) {
@@ -1464,10 +1443,11 @@ async function pollPointsDeviceFlow() {
   pointsToken = {
     accessToken: data.access_token,
     refreshToken: data.refresh_token,
-    /* Twitch's Android client doesn't return expires_in — assume a long-lived
+    /* Twitch's TV client doesn't return expires_in — assume a long-lived
        token (~60 days). We'll refresh on 401 instead of proactively. */
     expiresAt: Date.now() + ((data.expires_in || 5184000) * 1000),
     login,
+    clientId: TWITCH_POINTS_CLIENT_ID,
   };
   savePointsToken(pointsToken);
   console.info(`[points] linked as ${login}`);
@@ -1483,7 +1463,7 @@ async function refreshPointsToken() {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
-        client_id: TWITCH_ANDROID_CLIENT_ID,
+        client_id: TWITCH_POINTS_CLIENT_ID,
         grant_type: 'refresh_token',
         refresh_token: pointsToken.refreshToken,
       }),
@@ -1505,9 +1485,10 @@ async function refreshPointsToken() {
     pointsToken = {
       accessToken: data.access_token,
       refreshToken: data.refresh_token || pointsToken.refreshToken,
-      /* Twitch's Android client doesn't return expires_in — assume long-lived. */
+      /* Twitch's TV client doesn't return expires_in — assume long-lived. */
       expiresAt: Date.now() + ((data.expires_in || 5184000) * 1000),
       login: pointsToken.login,
+      clientId: TWITCH_POINTS_CLIENT_ID,
     };
     savePointsToken(pointsToken);
     console.info(`[points] Token refreshed for ${pointsToken.login}`);
@@ -1542,14 +1523,16 @@ async function gqlWithPointsToken(queryObj) {
       {
         method: 'POST',
         headers: {
-          'Client-ID': TWITCH_ANDROID_CLIENT_ID,
+          'Client-ID': TWITCH_POINTS_CLIENT_ID,
           Authorization: `OAuth ${token}`,
           'Content-Type': 'application/json',
           'Content-Length': Buffer.byteLength(body),
-          /* First-party headers that Twitch's web/TV clients send with GQL
-             calls. These help avoid Twitch flagging requests as suspicious. */
-          'X-Device-Id': pointsDeviceId,
+          /* First-party headers matching rdavydov's Twitch-Channel-Points-Miner-v2.
+             These identify the client as a real Twitch TV/web session. */
           'Client-Session-Id': pointsClientSessionId,
+          'Client-Version': TWITCH_POINTS_CLIENT_VERSION,
+          'User-Agent': TWITCH_POINTS_USER_AGENT,
+          'X-Device-Id': pointsDeviceId,
         },
       },
       (resp) => {
@@ -1587,8 +1570,7 @@ async function pollChannelPoints() {
     console.warn('[points] Poll skipped — no valid token');
     return;
   }
-  /* Regenerate session ID for each poll cycle (like Twitch's web client). */
-  pointsClientSessionId = randomHexId(16);
+  /* Client-Session-Id is generated once per application session (not per poll). */
   const logins = [...pointsWatchLogins];
   console.info(`[points] Polling ${logins.length} channels: ${logins.slice(0, 5).join(', ')}${logins.length > 5 ? '…' : ''}`);
 
@@ -1596,25 +1578,15 @@ async function pollChannelPoints() {
     try {
       /* ChannelPointsContext: persisted query that returns the channel's points
          context, including any available bonus claim (the "+50" button).
-         Send hash-only first; if Twitch returns PersistedQueryNotFound, retry
-         with the full query text included (standard persisted-query protocol). */
-      let queryRes = await gqlWithPointsToken(
+         Send ONLY the persisted operation (operationName + variables + extensions.
+         persistedQuery). No raw query text — a persisted hash describes an exact
+         GraphQL document and sending arbitrary text alongside produces
+         "persistedQuery sha256 hash does not match query body". */
+      const queryRes = await gqlWithPointsToken(
         gqlPersistedOp('ChannelPointsContext', GQL_HASH_CHANNEL_POINTS_CONTEXT, {
           channelLogin: login,
         })
       );
-
-      if (queryRes.status === 200 && isPersistedQueryNotFound(queryRes.body)) {
-        console.info(`[points] ${login}: PersistedQueryNotFound — retrying with full query text`);
-        queryRes = await gqlWithPointsToken(
-          gqlPersistedOpWithText(
-            'ChannelPointsContext',
-            GQL_HASH_CHANNEL_POINTS_CONTEXT,
-            GQL_RAW_CHANNEL_POINTS_CONTEXT,
-            { channelLogin: login }
-          )
-        );
-      }
 
       console.info(`[points] ${login}: ChannelPointsContext HTTP ${queryRes.status}`);
 
@@ -1694,24 +1666,12 @@ async function pollChannelPoints() {
       console.info(`[points] ${login}: ClaimCommunityPoints…`);
 
       /* ClaimCommunityPoints: persisted mutation that claims the bonus.
-         Same PersistedQueryNotFound fallback as above. */
-      let claimRes = await gqlWithPointsToken(
+         Send ONLY the persisted operation (no raw query text). */
+      const claimRes = await gqlWithPointsToken(
         gqlPersistedOp('ClaimCommunityPoints', GQL_HASH_CLAIM_COMMUNITY_POINTS, {
           input: { channelID: channelId, claimID: claim.id },
         })
       );
-
-      if (claimRes.status === 200 && isPersistedQueryNotFound(claimRes.body)) {
-        console.info(`[points] ${login}: ClaimCommunityPoints PersistedQueryNotFound — retrying with full query text`);
-        claimRes = await gqlWithPointsToken(
-          gqlPersistedOpWithText(
-            'ClaimCommunityPoints',
-            GQL_HASH_CLAIM_COMMUNITY_POINTS,
-            GQL_RAW_CLAIM_COMMUNITY_POINTS,
-            { input: { channelID: channelId, claimID: claim.id } }
-          )
-        );
-      }
 
       if (claimRes.status !== 200) {
         console.warn(`[points] ${login}: ClaimCommunityPoints HTTP ${claimRes.status}: ${claimRes.body.slice(0, 500)}`);
