@@ -196,6 +196,16 @@ body {
   color: #e59800;
 }
 
+.points-total {
+  display: inline-block;
+  margin-left: 0.5rem;
+  padding: 0.1rem 0.4rem;
+  border-radius: 4px;
+  background: rgba(145, 70, 255, 0.2);
+  color: #c9b3ff;
+  font-size: 0.75rem;
+}
+
 .channel-list {
   display: flex;
   flex-wrap: wrap;
@@ -497,14 +507,15 @@ body.grid-dragging .cell video.cell-video {
 }
 
 /* The chat pane docks on the right of the tile; video shrinks to the left.
-   Sized to feel like a Twitch popout — half the tile, capped so very large
-   tiles (e.g. on a 55" portrait TV) don't waste space. */
+   Fixed width matching a Twitch popout (~400px) so Twitch's in-chat popups
+   (channel points rewards panel, etc.) fit with their close button visible.
+   The 65% cap prevents overflow on very narrow tiles in a dense grid. */
 .cell-chat-wrap {
   position: absolute;
   top: 0;
   right: 0;
   bottom: 0;
-  width: var(--cell-chat-w, min(560px, 50%));
+  width: var(--cell-chat-w, min(400px, 65%));
   z-index: 10;
   display: none;
   background: #0e0e10;
@@ -524,7 +535,7 @@ body.grid-dragging .cell video.cell-video {
 /* When chat is open: shrink the video/iframe + embed hosts to the left portion,
    reveal the chat wrap, and hide the drag handle (it would overlap the chat). */
 .cell.cell-chat-open {
-  --cell-chat-w: min(560px, 50%);
+  --cell-chat-w: min(400px, 65%);
 }
 
 .cell.cell-chat-open .twitch-embed-host,
@@ -539,6 +550,20 @@ body.grid-dragging .cell video.cell-video {
   display: block;
 }
 
+/* When chat is open, move the toggle/close button to the LEFT edge of the chat
+   pane (the video-side divider). Twitch's in-chat popups (channel points, etc.)
+   render inside the iframe and can cover the top-right area — anchoring the
+   close button on the video side keeps it always clickable. */
+.cell.cell-chat-open .cell-chat-toggle {
+  right: var(--cell-chat-w);
+  left: auto;
+  top: 0;
+  border-radius: 0 0 4px 0;
+  font-size: 1rem;
+  line-height: 1;
+  padding: 0.25rem 0.5rem;
+}
+
 .cell.cell-chat-open .cell-drag-handle {
   display: none;
 }
@@ -547,7 +572,7 @@ body.grid-dragging .cell video.cell-video {
    usable. The toggle button stays accessible on top of the chat pane. */
 @media (max-width: 700px) {
   .cell.cell-chat-open {
-    --cell-chat-w: min(340px, 60%);
+    --cell-chat-w: min(400px, 70%);
   }
 }
 

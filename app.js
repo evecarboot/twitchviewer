@@ -34,6 +34,12 @@
 
   let state = loadState();
   let apiConfigured = false;
+  /** Tracks whether the user is logged in with Twitch — needed to know if the
+   *  channel-points auto-claim poller can run (it needs an OAuth token). */
+  let userAuthenticated = false;
+  /** Total points auto-claimed this session (for the small toolbar indicator). */
+  let channelPointsTotal = 0;
+  let channelPointsTimer = null;
   /** 'hls' = Twitch via streamlink+ffmpeg on server; 'iframe' = official embed */
   let twitchPlayback = 'iframe';
   let pollFailed = false;
@@ -46,6 +52,8 @@
   let cellObservers = [];
   /** Stagger Twitch iframe mounts (Helix + browser load). */
   let twitchEmbedQueue = Promise.resolve();
+  /** Stagger per-tile chat iframe preloads so we don't burst Twitch's embed endpoint. */
+  let chatPreloadQueue = Promise.resolve();
   /** `https://player.twitch.tv/js/embed/v1.js` load promise (Twitch.Player + setQuality). */
   let twitchEmbedScriptPromise = null;
   let twitchEmbedSeq = 0;
@@ -1526,6 +1534,7 @@
     try {
       const res = await fetch('/api/me', FETCH_OPTS);
       const data = await res.json();
+      userAuthenticated = Boolean(data.authenticated && data.user);
       if (data.authenticated && data.user) {
         els.authLogin.hidden = true;
         els.authUserWrap.hidden = false;
@@ -1543,8 +1552,54 @@
         els.authUserWrap.hidden = true;
       }
     } catch {
+      userAuthenticated = false;
       els.authLogin.hidden = false;
       els.authUserWrap.hidden = true;
+    }
+  }
+
+  /** Send the current Twitch logins to the server so the background poller can
+   *  auto-claim channel-points bonuses for each one. Only runs when logged in. */
+  async function syncChannelPointsWatch() {
+    if (!userAuthenticated) return;
+    const logins = twitchChannelsForChat();
+    if (!logins.length) return;
+    try {
+      await fetch('/api/channel-points/watch', {
+        ...FETCH_OPTS,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ logins }),
+      });
+    } catch {
+      /* non-critical — will retry on next fullRender */
+    }
+  }
+
+  /** Poll the server for recently auto-claimed bonus points and show a small
+   *  running total in the toolbar meta area. */
+  async function pollChannelPointsStatus() {
+    if (!userAuthenticated) return;
+    try {
+      const res = await fetch('/api/channel-points/status', FETCH_OPTS);
+      const data = await res.json();
+      if (data.claims && data.claims.length) {
+        const total = data.claims.reduce(
+          (sum, c) => sum + (c.pointsEarned || 0),
+          0
+        );
+        channelPointsTotal = total;
+        if (els.toolbarMeta) {
+          const existing = els.toolbarMeta.querySelector('.points-total');
+          if (existing) existing.remove();
+          const span = document.createElement('span');
+          span.className = 'points-total';
+          span.textContent = `Auto-claimed ${total} pts`;
+          els.toolbarMeta.appendChild(span);
+        }
+      }
+    } catch {
+      /* ignore */
     }
   }
 
@@ -2364,9 +2419,16 @@
   }
 
   /** Per-tile Twitch chat: a small toggle button on the tile that splits the
-   *  tile into VIDEO | CHAT when active. Independent of the global chat panel
-   *  so each stream can show its own chat simultaneously — useful on a large
-   *  portrait display where a single shared chat is hard to read. */
+   *  tile into VIDEO | CHAT when active. Each stream can show its own chat
+   *  simultaneously — useful on a large portrait display where a single shared
+   *  chat is hard to read.
+   *
+   *  Preloading: the chat iframe is created on tile mount (staggered to avoid
+   *  bursting Twitch's embed endpoint), kept hidden via CSS. When the user
+   *  clicks the toggle, the already-loaded iframe is just revealed — instant.
+   *  This means all visible tiles' chats load in the background, so any toggle
+   *  is snappy. The trade-off is more network/memory (one chat iframe per
+   *  Twitch tile), which is acceptable since chat iframes are lightweight. */
   function attachCellChatToggle(cell, login) {
     if (!login) return;
     cell.dataset.twitchLogin = login;
@@ -2389,22 +2451,40 @@
     });
     cell.appendChild(btn);
 
+    /* Stagger chat iframe creation across tiles so we don't fire 15+ embed
+       requests at Twitch simultaneously. The queue serializes preload creation
+       with a small delay between each. */
+    chatPreloadQueue = chatPreloadQueue.then(() =>
+      new Promise((resolve) => {
+        requestAnimationFrame(() => {
+          preloadCellChat(cell, login);
+          resolve();
+        });
+      })
+    );
+
     if (state.cellChats.includes(login)) {
-      mountCellChat(cell, login);
+      showCellChat(cell);
     }
   }
 
-  function mountCellChat(cell, login) {
+  /** Create the chat iframe in the wrap (if not already there). The wrap stays
+   *  hidden via CSS until showCellChat is called. The iframe loads in the
+   *  background regardless of the wrap's display state. */
+  function preloadCellChat(cell, login) {
     const wrap = cell.querySelector('.cell-chat-wrap');
     if (!wrap) return;
-    wrap.innerHTML = '';
+    if (wrap.querySelector('iframe')) return; /* already preloaded */
     const iframe = document.createElement('iframe');
     iframe.src = chatSrc(login);
     iframe.title = `Twitch chat: ${login}`;
-    iframe.setAttribute('loading', 'lazy');
     wrap.appendChild(iframe);
+  }
+
+  function showCellChat(cell) {
     cell.classList.add('cell-chat-open');
-    wrap.setAttribute('aria-hidden', 'false');
+    const wrap = cell.querySelector('.cell-chat-wrap');
+    if (wrap) wrap.setAttribute('aria-hidden', 'false');
     const btn = cell.querySelector('.cell-chat-toggle');
     if (btn) {
       btn.textContent = '×';
@@ -2413,10 +2493,9 @@
     }
   }
 
-  function unmountCellChat(cell) {
-    const wrap = cell.querySelector('.cell-chat-wrap');
-    if (wrap) wrap.innerHTML = '';
+  function hideCellChat(cell) {
     cell.classList.remove('cell-chat-open');
+    const wrap = cell.querySelector('.cell-chat-wrap');
     if (wrap) wrap.setAttribute('aria-hidden', 'true');
     const btn = cell.querySelector('.cell-chat-toggle');
     if (btn) {
@@ -2431,10 +2510,13 @@
     const set = new Set(state.cellChats);
     if (open) {
       set.add(login);
-      mountCellChat(cell, login);
+      /* If the iframe hasn't finished preloading yet, create it now so the
+         user sees something immediately rather than an empty pane. */
+      preloadCellChat(cell, login);
+      showCellChat(cell);
     } else {
       set.delete(login);
-      unmountCellChat(cell);
+      hideCellChat(cell);
     }
     state.cellChats = [...set];
     saveState();
@@ -2766,6 +2848,7 @@
     updateFollowImportButtonsVisibility();
     updatePriorityEditButtonVisibility();
     updateRefreshStreamsButton();
+    syncChannelPointsWatch();
     requestAnimationFrame(() => {
       requestAnimationFrame(() => layoutGridToViewport());
     });
@@ -3159,6 +3242,11 @@
     fullRender();
     schedulePoll();
     scheduleCategoryPoll();
+    /* Poll for auto-claimed channel points every 60s (the server polls Twitch
+       at the same cadence). Only shows results when logged in. */
+    if (!channelPointsTimer) {
+      channelPointsTimer = setInterval(pollChannelPointsStatus, 60_000);
+    }
     console.info(
       `[twitchviewer] Twitch playback: ${twitchPlayback}. proxy = streamlink pass-through (no ffmpeg, quality per tile size); iframe = Twitch.Player (setQuality: ~480p when Priority tiles off, Auto when on); hls = legacy streamlink+ffmpeg transcode. Run twitchviewerAutoplayDiagnostics().`
     );

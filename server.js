@@ -96,9 +96,11 @@ async function getAppToken() {
   return tokenCache.token;
 }
 
-async function refreshUserSession(req) {
-  const t = req.session.twitch;
-  if (!t?.refreshToken) return null;
+/** Refresh a Twitch OAuth token. Works with any token object that has
+ *  { accessToken, refreshToken, expiresAt } — used both for req.session.twitch
+ *  and for the channel-points background poller's standalone token copy. */
+async function refreshTokenObj(tokenObj) {
+  if (!tokenObj?.refreshToken) return null;
   const clientId = process.env.TWITCH_CLIENT_ID;
   const clientSecret = process.env.TWITCH_CLIENT_SECRET;
   if (!clientId || !clientSecret) return null;
@@ -110,15 +112,21 @@ async function refreshUserSession(req) {
       client_id: clientId,
       client_secret: clientSecret,
       grant_type: 'refresh_token',
-      refresh_token: t.refreshToken,
+      refresh_token: tokenObj.refreshToken,
     }),
   });
   if (!res.ok) return null;
   const data = await res.json();
-  t.accessToken = data.access_token;
-  if (data.refresh_token) t.refreshToken = data.refresh_token;
-  t.expiresAt = Date.now() + data.expires_in * 1000;
-  return t.accessToken;
+  tokenObj.accessToken = data.access_token;
+  if (data.refresh_token) tokenObj.refreshToken = data.refresh_token;
+  tokenObj.expiresAt = Date.now() + data.expires_in * 1000;
+  return tokenObj.accessToken;
+}
+
+async function refreshUserSession(req) {
+  const t = req.session.twitch;
+  if (!t?.refreshToken) return null;
+  return refreshTokenObj(t);
 }
 
 async function getUserAccessToken(req) {
@@ -129,6 +137,17 @@ async function getUserAccessToken(req) {
     return refreshed;
   }
   return t.accessToken;
+}
+
+/** Return a valid (non-expired) access token from a standalone token object,
+ *  refreshing if needed. Used by the channel-points poller which runs outside
+ *  of a request context. */
+async function getValidToken(tokenObj) {
+  if (!tokenObj?.accessToken) return null;
+  if (tokenObj.expiresAt && Date.now() > tokenObj.expiresAt - 60_000) {
+    return refreshTokenObj(tokenObj);
+  }
+  return tokenObj.accessToken;
 }
 
 function helixHeaders(accessToken) {
@@ -199,6 +218,8 @@ app.use(
   })
 );
 
+app.use(express.json({ limit: '256kb' }));
+
 /** Full path to streamlink.exe if not on PATH — see .env STREAMLINK_PATH */
 function streamlinkExecutable() {
   const p = process.env.STREAMLINK_PATH?.trim();
@@ -267,6 +288,61 @@ app.get('/api/me', async (req, res) => {
       displayName: t.displayName,
       profileImageUrl: t.profileImageUrl,
     },
+  });
+});
+
+/* --- Channel points auto-claim routes --- */
+
+/** Client posts the list of Twitch logins currently in the grid. The server
+ *  stores them per-session and the background poller auto-claims bonus points
+ *  for each one. Requires an authenticated Twitch user (for the OAuth token). */
+app.post('/api/channel-points/watch', async (req, res) => {
+  const t = req.session.twitch;
+  if (!t?.accessToken) {
+    return res.status(401).json({ error: 'Not authenticated' });
+  }
+  const rawLogins = Array.isArray(req.body?.logins) ? req.body.logins : [];
+  const logins = rawLogins
+    .filter((l) => typeof l === 'string' && l.trim())
+    .map((l) => l.trim().toLowerCase());
+
+  let watcher = channelPointsWatchers.get(req.sessionID);
+  if (!watcher) {
+    watcher = {
+      token: {
+        accessToken: t.accessToken,
+        refreshToken: t.refreshToken,
+        expiresAt: t.expiresAt,
+      },
+      logins: new Set(),
+      claims: [],
+      lastPoll: 0,
+    };
+    channelPointsWatchers.set(req.sessionID, watcher);
+  } else {
+    /* Keep the token copy in sync with the session (may have been refreshed
+       during a regular request). */
+    watcher.token.accessToken = t.accessToken;
+    watcher.token.refreshToken = t.refreshToken;
+    watcher.token.expiresAt = t.expiresAt;
+  }
+  watcher.logins = new Set(logins);
+  res.json({ watching: [...watcher.logins] });
+});
+
+/** Returns recent auto-claimed bonus points + the current watch list. */
+app.get('/api/channel-points/status', (req, res) => {
+  const watcher = channelPointsWatchers.get(req.sessionID);
+  if (!watcher) return res.json({ claims: [], watching: [] });
+  const t = req.session.twitch;
+  if (t) {
+    watcher.token.accessToken = t.accessToken;
+    watcher.token.refreshToken = t.refreshToken;
+    watcher.token.expiresAt = t.expiresAt;
+  }
+  res.json({
+    claims: watcher.claims.slice(0, 20),
+    watching: [...watcher.logins],
   });
 });
 
@@ -1093,6 +1169,120 @@ async function fetchTwitchPlaybackToken(login, playerType = 'embed') {
   twitchTokenCache.set(cacheKey, { token, ts: now });
   return token;
 }
+
+/* --- Channel points auto-claim (server-side, via Twitch GQL) ---
+ *
+ * Twitch's web client claims channel-points bonuses (the "+50" that appears
+ * periodically) via an authenticated GQL mutation. We replicate that here:
+ * the client tells us which Twitch channels are in the grid, and a background
+ * poller checks each one for available bonus claims every ~60s, auto-claiming
+ * any it finds using the user's OAuth token. This runs entirely server-side —
+ * no browser interaction needed, works even when the chat iframe isn't open.
+ *
+ * Only bonus points (free claims) are auto-collected. We do NOT auto-redeem
+ * rewards (spending points on channel-specific rewards) — that would be
+ * destructive and channel-specific. */
+
+/** POST a GQL query/mutation with a user OAuth token. The GQL endpoint uses
+ *  `Authorization: OAuth <token>` (not Bearer) with the web client_id. */
+async function gqlWithUserToken(accessToken, queryObj) {
+  const body = JSON.stringify(queryObj);
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      'https://gql.twitch.tv/gql',
+      {
+        method: 'POST',
+        headers: {
+          'Client-ID': TWITCH_WEB_CLIENT_ID,
+          Authorization: `OAuth ${accessToken}`,
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+        },
+      },
+      (resp) => {
+        const chunks = [];
+        resp.on('data', (c) => chunks.push(c));
+        resp.on('end', () => {
+          resolve({
+            status: resp.statusCode,
+            body: Buffer.concat(chunks).toString('utf8'),
+          });
+        });
+      }
+    );
+    req.on('error', reject);
+    req.setTimeout(10000, () => req.destroy(new Error('GQL timeout')));
+    req.write(body);
+    req.end();
+  });
+}
+
+/** @type {Map<string, {token: {accessToken: string, refreshToken: string, expiresAt: number}, logins: Set<string>, claims: Array<{login: string, pointsEarned: number, ts: number}>, lastPoll: number}>} */
+const channelPointsWatchers = new Map();
+
+/** Query a channel for available bonus claims and auto-claim them. */
+async function pollChannelPointsForWatcher(watcher) {
+  const token = await getValidToken(watcher.token);
+  if (!token) return;
+
+  for (const login of watcher.logins) {
+    try {
+      /* Query the channel's community points context — returns the channel ID
+         and any available bonus claims (the "+50" buttons). */
+      const queryRes = await gqlWithUserToken(token, {
+        query: `query { user(login: "${login}") { id channel { self { communityPoints { availableClaims { id } } } } } }`,
+      });
+      if (queryRes.status !== 200) continue;
+      const j = JSON.parse(queryRes.body);
+      const user = j.data && j.data.user;
+      if (!user || !user.id) continue;
+      const available =
+        user.channel &&
+        user.channel.self &&
+        user.channel.self.communityPoints &&
+        user.channel.self.communityPoints.availableClaims;
+      if (!available || !available.length) continue;
+
+      const channelId = user.id;
+      for (const claim of available) {
+        /* ClaimCommunityPoints is the same mutation Twitch's web client sends
+           when you click the "+50" button. */
+        const claimRes = await gqlWithUserToken(token, {
+          query: `mutation { claimCommunityPoints(input: { channelId: "${channelId}", claimId: "${claim.id}" }) { claim { id pointsEarned } } }`,
+        });
+        if (claimRes.status === 200) {
+          const cj = JSON.parse(claimRes.body);
+          const earned =
+            cj.data &&
+            cj.data.claimCommunityPoints &&
+            cj.data.claimCommunityPoints.claim &&
+            cj.data.claimCommunityPoints.claim.pointsEarned;
+          watcher.claims.unshift({
+            login,
+            pointsEarned: earned || 0,
+            ts: Date.now(),
+          });
+          if (watcher.claims.length > 50) watcher.claims.length = 50;
+        }
+      }
+    } catch {
+      /* ignore individual channel errors — one bad channel shouldn't stop others */
+    }
+  }
+}
+
+/** Global poller: checks all watchers every 15s, but each watcher is polled at
+ *  most once per 60s. Runs in the background for the lifetime of the server. */
+setInterval(() => {
+  for (const [, watcher] of channelPointsWatchers) {
+    if (watcher.logins.size === 0) continue;
+    if (Date.now() - watcher.lastPoll < 60_000) continue;
+    watcher.lastPoll = Date.now();
+    pollChannelPointsForWatcher(watcher).catch(() => {
+      /* swallow — logged per-channel inside the function */
+    });
+  }
+}, 15_000);
 
 /** Parse a Twitch master playlist and return the variant URL matching `quality`.
  *  Twitch names variants like "720p60", "480p30", "360p30", "160p30", "audio_only", "chunked".
