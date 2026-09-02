@@ -30,6 +30,10 @@
     hideChatPanel: false,
     chatOnLeft: false,
     chatForLogin: null,
+    /** Twitch logins (lowercase) that have their per-tile chat open — each tile
+     *  splits into VIDEO | CHAT when present. Independent of the global chat
+     *  panel so both can be used at once. */
+    cellChats: [],
     toolbarCollapsed: false,
   });
 
@@ -135,6 +139,9 @@
           ? parsed.importedFollows
           : [],
         categoryFollows: migrateCategoryFollows(parsed.categoryFollows),
+        cellChats: Array.isArray(parsed.cellChats)
+          ? parsed.cellChats.map((s) => normalizeLogin(s)).filter(Boolean)
+          : [],
       };
       delete merged.autoplayStreams;
       return merged;
@@ -1992,6 +1999,16 @@
   function renderChatSelect() {
     const prev = state.chatForLogin;
     const twitchList = twitchChannelsForChat();
+    /* Drop per-tile chats for channels that are no longer in the grid so
+       state.cellChats doesn't keep growing as channels are added/removed. */
+    if (state.cellChats.length) {
+      const valid = new Set(twitchList);
+      const filtered = state.cellChats.filter((l) => valid.has(l));
+      if (filtered.length !== state.cellChats.length) {
+        state.cellChats = filtered;
+        saveState();
+      }
+    }
     const selects = [els.chatChannel, els.chatChannelPanel].filter(Boolean);
     for (const sel of selects) {
       sel.innerHTML = '';
@@ -2057,6 +2074,10 @@
         video._hls = null;
       }
     });
+    /* Drop the per-tile chat iframe so it doesn't keep loading in the background
+       after the cell is removed from the grid. */
+    const chatWrap = cell.querySelector('.cell-chat-wrap');
+    if (chatWrap) chatWrap.innerHTML = '';
   }
 
   function disconnectCellObservers() {
@@ -2402,6 +2423,83 @@
     cell.appendChild(lab);
   }
 
+  /** Per-tile Twitch chat: a small toggle button on the tile that splits the
+   *  tile into VIDEO | CHAT when active. Independent of the global chat panel
+   *  so each stream can show its own chat simultaneously — useful on a large
+   *  portrait display where a single shared chat is hard to read. */
+  function attachCellChatToggle(cell, login) {
+    if (!login) return;
+    cell.dataset.twitchLogin = login;
+
+    const wrap = document.createElement('div');
+    wrap.className = 'cell-chat-wrap';
+    wrap.setAttribute('aria-hidden', 'true');
+    cell.appendChild(wrap);
+
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'cell-chat-toggle';
+    btn.title = 'Show chat for this stream';
+    btn.textContent = 'Chat';
+    btn.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      const open = cell.classList.contains('cell-chat-open');
+      setCellChatOpen(cell, login, !open);
+    });
+    cell.appendChild(btn);
+
+    if (state.cellChats.includes(login)) {
+      mountCellChat(cell, login);
+    }
+  }
+
+  function mountCellChat(cell, login) {
+    const wrap = cell.querySelector('.cell-chat-wrap');
+    if (!wrap) return;
+    wrap.innerHTML = '';
+    const iframe = document.createElement('iframe');
+    iframe.src = chatSrc(login);
+    iframe.title = `Twitch chat: ${login}`;
+    iframe.setAttribute('loading', 'lazy');
+    wrap.appendChild(iframe);
+    cell.classList.add('cell-chat-open');
+    wrap.setAttribute('aria-hidden', 'false');
+    const btn = cell.querySelector('.cell-chat-toggle');
+    if (btn) {
+      btn.textContent = '×';
+      btn.title = 'Hide chat for this stream';
+      btn.setAttribute('aria-pressed', 'true');
+    }
+  }
+
+  function unmountCellChat(cell) {
+    const wrap = cell.querySelector('.cell-chat-wrap');
+    if (wrap) wrap.innerHTML = '';
+    cell.classList.remove('cell-chat-open');
+    if (wrap) wrap.setAttribute('aria-hidden', 'true');
+    const btn = cell.querySelector('.cell-chat-toggle');
+    if (btn) {
+      btn.textContent = 'Chat';
+      btn.title = 'Show chat for this stream';
+      btn.setAttribute('aria-pressed', 'false');
+    }
+  }
+
+  function setCellChatOpen(cell, login, open) {
+    if (!login) return;
+    const set = new Set(state.cellChats);
+    if (open) {
+      set.add(login);
+      mountCellChat(cell, login);
+    } else {
+      set.delete(login);
+      unmountCellChat(cell);
+    }
+    state.cellChats = [...set];
+    saveState();
+  }
+
   /**
    * Build one grid cell. Sets data-channel-key so we can reuse DOM across polls
    * (avoids tearing down Twitch embeds when hide-offline toggles other channels).
@@ -2419,6 +2517,7 @@
 
     if (t === 'twitch') {
       const login = getTwitchLogin(ch);
+      attachCellChatToggle(cell, login);
       if (twitchPlayback === 'proxy') {
         // Mount immediately with a conservative default quality (360p30). The cell may not
         // have a size yet (CSS grid hasn't reflowed), so we can't pick the right quality tier

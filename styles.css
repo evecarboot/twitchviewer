@@ -514,6 +514,81 @@ body.grid-dragging .cell video.cell-video {
   box-shadow: inset 0 0 0 2px rgba(120, 180, 255, 0.7);
 }
 
+/* Per-tile Twitch chat toggle: splits one tile into VIDEO | CHAT. */
+.cell-chat-toggle {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  z-index: 12;
+  padding: 0.15rem 0.45rem;
+  border: 0;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.65);
+  color: var(--text, #e6e6e6);
+  font-size: 0.72rem;
+  line-height: 1.2;
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.cell-chat-toggle:hover {
+  background: rgba(0, 0, 0, 0.85);
+}
+
+/* The chat pane docks on the right of the tile; video shrinks to the left. */
+.cell-chat-wrap {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: var(--cell-chat-w, min(360px, 45%));
+  z-index: 10;
+  display: none;
+  background: #0e0e10;
+  border-left: 1px solid rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.cell-chat-wrap iframe {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  display: block;
+}
+
+/* When chat is open: shrink the video/iframe + embed hosts to the left portion,
+   reveal the chat wrap, and hide the drag handle (it would overlap the chat). */
+.cell.cell-chat-open {
+  --cell-chat-w: min(360px, 45%);
+}
+
+.cell.cell-chat-open .twitch-embed-host,
+.cell.cell-chat-open .twitch-embed-js-host,
+.cell.cell-chat-open iframe,
+.cell.cell-chat-open video.cell-video {
+  right: var(--cell-chat-w);
+  width: auto;
+}
+
+.cell.cell-chat-open .cell-chat-wrap {
+  display: block;
+}
+
+.cell.cell-chat-open .cell-drag-handle {
+  display: none;
+}
+
+/* On narrow tiles (small cells in a big grid), cap the chat so video stays
+   usable. The toggle button stays accessible on top of the chat pane. */
+@media (max-width: 700px) {
+  .cell.cell-chat-open {
+    --cell-chat-w: min(280px, 55%);
+  }
+}
+
 .chat-panel {
   flex: 0 0 min(360px, 40vw);
   min-width: 260px;
