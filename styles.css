@@ -507,15 +507,16 @@ body.grid-dragging .cell video.cell-video {
 }
 
 /* The chat pane docks on the right of the tile; video shrinks to the left.
-   Fixed width wide enough for Twitch's in-chat popups (channel points rewards
-   panel, etc.) to show their close button. The 70% cap prevents overflow on
-   very narrow tiles in a dense grid. */
+   Normal width ~400px for reading chat alongside video. When the user needs
+   to interact with Twitch's channel-points popup (which clips inside the
+   iframe), they click Expand and the chat covers the full tile — giving
+   Twitch's popup enough room to render. See .cell-chat-expanded below. */
 .cell-chat-wrap {
   position: absolute;
   top: 0;
   right: 0;
   bottom: 0;
-  width: var(--cell-chat-w, min(450px, 70%));
+  width: var(--cell-chat-w, min(400px, 65%));
   z-index: 10;
   display: none;
   background: #0e0e10;
@@ -535,7 +536,7 @@ body.grid-dragging .cell video.cell-video {
 /* When chat is open: shrink the video/iframe + embed hosts to the left portion,
    reveal the chat wrap, and hide the drag handle (it would overlap the chat). */
 .cell.cell-chat-open {
-  --cell-chat-w: min(450px, 70%);
+  --cell-chat-w: min(400px, 65%);
 }
 
 .cell.cell-chat-open .twitch-embed-host,
@@ -568,11 +569,67 @@ body.grid-dragging .cell video.cell-video {
   display: none;
 }
 
+/* Expand button: appears next to the close button when chat is open. Lets the
+   user temporarily overlay the chat across the entire tile so Twitch's
+   channel-points popup (which clips inside the iframe at normal width) has
+   enough room to render with its close button visible. */
+.cell-chat-expand {
+  position: absolute;
+  left: var(--cell-chat-w);
+  top: 0;
+  z-index: 12;
+  padding: 0.25rem 0.4rem;
+  border: 0;
+  border-radius: 0 0 0 4px;
+  background: rgba(0, 0, 0, 0.65);
+  color: var(--text, #e6e6e6);
+  font-size: 0.85rem;
+  line-height: 1;
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+  display: none;
+}
+
+.cell-chat-expand:hover {
+  background: rgba(0, 0, 0, 0.85);
+}
+
+.cell.cell-chat-open .cell-chat-expand {
+  display: block;
+}
+
+/* Expanded mode: chat covers the entire tile. Video is hidden behind the chat
+   overlay. The close + expand buttons stay anchored to the left edge so
+   they're always clickable. No overflow:hidden on any ancestor clips the
+   iframe — the wrap fills the cell completely. */
+.cell.cell-chat-expanded {
+  --cell-chat-w: 100%;
+}
+
+.cell.cell-chat-expanded .twitch-embed-host,
+.cell.cell-chat-expanded .twitch-embed-js-host,
+.cell.cell-chat-expanded iframe,
+.cell.cell-chat-expanded video.cell-video {
+  right: 100%;
+  width: auto;
+}
+
+.cell.cell-chat-expanded .cell-chat-toggle,
+.cell.cell-chat-expanded .cell-chat-expand {
+  left: 0;
+  right: auto;
+}
+
+.cell.cell-chat-expanded .cell-chat-expand {
+  left: 2.2rem;
+}
+
 /* On narrow tiles (small cells in a big grid), cap the chat so video stays
    usable. The toggle button stays accessible on top of the chat pane. */
 @media (max-width: 700px) {
   .cell.cell-chat-open {
-    --cell-chat-w: min(450px, 75%);
+    --cell-chat-w: min(400px, 70%);
   }
 }
 

@@ -2451,6 +2451,21 @@
     });
     cell.appendChild(btn);
 
+    /* Expand button: temporarily overlays the chat across the entire tile so
+       Twitch's channel-points popup (which clips at normal width) has enough
+       room. Click again to collapse back to VIDEO | CHAT. */
+    const expandBtn = document.createElement('button');
+    expandBtn.type = 'button';
+    expandBtn.className = 'cell-chat-expand';
+    expandBtn.title = 'Expand chat (for channel points)';
+    expandBtn.textContent = '⤢';
+    expandBtn.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      toggleCellChatExpand(cell);
+    });
+    cell.appendChild(expandBtn);
+
     /* Stagger chat iframe creation across tiles so we don't fire 15+ embed
        requests at Twitch simultaneously. The queue serializes preload creation
        with a small delay between each. */
@@ -2495,6 +2510,7 @@
 
   function hideCellChat(cell) {
     cell.classList.remove('cell-chat-open');
+    cell.classList.remove('cell-chat-expanded');
     const wrap = cell.querySelector('.cell-chat-wrap');
     if (wrap) wrap.setAttribute('aria-hidden', 'true');
     const btn = cell.querySelector('.cell-chat-toggle');
@@ -2502,6 +2518,22 @@
       btn.textContent = 'Chat';
       btn.title = 'Show chat for this stream';
       btn.setAttribute('aria-pressed', 'false');
+    }
+    const expandBtn = cell.querySelector('.cell-chat-expand');
+    if (expandBtn) {
+      expandBtn.textContent = '⤢';
+      expandBtn.title = 'Expand chat (for channel points)';
+    }
+  }
+
+  function toggleCellChatExpand(cell) {
+    const expanded = cell.classList.toggle('cell-chat-expanded');
+    const expandBtn = cell.querySelector('.cell-chat-expand');
+    if (expandBtn) {
+      expandBtn.textContent = expanded ? '⤡' : '⤢';
+      expandBtn.title = expanded
+        ? 'Collapse chat back to side panel'
+        : 'Expand chat (for channel points)';
     }
   }
 
