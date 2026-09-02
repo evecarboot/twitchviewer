@@ -1184,16 +1184,20 @@ async function fetchTwitchPlaybackToken(login, playerType = 'embed') {
  * destructive and channel-specific. */
 
 /** POST a GQL query/mutation with a user OAuth token. The GQL endpoint uses
- *  `Authorization: OAuth <token>` (not Bearer) with the web client_id. */
+ *  `Authorization: OAuth <token>` (not Bearer). The Client-ID must match the
+ *  client_id that was used to obtain the token — using the well-known web
+ *  client_id here would cause a 401 because the token was issued for the
+ *  user's own TWITCH_CLIENT_ID. */
 async function gqlWithUserToken(accessToken, queryObj) {
   const body = JSON.stringify(queryObj);
+  const clientId = process.env.TWITCH_CLIENT_ID || TWITCH_WEB_CLIENT_ID;
   return new Promise((resolve, reject) => {
     const req = https.request(
       'https://gql.twitch.tv/gql',
       {
         method: 'POST',
         headers: {
-          'Client-ID': TWITCH_WEB_CLIENT_ID,
+          'Client-ID': clientId,
           Authorization: `OAuth ${accessToken}`,
           'Content-Type': 'application/json',
           'Content-Length': Buffer.byteLength(body),
