@@ -125,6 +125,9 @@
               </button>
               <a href="/auth/logout" class="ghost">Log out</a>
             </div>
+            <button type="button" class="ghost" id="link-points" title="Link your Twitch account for auto channel points (separate from login)">
+              Link for points
+            </button>
           </div>
         </div>
         <div class="toolbar-meta" id="toolbar-meta"></div>
@@ -252,6 +255,48 @@
           >
             Save
           </button>
+        </div>
+      </div>
+    </div>
+
+    <div
+      id="points-modal"
+      class="modal"
+      hidden
+      aria-hidden="true"
+      aria-label="Channel points linking"
+    >
+      <div class="modal-backdrop" id="points-modal-backdrop"></div>
+      <div
+        class="modal-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="points-modal-title"
+      >
+        <h2 id="points-modal-title" class="modal-title">Auto Channel Points</h2>
+        <div id="points-modal-body">
+          <p class="modal-hint" id="points-modal-hint">
+            Link your Twitch account to automatically claim bonus channel points
+            (+50) for every stream in your grid. This uses a separate Twitch
+            device-code login (like activating Netflix on a TV) — it does not
+            affect your existing Twitch login.
+          </p>
+          <div id="points-device-code" hidden>
+            <p>Go to this URL on any device:</p>
+            <p><strong id="points-device-url"></strong></p>
+            <p>And enter this code:</p>
+            <div class="points-code-display" id="points-code-display"></div>
+            <p class="text-muted" id="points-polling-status">Waiting for authorization…</p>
+          </div>
+          <div id="points-linked" hidden>
+            <p>Linked as: <strong id="points-linked-login"></strong></p>
+            <p class="text-muted" id="points-claims-summary">No points claimed yet.</p>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <span class="modal-actions-spacer"></span>
+          <button type="button" class="ghost" id="points-modal-cancel">Close</button>
+          <button type="button" class="ghost" id="points-unlink" hidden>Unlink</button>
         </div>
       </div>
     </div>

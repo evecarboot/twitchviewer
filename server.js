@@ -97,8 +97,7 @@ async function getAppToken() {
 }
 
 /** Refresh a Twitch OAuth token. Works with any token object that has
- *  { accessToken, refreshToken, expiresAt } — used both for req.session.twitch
- *  and for the channel-points background poller's standalone token copy. */
+ *  { accessToken, refreshToken, expiresAt } — used for req.session.twitch. */
 async function refreshTokenObj(tokenObj) {
   if (!tokenObj?.refreshToken) return null;
   const clientId = process.env.TWITCH_CLIENT_ID;
@@ -137,17 +136,6 @@ async function getUserAccessToken(req) {
     return refreshed;
   }
   return t.accessToken;
-}
-
-/** Return a valid (non-expired) access token from a standalone token object,
- *  refreshing if needed. Used by the channel-points poller which runs outside
- *  of a request context. */
-async function getValidToken(tokenObj) {
-  if (!tokenObj?.accessToken) return null;
-  if (tokenObj.expiresAt && Date.now() > tokenObj.expiresAt - 60_000) {
-    return refreshTokenObj(tokenObj);
-  }
-  return tokenObj.accessToken;
 }
 
 function helixHeaders(accessToken) {
@@ -291,58 +279,68 @@ app.get('/api/me', async (req, res) => {
   });
 });
 
-/* --- Channel points auto-claim routes --- */
+/* --- Channel points auth + status routes --- */
 
-/** Client posts the list of Twitch logins currently in the grid. The server
- *  stores them per-session and the background poller auto-claims bonus points
- *  for each one. Requires an authenticated Twitch user (for the OAuth token). */
-app.post('/api/channel-points/watch', async (req, res) => {
-  const t = req.session.twitch;
-  if (!t?.accessToken) {
-    return res.status(401).json({ error: 'Not authenticated' });
-  }
-  const rawLogins = Array.isArray(req.body?.logins) ? req.body.logins : [];
-  const logins = rawLogins
-    .filter((l) => typeof l === 'string' && l.trim())
-    .map((l) => l.trim().toLowerCase());
-
-  let watcher = channelPointsWatchers.get(req.sessionID);
-  if (!watcher) {
-    watcher = {
-      token: {
-        accessToken: t.accessToken,
-        refreshToken: t.refreshToken,
-        expiresAt: t.expiresAt,
-      },
-      logins: new Set(),
-      claims: [],
-      lastPoll: 0,
-    };
-    channelPointsWatchers.set(req.sessionID, watcher);
-  } else {
-    /* Keep the token copy in sync with the session (may have been refreshed
-       during a regular request). */
-    watcher.token.accessToken = t.accessToken;
-    watcher.token.refreshToken = t.refreshToken;
-    watcher.token.expiresAt = t.expiresAt;
-  }
-  watcher.logins = new Set(logins);
-  res.json({ watching: [...watcher.logins] });
+/** Check if the points subsystem is linked (has a valid web-session token). */
+app.get('/api/points-auth/status', (_req, res) => {
+  res.json({
+    linked: Boolean(pointsToken?.accessToken),
+    login: pointsToken?.login || null,
+    deviceCodeInProgress: Boolean(deviceCodeState),
+  });
 });
 
-/** Returns recent auto-claimed bonus points + the current watch list. */
-app.get('/api/channel-points/status', (req, res) => {
-  const watcher = channelPointsWatchers.get(req.sessionID);
-  if (!watcher) return res.json({ claims: [], watching: [] });
-  const t = req.session.twitch;
-  if (t) {
-    watcher.token.accessToken = t.accessToken;
-    watcher.token.refreshToken = t.refreshToken;
-    watcher.token.expiresAt = t.expiresAt;
+/** Start the device code flow — returns the URL + code for the user to enter. */
+app.post('/api/points-auth/device', async (_req, res) => {
+  try {
+    const result = await startPointsDeviceFlow();
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: e.message || String(e) });
   }
+});
+
+/** Poll for device code authorization completion. */
+app.get('/api/points-auth/poll', async (_req, res) => {
+  try {
+    const result = await pollPointsDeviceFlow();
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: e.message || String(e) });
+  }
+});
+
+/** Unlink the points token (clears the persisted token + stops watching). */
+app.post('/api/points-auth/logout', (_req, res) => {
+  pointsToken = null;
+  pointsWatchLogins = new Set();
+  pointsClaims = [];
+  try { fs.unlinkSync(pointsTokenPath); } catch { /* ignore */ }
+  res.json({ ok: true });
+});
+
+/** Set the list of Twitch logins to watch for bonus claims. */
+app.post('/api/points/watch', (req, res) => {
+  if (!pointsToken?.accessToken) {
+    return res.status(401).json({ error: 'Not linked — use /api/points-auth/device first' });
+  }
+  const rawLogins = Array.isArray(req.body?.logins) ? req.body.logins : [];
+  pointsWatchLogins = new Set(
+    rawLogins
+      .filter((l) => typeof l === 'string' && l.trim())
+      .map((l) => l.trim().toLowerCase())
+  );
+  res.json({ watching: [...pointsWatchLogins] });
+});
+
+/** Get recent claims + current watch list. */
+app.get('/api/points/status', (_req, res) => {
   res.json({
-    claims: watcher.claims.slice(0, 20),
-    watching: [...watcher.logins],
+    linked: Boolean(pointsToken?.accessToken),
+    login: pointsToken?.login || null,
+    claims: pointsClaims.slice(0, 20),
+    watching: [...pointsWatchLogins],
+    totalClaimed: pointsClaims.reduce((sum, c) => sum + (c.pointsEarned || 0), 0),
   });
 });
 
@@ -1170,35 +1168,237 @@ async function fetchTwitchPlaybackToken(login, playerType = 'embed') {
   return token;
 }
 
-/* --- Channel points auto-claim (server-side, via Twitch GQL) ---
+/* --- Channel points auto-claim (Twitch web-session subsystem) ---
  *
- * Twitch's web client claims channel-points bonuses (the "+50" that appears
- * periodically) via an authenticated GQL mutation. We replicate that here:
- * the client tells us which Twitch channels are in the grid, and a background
- * poller checks each one for available bonus claims every ~60s, auto-claiming
- * any it finds using the user's OAuth token. This runs entirely server-side —
- * no browser interaction needed, works even when the chat iframe isn't open.
+ * Twitch's GQL endpoint (gql.twitch.tv) is an internal API that rejects tokens
+ * issued to custom developer applications. To auto-claim channel-points bonuses
+ * (the "+50" that appears periodically), we need a token issued by Twitch's own
+ * client — not our developer app's client.
+ *
+ * This subsystem is architecturally separate from the existing developer OAuth
+ * (which handles follows/profile via Helix). It uses Twitch's device code flow
+ * with the Android TV client_id (kd1unb4b3q4t58fwlpcbzcbnm76a8fp), which is the
+ * same approach used by TwitchChannelPointsMiner and similar tools. The user
+ * links their Twitch account once via a device code (like Netflix/YouTube on a
+ * TV), and the resulting token is persisted to disk and used for GQL channel-
+ * points operations.
+ *
+ * Flow:
+ *  1. User clicks "Link for points" → server starts device code flow
+ *  2. User visits twitch.tv/activate, enters the code
+ *  3. Server polls Twitch until authorized, persists the token
+ *  4. Background poller checks each watched channel for available bonus claims
+ *     every 60s and auto-claims them via the ClaimCommunityPoints GQL mutation
+ *  5. Client polls /api/points/status for the running total
  *
  * Only bonus points (free claims) are auto-collected. We do NOT auto-redeem
  * rewards (spending points on channel-specific rewards) — that would be
  * destructive and channel-specific. */
 
-/** POST a GQL query/mutation with a user OAuth token. The GQL endpoint uses
- *  `Authorization: OAuth <token>` (not Bearer). The Client-ID must match the
- *  client_id that was used to obtain the token — using the well-known web
- *  client_id here would cause a 401 because the token was issued for the
- *  user's own TWITCH_CLIENT_ID. */
-async function gqlWithUserToken(accessToken, queryObj) {
+/** Twitch's Android TV client_id — used for the device code flow because GQL
+ *  only accepts tokens issued by Twitch's own clients, not developer apps. */
+const TWITCH_ANDROID_CLIENT_ID = 'kd1unb4b3q4t58fwlpcbzcbnm76a8fp';
+
+/** Path to the persisted points token (JSON file in the app data directory). */
+const pointsTokenPath = path.join(sessionSqliteDir, 'points-token.json');
+
+/** Load the persisted points token from disk. Returns null if not linked. */
+function loadPointsToken() {
+  try {
+    const raw = fs.readFileSync(pointsTokenPath, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (parsed.accessToken && parsed.refreshToken) return parsed;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** Save the points token to disk so it survives server restarts. */
+function savePointsToken(token) {
+  try {
+    fs.writeFileSync(pointsTokenPath, JSON.stringify(token, null, 2));
+  } catch (e) {
+    console.warn('[points] Could not save token:', e.message);
+  }
+}
+
+/** @type {{accessToken: string, refreshToken: string, expiresAt: number, login: string} | null} */
+let pointsToken = loadPointsToken();
+
+/** In-memory state for the device code flow (short-lived, expires in ~5 min). */
+let deviceCodeState = null;
+
+/** Recent claims (newest first, capped at 50). */
+let pointsClaims = [];
+/** Set of Twitch logins currently being watched for bonus claims. */
+let pointsWatchLogins = new Set();
+let pointsLastPoll = 0;
+
+/** Start the Twitch device code flow. Returns the verification URL + user code
+ *  for the user to enter at twitch.tv/activate. */
+async function startPointsDeviceFlow() {
+  const res = await fetch('https://id.twitch.tv/oauth2/device', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: TWITCH_ANDROID_CLIENT_ID,
+      scope: 'user:read:email',
+    }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Device code flow failed (${res.status}): ${text}`);
+  }
+  const data = await res.json();
+  deviceCodeState = {
+    deviceCode: data.device_code,
+    userCode: data.user_code,
+    verificationUri: data.verification_uri || 'https://www.twitch.tv/activate',
+    expiresAt: Date.now() + (data.expires_in || 600) * 1000,
+    interval: (data.interval || 5) * 1000,
+    lastPoll: 0,
+  };
+  return {
+    userCode: data.user_code,
+    verificationUri: deviceCodeState.verificationUri,
+    expiresIn: data.expires_in || 600,
+  };
+}
+
+/** Poll Twitch for the device code authorization. Returns:
+ *  - { status: 'pending' } if the user hasn't authorized yet
+ *  - { status: 'linked', login } on success
+ *  - { status: 'expired' } if the device code expired
+ *  - { status: 'error', error } on other errors */
+async function pollPointsDeviceFlow() {
+  if (!deviceCodeState) return { status: 'error', error: 'No device code flow in progress' };
+  if (Date.now() > deviceCodeState.expiresAt) {
+    deviceCodeState = null;
+    return { status: 'expired' };
+  }
+  /* Throttle polling to Twitch's requested interval. */
+  if (Date.now() - deviceCodeState.lastPoll < deviceCodeState.interval) {
+    return { status: 'pending' };
+  }
+  deviceCodeState.lastPoll = Date.now();
+
+  const res = await fetch('https://id.twitch.tv/oauth2/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: TWITCH_ANDROID_CLIENT_ID,
+      device_code: deviceCodeState.deviceCode,
+      grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+    }),
+  });
+  const data = await res.json();
+
+  if (data.error === 'authorization_pending') return { status: 'pending' };
+  if (data.error === 'slow_down') {
+    deviceCodeState.interval += 5000;
+    return { status: 'pending' };
+  }
+  if (data.error === 'expired_token') {
+    deviceCodeState = null;
+    return { status: 'expired' };
+  }
+  if (data.error) {
+    deviceCodeState = null;
+    return { status: 'error', error: data.error_description || data.error };
+  }
+  if (!data.access_token) {
+    deviceCodeState = null;
+    return { status: 'error', error: 'No access token in response' };
+  }
+
+  /* Success — resolve the user's login via Helix (using the same token/client). */
+  let login = 'unknown';
+  try {
+    const userRes = await fetch('https://api.twitch.tv/helix/users', {
+      headers: {
+        Authorization: `Bearer ${data.access_token}`,
+        'Client-ID': TWITCH_ANDROID_CLIENT_ID,
+      },
+    });
+    if (userRes.ok) {
+      const userBody = await userRes.json();
+      login = userBody.data?.[0]?.login || 'unknown';
+    }
+  } catch {
+    /* non-critical — we have the token even if we can't resolve the login */
+  }
+
+  pointsToken = {
+    accessToken: data.access_token,
+    refreshToken: data.refresh_token,
+    expiresAt: Date.now() + (data.expires_in || 0) * 1000,
+    login,
+  };
+  savePointsToken(pointsToken);
+  deviceCodeState = null;
+  console.info(`[points] Linked Twitch account: ${login}`);
+  return { status: 'linked', login };
+}
+
+/** Refresh the points token using the refresh token. */
+async function refreshPointsToken() {
+  if (!pointsToken?.refreshToken) return null;
+  try {
+    const res = await fetch('https://id.twitch.tv/oauth2/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: TWITCH_ANDROID_CLIENT_ID,
+        grant_type: 'refresh_token',
+        refresh_token: pointsToken.refreshToken,
+      }),
+    });
+    if (!res.ok) {
+      console.warn(`[points] Token refresh failed (${res.status}) — re-link needed`);
+      pointsToken = null;
+      try { fs.unlinkSync(pointsTokenPath); } catch { /* ignore */ }
+      return null;
+    }
+    const data = await res.json();
+    pointsToken = {
+      accessToken: data.access_token,
+      refreshToken: data.refresh_token || pointsToken.refreshToken,
+      expiresAt: Date.now() + (data.expires_in || 0) * 1000,
+      login: pointsToken.login,
+    };
+    savePointsToken(pointsToken);
+    return pointsToken.accessToken;
+  } catch (e) {
+    console.warn(`[points] Token refresh error: ${e.message}`);
+    return null;
+  }
+}
+
+/** Return a valid (non-expired) points access token, refreshing if needed. */
+async function getValidPointsToken() {
+  if (!pointsToken?.accessToken) return null;
+  if (pointsToken.expiresAt && Date.now() > pointsToken.expiresAt - 60_000) {
+    return refreshPointsToken();
+  }
+  return pointsToken.accessToken;
+}
+
+/** POST a GQL query/mutation using the points token + Android client_id.
+ *  Unlike the developer OAuth token, this token is accepted by GQL because
+ *  it was issued by Twitch's own client. */
+async function gqlWithPointsToken(queryObj) {
+  const token = await getValidPointsToken();
+  if (!token) throw new Error('No points token');
   const body = JSON.stringify(queryObj);
-  const clientId = process.env.TWITCH_CLIENT_ID || TWITCH_WEB_CLIENT_ID;
   return new Promise((resolve, reject) => {
     const req = https.request(
       'https://gql.twitch.tv/gql',
       {
         method: 'POST',
         headers: {
-          'Client-ID': clientId,
-          Authorization: `OAuth ${accessToken}`,
+          'Client-ID': TWITCH_ANDROID_CLIENT_ID,
+          Authorization: `OAuth ${token}`,
           'Content-Type': 'application/json',
           'Content-Length': Buffer.byteLength(body),
         },
@@ -1221,111 +1421,64 @@ async function gqlWithUserToken(accessToken, queryObj) {
   });
 }
 
-/** @type {Map<string, {token: {accessToken: string, refreshToken: string, expiresAt: number}, logins: Set<string>, claims: Array<{login: string, pointsEarned: number, ts: number}>, lastPoll: number}>} */
-const channelPointsWatchers = new Map();
+/** Check all watched channels for available bonus claims and auto-claim them. */
+async function pollChannelPoints() {
+  if (pointsWatchLogins.size === 0) return;
+  const token = await getValidPointsToken();
+  if (!token) return;
 
-/** Query a channel for available bonus claims and auto-claim them. */
-async function pollChannelPointsForWatcher(watcher) {
-  const token = await getValidToken(watcher.token);
-  if (!token) {
-    console.warn('[channel-points] No valid token — is the user logged in?');
-    return;
-  }
-
-  /* Diagnostic: validate the token via Helix first. If Helix accepts it but
-     GQL rejects it, the issue is that Twitch's GQL endpoint doesn't accept
-     tokens from our client_id (GQL is an internal API, not a public one). */
-  const clientId = process.env.TWITCH_CLIENT_ID || TWITCH_WEB_CLIENT_ID;
-  try {
-    const helixRes = await fetch('https://api.twitch.tv/helix/users', {
-      headers: { Authorization: `Bearer ${token}`, 'Client-ID': clientId },
-    });
-    if (helixRes.ok) {
-      const helixBody = await helixRes.json();
-      const u = helixBody.data && helixBody.data[0];
-      console.info(`[channel-points] Token valid via Helix (user: ${u ? u.login : '?'}, client_id: ${clientId.slice(0, 8)}…). GQL rejection is a client_id issue.`);
-    } else {
-      const helixText = await helixRes.text();
-      console.warn(`[channel-points] Token ALSO rejected by Helix (${helixRes.status}): ${helixText.slice(0, 200)}. Token is genuinely invalid/expired.`);
-    }
-  } catch (e) {
-    console.warn(`[channel-points] Helix validation failed: ${e.message}`);
-  }
-
-  for (const login of watcher.logins) {
+  for (const login of pointsWatchLogins) {
     try {
       /* Query the channel's community points context — returns the channel ID
          and any available bonus claims (the "+50" buttons). */
-      const queryRes = await gqlWithUserToken(token, {
+      const queryRes = await gqlWithPointsToken({
         query: `query { user(login: "${login}") { id channel { self { communityPoints { availableClaims { id } } } } } }`,
       });
       if (queryRes.status !== 200) {
-        console.warn(`[channel-points] ${login}: GQL query returned ${queryRes.status}: ${queryRes.body.slice(0, 200)}`);
+        if (queryRes.status === 401) {
+          console.warn('[points] GQL returned 401 — token may be invalid, will refresh on next poll');
+        }
         continue;
       }
       const j = JSON.parse(queryRes.body);
-      if (j.errors) {
-        console.warn(`[channel-points] ${login}: GQL errors: ${j.errors.map((e) => e.message).join('; ')}`);
-        continue;
-      }
+      if (j.errors) continue;
       const user = j.data && j.data.user;
-      if (!user || !user.id) {
-        console.warn(`[channel-points] ${login}: no user data in GQL response`);
-        continue;
-      }
+      if (!user || !user.id) continue;
       const available =
         user.channel &&
         user.channel.self &&
         user.channel.self.communityPoints &&
         user.channel.self.communityPoints.availableClaims;
-      if (!available || !available.length) continue; /* no bonus available right now — normal */
+      if (!available || !available.length) continue;
 
       const channelId = user.id;
       for (const claim of available) {
-        /* ClaimCommunityPoints is the same mutation Twitch's web client sends
-           when you click the "+50" button. */
-        const claimRes = await gqlWithUserToken(token, {
+        const claimRes = await gqlWithPointsToken({
           query: `mutation { claimCommunityPoints(input: { channelId: "${channelId}", claimId: "${claim.id}" }) { claim { id pointsEarned } } }`,
         });
         if (claimRes.status === 200) {
           const cj = JSON.parse(claimRes.body);
-          if (cj.errors) {
-            console.warn(`[channel-points] ${login}: claim mutation errors: ${cj.errors.map((e) => e.message).join('; ')}`);
-            continue;
-          }
+          if (cj.errors) continue;
           const earned =
-            cj.data &&
-            cj.data.claimCommunityPoints &&
-            cj.data.claimCommunityPoints.claim &&
-            cj.data.claimCommunityPoints.claim.pointsEarned;
-          console.info(`[channel-points] ${login}: claimed ${earned || 0} points`);
-          watcher.claims.unshift({
-            login,
-            pointsEarned: earned || 0,
-            ts: Date.now(),
-          });
-          if (watcher.claims.length > 50) watcher.claims.length = 50;
-        } else {
-          console.warn(`[channel-points] ${login}: claim mutation returned ${claimRes.status}: ${claimRes.body.slice(0, 200)}`);
+            cj.data?.claimCommunityPoints?.claim?.pointsEarned || 0;
+          console.info(`[points] ${login}: claimed ${earned} points`);
+          pointsClaims.unshift({ login, pointsEarned: earned, ts: Date.now() });
+          if (pointsClaims.length > 50) pointsClaims.length = 50;
         }
       }
-    } catch (e) {
-      console.warn(`[channel-points] ${login}: error: ${e.message || e}`);
+    } catch {
+      /* ignore individual channel errors */
     }
   }
 }
 
-/** Global poller: checks all watchers every 15s, but each watcher is polled at
- *  most once per 60s. Runs in the background for the lifetime of the server. */
+/** Background poller: checks watched channels every 60s for available claims. */
 setInterval(() => {
-  for (const [, watcher] of channelPointsWatchers) {
-    if (watcher.logins.size === 0) continue;
-    if (Date.now() - watcher.lastPoll < 60_000) continue;
-    watcher.lastPoll = Date.now();
-    pollChannelPointsForWatcher(watcher).catch(() => {
-      /* swallow — logged per-channel inside the function */
-    });
-  }
+  if (pointsWatchLogins.size === 0) return;
+  if (Date.now() - pointsLastPoll < 60_000) return;
+  if (!pointsToken) return;
+  pointsLastPoll = Date.now();
+  pollChannelPoints().catch(() => {});
 }, 15_000);
 
 /** Parse a Twitch master playlist and return the variant URL matching `quality`.

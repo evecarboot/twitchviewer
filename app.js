@@ -34,12 +34,6 @@
 
   let state = loadState();
   let apiConfigured = false;
-  /** Tracks whether the user is logged in with Twitch — needed to know if the
-   *  channel-points auto-claim poller can run (it needs an OAuth token). */
-  let userAuthenticated = false;
-  /** Total points auto-claimed this session (for the small toolbar indicator). */
-  let channelPointsTotal = 0;
-  let channelPointsTimer = null;
   /** 'hls' = Twitch via streamlink+ffmpeg on server; 'iframe' = official embed */
   let twitchPlayback = 'iframe';
   let pollFailed = false;
@@ -115,6 +109,19 @@
     prioritySelectNone: document.getElementById('priority-select-none'),
     priorityModalSave: document.getElementById('priority-modal-save'),
     priorityModalCancel: document.getElementById('priority-modal-cancel'),
+    // Channel points
+    linkPoints: document.getElementById('link-points'),
+    pointsModal: document.getElementById('points-modal'),
+    pointsModalBackdrop: document.getElementById('points-modal-backdrop'),
+    pointsModalCancel: document.getElementById('points-modal-cancel'),
+    pointsUnlink: document.getElementById('points-unlink'),
+    pointsDeviceCode: document.getElementById('points-device-code'),
+    pointsDeviceUrl: document.getElementById('points-device-url'),
+    pointsCodeDisplay: document.getElementById('points-code-display'),
+    pointsPollingStatus: document.getElementById('points-polling-status'),
+    pointsLinked: document.getElementById('points-linked'),
+    pointsLinkedLogin: document.getElementById('points-linked-login'),
+    pointsClaimsSummary: document.getElementById('points-claims-summary'),
   };
 
   function loadState() {
@@ -1534,7 +1541,6 @@
     try {
       const res = await fetch('/api/me', FETCH_OPTS);
       const data = await res.json();
-      userAuthenticated = Boolean(data.authenticated && data.user);
       if (data.authenticated && data.user) {
         els.authLogin.hidden = true;
         els.authUserWrap.hidden = false;
@@ -1552,20 +1558,151 @@
         els.authUserWrap.hidden = true;
       }
     } catch {
-      userAuthenticated = false;
       els.authLogin.hidden = false;
       els.authUserWrap.hidden = true;
     }
   }
 
-  /** Send the current Twitch logins to the server so the background poller can
-   *  auto-claim channel-points bonuses for each one. Only runs when logged in. */
-  async function syncChannelPointsWatch() {
-    if (!userAuthenticated) return;
+  /* --- Channel points auto-claim (separate Twitch web-session) --- */
+
+  let pointsLinked = false;
+  let pointsPollTimer = null;
+  let pointsStatusTimer = null;
+
+  async function refreshPointsAuth() {
+    try {
+      const res = await fetch('/api/points-auth/status', FETCH_OPTS);
+      const data = await res.json();
+      pointsLinked = Boolean(data.linked);
+      if (els.linkPoints) {
+        els.linkPoints.textContent = pointsLinked
+          ? `Points: ${data.login || 'linked'}`
+          : 'Link for points';
+      }
+    } catch {
+      /* non-critical */
+    }
+  }
+
+  async function startPointsLink() {
+    if (!els.pointsModal) return;
+    els.pointsModal.hidden = false;
+    els.pointsModal.setAttribute('aria-hidden', 'false');
+    els.pointsDeviceCode.hidden = true;
+    els.pointsLinked.hidden = true;
+    els.pointsUnlink.hidden = true;
+
+    /* Check if already linked */
+    try {
+      const res = await fetch('/api/points-auth/status', FETCH_OPTS);
+      const data = await res.json();
+      if (data.linked) {
+        showPointsLinked(data.login);
+        return;
+      }
+    } catch { /* continue to device flow */ }
+
+    /* Start device code flow */
+    try {
+      const res = await fetch('/api/points-auth/device', {
+        ...FETCH_OPTS,
+        method: 'POST',
+      });
+      const data = await res.json();
+      if (data.error) {
+        if (els.pointsPollingStatus) {
+          els.pointsPollingStatus.textContent = `Error: ${data.error}`;
+        }
+        els.pointsDeviceCode.hidden = false;
+        return;
+      }
+      els.pointsDeviceCode.hidden = false;
+      els.pointsDeviceUrl.textContent = data.verificationUri;
+      els.pointsCodeDisplay.textContent = data.userCode;
+      els.pointsPollingStatus.textContent = 'Waiting for authorization…';
+      /* Start polling for completion */
+      startPointsPolling();
+    } catch (e) {
+      if (els.pointsPollingStatus) {
+        els.pointsPollingStatus.textContent = `Error: ${e.message}`;
+      }
+      els.pointsDeviceCode.hidden = false;
+    }
+  }
+
+  function startPointsPolling() {
+    if (pointsPollTimer) clearInterval(pointsPollTimer);
+    pointsPollTimer = setInterval(async () => {
+      try {
+        const res = await fetch('/api/points-auth/poll', FETCH_OPTS);
+        const data = await res.json();
+        if (data.status === 'linked') {
+          clearInterval(pointsPollTimer);
+          pointsPollTimer = null;
+          pointsLinked = true;
+          if (els.linkPoints) {
+            els.linkPoints.textContent = `Points: ${data.login || 'linked'}`;
+          }
+          showPointsLinked(data.login);
+          syncPointsWatch();
+        } else if (data.status === 'expired') {
+          clearInterval(pointsPollTimer);
+          pointsPollTimer = null;
+          if (els.pointsPollingStatus) {
+            els.pointsPollingStatus.textContent = 'Code expired. Close and try again.';
+          }
+        } else if (data.status === 'error') {
+          clearInterval(pointsPollTimer);
+          pointsPollTimer = null;
+          if (els.pointsPollingStatus) {
+            els.pointsPollingStatus.textContent = `Error: ${data.error}`;
+          }
+        }
+        /* status === 'pending' → keep polling */
+      } catch {
+        /* ignore — will retry next interval */
+      }
+    }, 5000);
+  }
+
+  function showPointsLinked(login) {
+    els.pointsDeviceCode.hidden = true;
+    els.pointsLinked.hidden = false;
+    els.pointsUnlink.hidden = false;
+    els.pointsLinkedLogin.textContent = login || 'linked';
+    refreshPointsStatus();
+  }
+
+  async function refreshPointsStatus() {
+    if (!pointsLinked) return;
+    try {
+      const res = await fetch('/api/points/status', FETCH_OPTS);
+      const data = await res.json();
+      if (data.totalClaimed > 0 && els.pointsClaimsSummary) {
+        els.pointsClaimsSummary.textContent = `Auto-claimed ${data.totalClaimed} points so far.`;
+      }
+      /* Show a small indicator in the toolbar meta area */
+      if (els.toolbarMeta && data.totalClaimed > 0) {
+        const existing = els.toolbarMeta.querySelector('.points-indicator');
+        if (existing) existing.remove();
+        const span = document.createElement('span');
+        span.className = 'points-indicator';
+        span.textContent = `Auto-claimed ${data.totalClaimed} pts`;
+        els.toolbarMeta.appendChild(span);
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /** Send the current Twitch logins to the server so the poller knows which
+   *  channels to watch for bonus claims. */
+  async function syncPointsWatch() {
+    if (!pointsLinked) return;
     const logins = twitchChannelsForChat();
     if (!logins.length) return;
     try {
-      await fetch('/api/channel-points/watch', {
+      await fetch('/api/points/watch', {
         ...FETCH_OPTS,
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1576,30 +1713,34 @@
     }
   }
 
-  /** Poll the server for recently auto-claimed bonus points and show a small
-   *  running total in the toolbar meta area. */
-  async function pollChannelPointsStatus() {
-    if (!userAuthenticated) return;
+  async function unlinkPoints() {
     try {
-      const res = await fetch('/api/channel-points/status', FETCH_OPTS);
-      const data = await res.json();
-      if (data.claims && data.claims.length) {
-        const total = data.claims.reduce(
-          (sum, c) => sum + (c.pointsEarned || 0),
-          0
-        );
-        channelPointsTotal = total;
-        if (els.toolbarMeta) {
-          const existing = els.toolbarMeta.querySelector('.points-total');
-          if (existing) existing.remove();
-          const span = document.createElement('span');
-          span.className = 'points-total';
-          span.textContent = `Auto-claimed ${total} pts`;
-          els.toolbarMeta.appendChild(span);
-        }
-      }
-    } catch {
-      /* ignore */
+      await fetch('/api/points-auth/logout', {
+        ...FETCH_OPTS,
+        method: 'POST',
+      });
+    } catch { /* ignore */ }
+    pointsLinked = false;
+    if (els.linkPoints) els.linkPoints.textContent = 'Link for points';
+    els.pointsLinked.hidden = true;
+    els.pointsUnlink.hidden = true;
+    els.pointsDeviceCode.hidden = true;
+    closePointsModal();
+    /* Remove the toolbar indicator */
+    if (els.toolbarMeta) {
+      const existing = els.toolbarMeta.querySelector('.points-indicator');
+      if (existing) existing.remove();
+    }
+  }
+
+  function closePointsModal() {
+    if (pointsPollTimer) {
+      clearInterval(pointsPollTimer);
+      pointsPollTimer = null;
+    }
+    if (els.pointsModal) {
+      els.pointsModal.hidden = true;
+      els.pointsModal.setAttribute('aria-hidden', 'true');
     }
   }
 
@@ -2880,7 +3021,7 @@
     updateFollowImportButtonsVisibility();
     updatePriorityEditButtonVisibility();
     updateRefreshStreamsButton();
-    syncChannelPointsWatch();
+    syncPointsWatch();
     requestAnimationFrame(() => {
       requestAnimationFrame(() => layoutGridToViewport());
     });
@@ -3042,6 +3183,20 @@
     els.followGame.addEventListener('click', () => {
       promptAddCategoryFollow();
     });
+  }
+
+  /* Channel points: link button + modal events */
+  if (els.linkPoints) {
+    els.linkPoints.addEventListener('click', startPointsLink);
+  }
+  if (els.pointsModalCancel) {
+    els.pointsModalCancel.addEventListener('click', closePointsModal);
+  }
+  if (els.pointsModalBackdrop) {
+    els.pointsModalBackdrop.addEventListener('click', closePointsModal);
+  }
+  if (els.pointsUnlink) {
+    els.pointsUnlink.addEventListener('click', unlinkPoints);
   }
 
   els.toolbarToggle.addEventListener('click', () => {
@@ -3270,14 +3425,15 @@
     await refreshOnly();
     await refreshCategoryFollows();
     await refreshAuth();
+    await refreshPointsAuth();
     setupGridDrag();
     fullRender();
     schedulePoll();
     scheduleCategoryPoll();
-    /* Poll for auto-claimed channel points every 60s (the server polls Twitch
-       at the same cadence). Only shows results when logged in. */
-    if (!channelPointsTimer) {
-      channelPointsTimer = setInterval(pollChannelPointsStatus, 60_000);
+    /* Poll for points status every 60s if linked (server polls Twitch at
+       the same cadence). */
+    if (!pointsStatusTimer) {
+      pointsStatusTimer = setInterval(refreshPointsStatus, 60_000);
     }
     console.info(
       `[twitchviewer] Twitch playback: ${twitchPlayback}. proxy = streamlink pass-through (no ffmpeg, quality per tile size); iframe = Twitch.Player (setQuality: ~480p when Priority tiles off, Auto when on); hls = legacy streamlink+ffmpeg transcode. Run twitchviewerAutoplayDiagnostics().`

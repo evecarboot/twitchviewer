@@ -196,7 +196,8 @@ body {
   color: #e59800;
 }
 
-.points-total {
+/* Channel points auto-claim indicator in the toolbar meta area. */
+.points-indicator {
   display: inline-block;
   margin-left: 0.5rem;
   padding: 0.1rem 0.4rem;
@@ -204,6 +205,21 @@ body {
   background: rgba(145, 70, 255, 0.2);
   color: #c9b3ff;
   font-size: 0.75rem;
+}
+
+/* Device code display in the linking modal — large, easy to read on a TV. */
+.points-code-display {
+  font-size: 2rem;
+  font-weight: 700;
+  letter-spacing: 0.3rem;
+  text-align: center;
+  padding: 1rem;
+  margin: 0.5rem 0;
+  background: var(--bg, #0e0e10);
+  border: 1px solid var(--border, #333);
+  border-radius: 8px;
+  color: var(--text, #e6e6e6);
+  font-family: monospace;
 }
 
 .channel-list {
