@@ -1302,27 +1302,30 @@ async function pollPointsDeviceFlow() {
     return { status: 'error', error: 'Twitch returned invalid response' };
   }
 
-  /* Debug: log the full response when it's not a standard pending/slow_down */
-  if (data.error !== 'authorization_pending' && data.error !== 'slow_down') {
+  /* Debug: log the full response when it's not a standard pending */
+  const msg = data.message || data.error || '';
+  if (msg !== 'authorization_pending' && msg !== 'slow_down') {
     console.info(`[points] Token endpoint response (${res.status}): ${rawBody.slice(0, 300)}`);
   }
 
-  if (data.error === 'authorization_pending') return { status: 'pending' };
-  if (data.error === 'slow_down') {
+  /* Twitch's device code flow uses {status, message} instead of the standard
+     OAuth {error, error_description} format. Handle both for safety. */
+  if (msg === 'authorization_pending') return { status: 'pending' };
+  if (msg === 'slow_down') {
     deviceCodeState.interval += 5000;
     return { status: 'pending' };
   }
-  if (data.error === 'expired_token') {
+  if (msg === 'expired_token' || msg === 'Token expired') {
     deviceCodeState = null;
     return { status: 'expired' };
   }
-  if (data.error) {
+  if (data.error || (data.status && data.status >= 400 && !data.access_token)) {
     deviceCodeState = null;
-    return { status: 'error', error: data.error_description || data.error };
+    return { status: 'error', error: data.error_description || data.message || data.error || 'Unknown error' };
   }
   if (!data.access_token) {
     deviceCodeState = null;
-    return { status: 'error', error: 'No access token in response' };
+    return { status: 'error', error: `No access token in response: ${rawBody.slice(0, 200)}` };
   }
 
   /* Success — resolve the user's login via Helix (using the same token/client). */
