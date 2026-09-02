@@ -262,36 +262,6 @@ body {
   color: var(--text);
 }
 
-.peek-chat {
-  position: fixed;
-  right: 0;
-  top: 50%;
-  transform: translateY(-50%);
-  z-index: 20;
-  padding: 0.5rem 0.35rem;
-  border: 1px solid var(--border);
-  border-radius: 6px 0 0 6px;
-  border-right: none;
-  background: var(--surface);
-  color: var(--muted);
-  cursor: pointer;
-  font-size: 0.8rem;
-  writing-mode: vertical-rl;
-  text-orientation: mixed;
-}
-
-.peek-chat:hover {
-  color: var(--text);
-}
-
-#app.chat-on-left .peek-chat {
-  left: 0;
-  right: auto;
-  border-radius: 0 6px 6px 0;
-  border-left: none;
-  border-right: 1px solid var(--border);
-}
-
 .main {
   /* basis 0 so this row fills all space below the toolbar (avoids 1fr rows collapsing to 300px). */
   flex: 1 1 0;
@@ -347,16 +317,6 @@ body {
 
 .grid-split > .grid.grid-rest-hidden {
   display: none !important;
-}
-
-.main.chat-on-left .grid-area {
-  order: 2;
-}
-
-.main.chat-on-left .chat-panel {
-  order: 1;
-  border-left: none;
-  border-right: 1px solid var(--border);
 }
 
 /* Grid minimums are runtime-controlled from app.js via CSS vars so we can
@@ -536,13 +496,15 @@ body.grid-dragging .cell video.cell-video {
   background: rgba(0, 0, 0, 0.85);
 }
 
-/* The chat pane docks on the right of the tile; video shrinks to the left. */
+/* The chat pane docks on the right of the tile; video shrinks to the left.
+   Sized to feel like a Twitch popout — half the tile, capped so very large
+   tiles (e.g. on a 55" portrait TV) don't waste space. */
 .cell-chat-wrap {
   position: absolute;
   top: 0;
   right: 0;
   bottom: 0;
-  width: var(--cell-chat-w, min(360px, 45%));
+  width: var(--cell-chat-w, min(560px, 50%));
   z-index: 10;
   display: none;
   background: #0e0e10;
@@ -562,7 +524,7 @@ body.grid-dragging .cell video.cell-video {
 /* When chat is open: shrink the video/iframe + embed hosts to the left portion,
    reveal the chat wrap, and hide the drag handle (it would overlap the chat). */
 .cell.cell-chat-open {
-  --cell-chat-w: min(360px, 45%);
+  --cell-chat-w: min(560px, 50%);
 }
 
 .cell.cell-chat-open .twitch-embed-host,
@@ -585,78 +547,8 @@ body.grid-dragging .cell video.cell-video {
    usable. The toggle button stays accessible on top of the chat pane. */
 @media (max-width: 700px) {
   .cell.cell-chat-open {
-    --cell-chat-w: min(280px, 55%);
+    --cell-chat-w: min(340px, 60%);
   }
-}
-
-.chat-panel {
-  flex: 0 0 min(360px, 40vw);
-  min-width: 260px;
-  max-width: 100%;
-  display: flex;
-  flex-direction: column;
-  border-left: 1px solid var(--border);
-  background: var(--surface);
-  min-height: 0;
-}
-
-/* .chat-panel { display: flex } overrides the native [hidden] rule; force collapse */
-#chat-panel[hidden],
-#peek-chat[hidden] {
-  display: none !important;
-}
-
-.chat-panel-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.5rem;
-  padding: 0.35rem 0.5rem;
-  border-bottom: 1px solid var(--border);
-  font-size: 0.9rem;
-}
-
-.chat-panel-header-main {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  min-width: 0;
-  flex: 1;
-}
-
-.chat-panel-heading {
-  flex-shrink: 0;
-  font-weight: 600;
-  color: var(--text);
-}
-
-.chat-channel-select {
-  flex: 1;
-  min-width: 0;
-  max-width: 100%;
-  padding: 0.25rem 0.35rem;
-  border-radius: 4px;
-  border: 1px solid var(--border);
-  background: var(--bg);
-  color: var(--text);
-  font-size: 0.85rem;
-}
-
-.chat-iframe-wrap {
-  flex: 1;
-  min-height: 0;
-  position: relative;
-}
-
-.chat-iframe-wrap iframe {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  max-width: 100%;
-  max-height: 100%;
-  border: 0;
-  display: block;
 }
 
 .modal {
@@ -774,17 +666,6 @@ body.grid-dragging .cell video.cell-video {
 }
 
 @media (max-width: 700px) {
-  .chat-panel {
-    flex-basis: 100%;
-    max-width: 100%;
-    border-left: none;
-    border-top: 1px solid var(--border);
-  }
-
-  .main.chat-on-left .chat-panel {
-    border-right: none;
-  }
-
   .main {
     flex-direction: column;
   }

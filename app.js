@@ -26,13 +26,8 @@
     prioritySelection: [],
     sortByViews: false,
     sortByViewsInvert: false,
-    showChat: false,
-    hideChatPanel: false,
-    chatOnLeft: false,
-    chatForLogin: null,
     /** Twitch logins (lowercase) that have their per-tile chat open — each tile
-     *  splits into VIDEO | CHAT when present. Independent of the global chat
-     *  panel so both can be used at once. */
+     *  splits into VIDEO | CHAT when present. */
     cellChats: [],
     toolbarCollapsed: false,
   });
@@ -75,17 +70,9 @@
     refreshStreams: document.getElementById('refresh-streams'),
     followGame: document.getElementById('follow-game'),
     categoryList: document.getElementById('category-list'),
-    showChat: document.getElementById('show-chat'),
-    hideChatPanelWrap: document.getElementById('hide-chat-panel-wrap'),
-    hideChatPanel: document.getElementById('hide-chat-panel'),
-    chatOnLeftWrap: document.getElementById('chat-on-left-wrap'),
-    chatOnLeft: document.getElementById('chat-on-left'),
-    chatChannelWrap: document.getElementById('chat-channel-wrap'),
-    chatChannel: document.getElementById('chat-channel'),
     toolbarToggle: document.getElementById('toolbar-toggle'),
     toolbar: document.getElementById('toolbar'),
     peekTab: document.getElementById('peek-tab'),
-    peekChat: document.getElementById('peek-chat'),
     app: document.getElementById('app'),
     main: document.getElementById('main'),
     toolbarMeta: document.getElementById('toolbar-meta'),
@@ -94,10 +81,6 @@
     gridSplit: document.getElementById('grid-split'),
     gridPriority: document.getElementById('grid-priority'),
     gridArea: document.getElementById('grid-area'),
-    chatPanel: document.getElementById('chat-panel'),
-    chatIframeWrap: document.getElementById('chat-iframe-wrap'),
-    chatChannelPanel: document.getElementById('chat-channel-panel'),
-    closeChat: document.getElementById('close-chat'),
     authLogin: document.getElementById('auth-login'),
     authUserWrap: document.getElementById('auth-user-wrap'),
     authAvatar: document.getElementById('auth-avatar'),
@@ -1646,10 +1629,6 @@
       )
       .map((login) => ({ type: 'twitch', login }));
     state.channels = [...kept, ...added];
-    const twitchChat = twitchChannelsForChat();
-    if (state.chatForLogin && !twitchChat.includes(state.chatForLogin)) {
-      state.chatForLogin = twitchChat[0] || null;
-    }
     saveState();
     closeFollowModal();
     tick().then(() => {
@@ -1780,10 +1759,6 @@
       rm.textContent = '×';
       rm.addEventListener('click', () => {
         state.channels = state.channels.filter((c) => channelKey(c) !== key);
-        const twitchChat = twitchChannelsForChat();
-        if (state.chatForLogin && !twitchChat.includes(state.chatForLogin)) {
-          state.chatForLogin = twitchChat[0] || null;
-        }
         saveState();
         fullRender();
         schedulePoll();
@@ -1845,10 +1820,6 @@
         state.channels = state.channels.filter(
           (c) => !(getChannelType(c) === 'twitch' && c.fromCategory === cat.id)
         );
-        const twitchChat = twitchChannelsForChat();
-        if (state.chatForLogin && !twitchChat.includes(state.chatForLogin)) {
-          state.chatForLogin = twitchChat[0] || null;
-        }
         saveState();
         fullRender();
         schedulePoll();
@@ -1997,11 +1968,10 @@
   }
 
   function renderChatSelect() {
-    const prev = state.chatForLogin;
-    const twitchList = twitchChannelsForChat();
     /* Drop per-tile chats for channels that are no longer in the grid so
        state.cellChats doesn't keep growing as channels are added/removed. */
     if (state.cellChats.length) {
+      const twitchList = twitchChannelsForChat();
       const valid = new Set(twitchList);
       const filtered = state.cellChats.filter((l) => valid.has(l));
       if (filtered.length !== state.cellChats.length) {
@@ -2009,36 +1979,6 @@
         saveState();
       }
     }
-    const selects = [els.chatChannel, els.chatChannelPanel].filter(Boolean);
-    for (const sel of selects) {
-      sel.innerHTML = '';
-      twitchList.forEach((login) => {
-        const opt = document.createElement('option');
-        opt.value = login;
-        opt.textContent = login;
-        sel.appendChild(opt);
-      });
-    }
-    if (twitchList.length) {
-      if (!twitchList.includes(prev)) state.chatForLogin = twitchList[0];
-      const v = state.chatForLogin || twitchList[0];
-      state.chatForLogin = v;
-      for (const sel of selects) {
-        sel.value = v;
-      }
-    } else {
-      state.chatForLogin = null;
-    }
-  }
-
-  function renderChatIframe() {
-    els.chatIframeWrap.innerHTML = '';
-    if (!state.showChat || !state.chatForLogin) return;
-    if (state.hideChatPanel) return;
-    const iframe = document.createElement('iframe');
-    iframe.src = chatSrc(state.chatForLogin);
-    iframe.title = `Twitch chat: ${state.chatForLogin}`;
-    els.chatIframeWrap.appendChild(iframe);
   }
 
   function destroyCellMedia(cell) {
@@ -2799,49 +2739,6 @@
     requestAnimationFrame(() => layoutGridToViewport());
   }
 
-  function applyChatLayout() {
-    const hasTwitchChat = twitchChannelsForChat().length > 0;
-    els.showChat.checked = state.showChat;
-    els.hideOffline.checked = state.hideOffline;
-    els.chatChannelWrap.hidden = !state.showChat || !hasTwitchChat;
-    if (els.hideChatPanelWrap) {
-      els.hideChatPanelWrap.hidden = !state.showChat;
-    }
-    if (els.chatOnLeftWrap) {
-      els.chatOnLeftWrap.hidden = !state.showChat;
-    }
-    if (els.hideChatPanel) {
-      els.hideChatPanel.checked = state.hideChatPanel;
-    }
-    if (els.chatOnLeft) {
-      els.chatOnLeft.checked = state.chatOnLeft;
-    }
-    const panelVisible =
-      state.showChat && hasTwitchChat && !state.hideChatPanel;
-    els.chatPanel.hidden = !panelVisible;
-    if (els.main) {
-      els.main.classList.toggle(
-        'chat-on-left',
-        Boolean(state.chatOnLeft && state.showChat)
-      );
-    }
-    if (els.app) {
-      els.app.classList.toggle(
-        'chat-on-left',
-        Boolean(state.chatOnLeft && state.showChat)
-      );
-    }
-    if (els.peekChat) {
-      els.peekChat.hidden = !(
-        state.showChat &&
-        state.hideChatPanel &&
-        hasTwitchChat
-      );
-    }
-    renderChatIframe();
-    requestAnimationFrame(() => layoutGridToViewport());
-  }
-
   function updateRefreshStreamsButton() {
     if (!els.refreshStreams) return;
     const hasTwitchToPoll = twitchLoginsForPoll().length > 0;
@@ -2863,7 +2760,6 @@
     renderChannelChips();
     renderCategoryChips();
     renderChatSelect();
-    applyChatLayout();
     applySortControls();
     applyToolbarLayout();
     renderGrid();
@@ -2964,9 +2860,6 @@
     if (!state.channels.some((c) => channelKey(c) === channelKey(newCh))) {
       state.channels.push(newCh);
     }
-    if (!state.chatForLogin && getChannelType(newCh) === 'twitch') {
-      state.chatForLogin = getTwitchLogin(newCh);
-    }
     els.channelInput.value = '';
     saveState();
     setMeta('', false);
@@ -3036,49 +2929,6 @@
     });
   }
 
-  els.showChat.addEventListener('change', () => {
-    state.showChat = els.showChat.checked;
-    if (!state.showChat) {
-      state.hideChatPanel = false;
-    }
-    saveState();
-    applyChatLayout();
-  });
-
-  if (els.hideChatPanel) {
-    els.hideChatPanel.addEventListener('change', () => {
-      state.hideChatPanel = els.hideChatPanel.checked;
-      saveState();
-      applyChatLayout();
-    });
-  }
-
-  if (els.chatOnLeft) {
-    els.chatOnLeft.addEventListener('change', () => {
-      state.chatOnLeft = els.chatOnLeft.checked;
-      saveState();
-      applyChatLayout();
-    });
-  }
-
-  function onChatChannelPick(source) {
-    const v = source.value;
-    state.chatForLogin = v;
-    if (els.chatChannel && source !== els.chatChannel) els.chatChannel.value = v;
-    if (els.chatChannelPanel && source !== els.chatChannelPanel) {
-      els.chatChannelPanel.value = v;
-    }
-    saveState();
-    renderChatIframe();
-  }
-
-  els.chatChannel.addEventListener('change', () => onChatChannelPick(els.chatChannel));
-  if (els.chatChannelPanel) {
-    els.chatChannelPanel.addEventListener('change', () =>
-      onChatChannelPick(els.chatChannelPanel)
-    );
-  }
-
   els.toolbarToggle.addEventListener('click', () => {
     state.toolbarCollapsed = true;
     saveState();
@@ -3091,20 +2941,6 @@
     applyToolbarLayout();
   });
 
-  els.closeChat.addEventListener('click', () => {
-    state.hideChatPanel = true;
-    saveState();
-    applyChatLayout();
-  });
-
-  if (els.peekChat) {
-    els.peekChat.addEventListener('click', () => {
-      state.hideChatPanel = false;
-      saveState();
-      applyChatLayout();
-    });
-  }
-
   els.hideOffline.checked = state.hideOffline;
   if (els.priorityTiles) {
     els.priorityTiles.checked = state.priorityTiles;
@@ -3114,7 +2950,6 @@
       openPriorityModal();
     });
   }
-  els.showChat.checked = state.showChat;
 
   async function fetchFollowsFromApi() {
     const res = await fetch('/api/follows', FETCH_OPTS);
