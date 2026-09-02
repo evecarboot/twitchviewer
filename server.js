@@ -1559,6 +1559,15 @@ async function gqlWithPointsToken(queryObj) {
 /** Track whether we've logged the first successful ChannelPointsContext
  *  response structure (for debugging the data path). Reset on server start. */
 let pointsLoggedFirstResponse = false;
+/** Track whether we've logged the first successful ClaimCommunityPoints
+ *  response (full JSON) for debugging. Reset on server start. */
+let pointsLoggedFirstClaim = false;
+/** Per-channel balance snapshot taken before a claim, so we can compute the
+ *  earned amount via balance delta on the next ChannelPointsContext poll.
+ *  Map<login, { balanceBefore: number, claimId: string, claimTs: number }>. */
+const pointsPendingBalanceCheck = new Map();
+/** Per-channel last known balance (for delta comparison). Map<login, number>. */
+const pointsLastBalance = new Map();
 
 async function pollChannelPoints() {
   if (pointsWatchLogins.size === 0) {
@@ -1655,6 +1664,34 @@ async function pollChannelPoints() {
         continue;
       }
 
+      /* Track the current balance for this channel. */
+      const currentBalance = typeof cp.balance === 'number' ? cp.balance : null;
+      const prevBalance = pointsLastBalance.get(login);
+      if (currentBalance !== null) {
+        pointsLastBalance.set(login, currentBalance);
+      }
+
+      /* Check if we have a pending balance-delta verification for this channel
+         (i.e. we claimed a bonus recently and want to confirm via balance). */
+      const pending = pointsPendingBalanceCheck.get(login);
+      if (pending && currentBalance !== null) {
+        const delta = currentBalance - (pending.balanceBefore ?? 0);
+        console.info(`[points] ${login}: balance delta after claim ${pending.claimId.slice(0, 8)}…: ${pending.balanceBefore ?? '?'} → ${currentBalance} (Δ=${delta})`);
+        pointsPendingBalanceCheck.delete(login);
+        /* If we previously recorded the claim as +0 (because pointsEarned was
+           absent), update the recorded claim with the delta-derived amount. */
+        if (delta > 0) {
+          const claimIdx = pointsClaims.findIndex(
+            (c) => c.claimId === pending.claimId
+          );
+          if (claimIdx >= 0 && (!pointsClaims[claimIdx].pointsEarned || pointsClaims[claimIdx].pointsEarned === 0)) {
+            pointsClaims[claimIdx].pointsEarned = delta;
+            pointsClaims[claimIdx].balanceDelta = delta;
+            console.info(`[points] ${login}: updated claim ${pending.claimId.slice(0, 8)}… earned amount from balance delta: +${delta}`);
+          }
+        }
+      }
+
       /* availableClaim is a single object (not array) in the current schema. */
       const claim = cp.availableClaim;
       if (!claim || !claim.id) {
@@ -1663,6 +1700,7 @@ async function pollChannelPoints() {
       }
 
       console.info(`[points] ${login}: bonus claim ${claim.id} found`);
+      console.info(`[points] ${login}: balance before claim: ${currentBalance ?? 'unknown'}`);
       console.info(`[points] ${login}: ClaimCommunityPoints…`);
 
       /* ClaimCommunityPoints: persisted mutation that claims the bonus.
@@ -1686,20 +1724,62 @@ async function pollChannelPoints() {
         continue;
       }
 
+      /* Log the complete first successful ClaimCommunityPoints JSON response. */
+      if (!pointsLoggedFirstClaim) {
+        pointsLoggedFirstClaim = true;
+        console.info(`[points] First successful ClaimCommunityPoints response for ${login}:`);
+        console.info(`[points]   raw: ${claimRes.body.slice(0, 1000)}`);
+        console.info(`[points]   parsed: ${JSON.stringify(cj).slice(0, 800)}`);
+      }
+
       if (cj.errors && cj.errors.length) {
         console.warn(`[points] ${login}: ClaimCommunityPoints GQL errors: ${cj.errors.map((e) => e.message).join('; ')}`);
         continue;
       }
 
-      if (!cj.data || !cj.data.claimCommunityPoints) {
-        console.warn(`[points] ${login}: ClaimCommunityPoints no data object: ${claimRes.body.slice(0, 500)}`);
+      /* Determine if the claim was successful. Do NOT assume pointsEarned exists
+         at any specific path — inspect the response defensively. */
+      const claimData = cj.data?.claimCommunityPoints;
+      const claimObj = claimData?.claim;
+      const earnedFromResponse =
+        typeof claimObj?.pointsEarned === 'number' ? claimObj.pointsEarned : null;
+
+      /* A successful claim typically returns data.claimCommunityPoints (even if
+         pointsEarned is absent). If the claim ID disappears on the next
+         ChannelPointsContext poll, that also confirms success. */
+      const claimSucceeded = Boolean(claimData);
+
+      if (!claimSucceeded) {
+        console.warn(`[points] ${login}: ClaimCommunityPoints no data.claimCommunityPoints: ${claimRes.body.slice(0, 500)}`);
         continue;
       }
 
-      const earned = cj.data.claimCommunityPoints.claim?.pointsEarned || 0;
-      console.info(`[points] ${login}: claimed +${earned}`);
-      pointsClaims.unshift({ login, pointsEarned: earned, ts: Date.now() });
+      /* Record the claim. If pointsEarned is absent, record as successful with
+         earned=0 for now; the balance delta on the next poll will update it. */
+      const earned = earnedFromResponse ?? 0;
+      const claimRecord = {
+        login,
+        claimId: claim.id,
+        pointsEarned: earned,
+        ts: Date.now(),
+      };
+      pointsClaims.unshift(claimRecord);
       if (pointsClaims.length > 50) pointsClaims.length = 50;
+
+      /* Schedule a balance-delta check for the next ChannelPointsContext poll. */
+      if (earnedFromResponse === null && currentBalance !== null) {
+        pointsPendingBalanceCheck.set(login, {
+          balanceBefore: currentBalance,
+          claimId: claim.id,
+          claimTs: Date.now(),
+        });
+      }
+
+      if (earnedFromResponse !== null) {
+        console.info(`[points] ${login}: claimed +${earned} (from response)`);
+      } else {
+        console.info(`[points] ${login}: claim ${claim.id.slice(0, 8)}… accepted (pointsEarned absent — will verify via balance delta on next poll)`);
+      }
     } catch (e) {
       /* Log the full exception — do NOT swallow. */
       console.warn(`[points] ${login}: error during poll: ${e.message || e}`);
