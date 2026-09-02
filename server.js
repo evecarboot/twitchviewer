@@ -1328,6 +1328,9 @@ async function pollPointsDeviceFlow() {
     return { status: 'error', error: `No access token in response: ${rawBody.slice(0, 200)}` };
   }
 
+  /* Clear device code state immediately so concurrent polls don't double-link. */
+  deviceCodeState = null;
+
   /* Success — resolve the user's login via Helix (using the same token/client). */
   let login = 'unknown';
   try {
@@ -1348,7 +1351,9 @@ async function pollPointsDeviceFlow() {
   pointsToken = {
     accessToken: data.access_token,
     refreshToken: data.refresh_token,
-    expiresAt: Date.now() + (data.expires_in || 0) * 1000,
+    /* Twitch's Android client doesn't return expires_in — assume a long-lived
+       token (~60 days). We'll refresh on 401 instead of proactively. */
+    expiresAt: Date.now() + ((data.expires_in || 5184000) * 1000),
     login,
   };
   savePointsToken(pointsToken);
@@ -1371,16 +1376,24 @@ async function refreshPointsToken() {
       }),
     });
     if (!res.ok) {
-      console.warn(`[points] Token refresh failed (${res.status}) — re-link needed`);
+      const text = await res.text();
+      console.warn(`[points] Token refresh failed (${res.status}): ${text.slice(0, 200)} — re-link needed`);
       pointsToken = null;
       try { fs.unlinkSync(pointsTokenPath); } catch { /* ignore */ }
       return null;
     }
     const data = await res.json();
+    if (!data.access_token) {
+      console.warn(`[points] Token refresh returned no access_token — re-link needed`);
+      pointsToken = null;
+      try { fs.unlinkSync(pointsTokenPath); } catch { /* ignore */ }
+      return null;
+    }
     pointsToken = {
       accessToken: data.access_token,
       refreshToken: data.refresh_token || pointsToken.refreshToken,
-      expiresAt: Date.now() + (data.expires_in || 0) * 1000,
+      /* Twitch's Android client doesn't return expires_in — assume long-lived. */
+      expiresAt: Date.now() + ((data.expires_in || 5184000) * 1000),
       login: pointsToken.login,
     };
     savePointsToken(pointsToken);
