@@ -1960,12 +1960,16 @@ async function processSingleClaim({ login, channelId, claimId, balanceBefore }) 
       return false;
     }
 
-    /* Log the complete first successful ClaimCommunityPoints JSON response. */
+    /* Log the complete first successful ClaimCommunityPoints JSON response,
+       but only when POINTS_DEBUG is set — the response structure is now
+       confirmed and the dump is no longer needed in normal operation. */
     if (!pointsLoggedFirstClaim) {
       pointsLoggedFirstClaim = true;
-      console.info(`[points] First successful ClaimCommunityPoints response for ${login}:`);
-      console.info(`[points]   raw: ${claimRes.body.slice(0, 1000)}`);
-      console.info(`[points]   parsed: ${JSON.stringify(cj).slice(0, 800)}`);
+      if (process.env.POINTS_DEBUG) {
+        console.info(`[points] First successful ClaimCommunityPoints response for ${login}:`);
+        console.info(`[points]   raw: ${claimRes.body.slice(0, 1000)}`);
+        console.info(`[points]   parsed: ${JSON.stringify(cj).slice(0, 800)}`);
+      }
     }
 
     if (cj.errors && cj.errors.length) {
@@ -1973,68 +1977,53 @@ async function processSingleClaim({ login, channelId, claimId, balanceBefore }) 
       return false;
     }
 
-    /* Determine if the claim was successful. Do NOT assume pointsEarned exists
-       at any specific path — inspect the response defensively by searching
-       multiple possible locations in the response tree. */
-    const claimData = cj.data?.claimCommunityPoints;
-    const claimObj = claimData?.claim;
+    /* Parse the claim response. Twitch's current schema returns:
+     *   data.claimCommunityPoints.claim.pointsEarnedBaseline
+     *   data.claimCommunityPoints.claim.pointsEarnedTotal
+     *   data.claimCommunityPoints.currentPoints
+     * It does NOT return claim.pointsEarned (older schema). */
+    const payload = cj.data?.claimCommunityPoints;
+    const claimObj = payload?.claim;
 
-    /* Search multiple possible paths for pointsEarned — the response
-       structure has changed across Twitch API versions. */
-    const earnedFromResponse =
-      typeof claimObj?.pointsEarned === 'number' ? claimObj.pointsEarned :
-      typeof claimData?.pointsEarned === 'number' ? claimData.pointsEarned :
-      typeof cj.data?.claimCommunityPoints?.pointsEarned === 'number' ? cj.data.claimCommunityPoints.pointsEarned :
+    const earned =
+      typeof claimObj?.pointsEarnedTotal === 'number' ? claimObj.pointsEarnedTotal :
+      typeof claimObj?.pointsEarnedBaseline === 'number' ? claimObj.pointsEarnedBaseline :
       null;
 
-    /* If we still can't find it, log the full structure so we can see
-       where Twitch put it (or if it's genuinely absent). */
-    if (earnedFromResponse === null && claimData) {
-      console.info(`[points] ${login}: ClaimCommunityPoints response structure (searching for pointsEarned):`);
-      console.info(`[points]   data.claimCommunityPoints keys: ${Object.keys(claimData).join(', ')}`);
-      if (claimObj) {
-        console.info(`[points]   data.claimCommunityPoints.claim keys: ${Object.keys(claimObj).join(', ')}`);
-      }
-    }
+    const currentPoints =
+      typeof payload?.currentPoints === 'number' ? payload.currentPoints : null;
 
-    /* A successful claim typically returns data.claimCommunityPoints (even if
-       pointsEarned is absent). If the claim ID disappears on the next
-       ChannelPointsContext poll, that also confirms success. */
-    const claimSucceeded = Boolean(claimData);
+    /* Success = no error and the claim object has an ID. */
+    const success = !payload?.error && Boolean(claimObj?.id);
 
-    if (!claimSucceeded) {
-      console.warn(`[points] ${login}: ClaimCommunityPoints no data.claimCommunityPoints: ${claimRes.body.slice(0, 500)}`);
+    if (!success) {
+      console.warn(`[points] ${login}: ClaimCommunityPoints not successful: ${claimRes.body.slice(0, 500)}`);
       return false;
     }
 
-    /* Record the claim. If pointsEarned is absent, record as successful with
-       earned=0 for now; the balance delta on the next poll will update it. */
-    const earned = earnedFromResponse ?? 0;
+    /* Record the claim with the parsed earned amount. */
     const claimRecord = {
       login,
       claimId,
-      pointsEarned: earned,
+      pointsEarned: earned ?? 0,
       ts: Date.now(),
     };
     pointsClaims.unshift(claimRecord);
     if (pointsClaims.length > 50) pointsClaims.length = 50;
 
-    /* Schedule a balance-delta check for the next ChannelPointsContext poll. */
-    if (earnedFromResponse === null && balanceBefore !== null) {
-      pointsPendingBalanceCheck.set(login, {
-        balanceBefore,
-        claimId,
-        claimTs: Date.now(),
-      });
+    /* Update the stored balance immediately from currentPoints so the next
+       ChannelPointsContext poll doesn't see the +50 claim as a passive watch
+       balance delta. Without this, the poll would log e.g. "946180 → 946230
+       (Δ=+50)" and misclassify it as a watch-credit change. */
+    if (currentPoints !== null) {
+      pointsLastBalance.set(login, currentPoints);
     }
 
-    /* Log success. Do NOT hardcode +50 — only report the amount if Twitch
-       actually returned it. Otherwise, log "amount unknown" and let the
-       balance-delta verification on the next poll determine the real amount. */
-    if (earnedFromResponse !== null) {
-      console.info(`[points] ${login}: claim succeeded (+${earned} from response)`);
+    /* Log success with the actual amount from the response. */
+    if (earned !== null) {
+      console.info(`[points] ${login}: claim succeeded (+${earned})`);
     } else {
-      console.info(`[points] ${login}: claim succeeded (amount unknown — will verify via balance delta on next poll)`);
+      console.info(`[points] ${login}: claim succeeded (amount unknown)`);
     }
     return true;
   } catch (e) {
