@@ -387,6 +387,7 @@ app.get('/api/points/status', (_req, res) => {
     watching: [...pointsWatchLogins],
     playing: [...pointsPlayingLogins],
     activeSlots: [...pointsActiveSlots],
+    slotAssignedAt: Object.fromEntries(pointsSlotAssignedAt),
     bonusMonitored: getBonusMonitoredLogins(),
     priority: [...pointsPriorityLogins],
     balances: Object.fromEntries(pointsLastBalance),
@@ -2253,8 +2254,12 @@ async function sendMinuteWatched(login, streamInfo) {
 
 /** @type {string[]} Ordered list of logins the user manually prioritised. */
 let pointsPriorityLogins = [];
-/** @type {string[]} Current sticky slot allocation (up to 2 logins). */
+/** @type {string[]} Current sticky slot allocation (up to POINTS_MAX_ACTIVE logins). */
 let pointsActiveSlots = [];
+/** @type {Map<string, number>} When each login was assigned to an earning slot
+ *  (epoch ms). Used for the earning timer in the UI. Cleared when a login
+ *  leaves the active slots. */
+const pointsSlotAssignedAt = new Map();
 
 /** Recompute the points-active slots from the eligible set.
  *  Eligible = Playing ∩ Live. Sticky: existing slots are kept if still
@@ -2291,11 +2296,13 @@ function recomputePointsActiveSlots() {
     }
   }
 
-  /* Detect slot changes and log the reason for each change. */
+  /* Detect slot changes and log the reason for each change. Also track
+     assignment timestamps for the earning timer in the UI. */
   const oldSlots = pointsActiveSlots;
   const oldKey = oldSlots.join(',');
   const newKey = slots.join(',');
   if (oldKey !== newKey) {
+    const now = Date.now();
     /* Log each slot position for clear debugging. */
     for (let i = 0; i < POINTS_MAX_ACTIVE; i++) {
       const oldLogin = oldSlots[i] || null;
@@ -2309,14 +2316,18 @@ function recomputePointsActiveSlots() {
         else reason = 'displaced by priority';
         console.info(`[points] Slot ${i + 1}: ${oldLogin} removed — ${reason}`);
         console.info(`[points] Slot ${i + 1}: ${newLogin} assigned — eligible`);
+        pointsSlotAssignedAt.delete(oldLogin);
+        pointsSlotAssignedAt.set(newLogin, now);
       } else if (oldLogin && !newLogin) {
         let reason;
         if (!playingSet.has(oldLogin)) reason = 'stopped playing';
         else if (!liveSet.has(oldLogin)) reason = 'offline';
         else reason = 'no longer eligible';
         console.info(`[points] Slot ${i + 1}: ${oldLogin} removed — ${reason}`);
+        pointsSlotAssignedAt.delete(oldLogin);
       } else if (!oldLogin && newLogin) {
         console.info(`[points] Slot ${i + 1}: ${newLogin} assigned — eligible`);
+        pointsSlotAssignedAt.set(newLogin, now);
       }
     }
     console.info(

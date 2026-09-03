@@ -1726,14 +1726,17 @@
     const priority = data.priority || [];
     const balances = data.balances || {};
     const watching = data.watching || [];
+    const slotAssignedAt = data.slotAssignedAt || {};
 
     /* Build a combined unique list of all playing + active channels. */
     const allLogins = [...new Set([...playing, ...activeSlots])];
-    /* Sort: active slots first, then playing, alphabetical. */
+    /* Sort: active slots first (by slot order), then waiting, alphabetical. */
     allLogins.sort((a, b) => {
-      const aActive = activeSlots.includes(a) ? 0 : 1;
-      const bActive = activeSlots.includes(b) ? 0 : 1;
-      if (aActive !== bActive) return aActive - bActive;
+      const aIdx = activeSlots.indexOf(a);
+      const bIdx = activeSlots.indexOf(b);
+      if (aIdx !== -1 && bIdx !== -1) return aIdx - bIdx;
+      if (aIdx !== -1) return -1;
+      if (bIdx !== -1) return 1;
       return a.localeCompare(b);
     });
 
@@ -1747,6 +1750,7 @@
       const isLive = watching.includes(login);
       const isPriority = priority.includes(login);
       const balance = balances[login];
+      const assignedAt = slotAssignedAt[login];
 
       const row = document.createElement('div');
       row.className = 'points-active-row';
@@ -1767,16 +1771,31 @@
         row.appendChild(bal);
       }
 
+      /* Status label: EARNING for active slots, WAITING for eligible-but-not-
+         active, PLAYING for playing-but-not-live, LIVE for live-but-not-playing.
+         The star indicates manual priority/pin. */
       const status = document.createElement('span');
       status.className = 'points-active-status ' + (isActive ? 'earning' : '');
       if (isActive) {
-        status.textContent = isPriority ? 'Earning ★' : 'Earning';
+        /* Earning timer: how long the channel has continuously occupied
+           an earning slot. Format as MM:SS or HH:MM:SS. */
+        let timerText = '';
+        if (assignedAt) {
+          const elapsed = Math.floor((Date.now() - assignedAt) / 1000);
+          const h = Math.floor(elapsed / 3600);
+          const m = Math.floor((elapsed % 3600) / 60);
+          const s = elapsed % 60;
+          timerText = ' · ' + (h > 0
+            ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+            : `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`);
+        }
+        status.textContent = 'EARNING' + timerText + (isPriority ? ' ★' : '');
       } else if (isPlaying && isLive) {
-        status.textContent = 'Eligible';
+        status.textContent = 'WAITING';
       } else if (isPlaying) {
-        status.textContent = 'Playing';
+        status.textContent = 'PLAYING';
       } else {
-        status.textContent = 'Live';
+        status.textContent = 'LIVE';
       }
       row.appendChild(status);
 
@@ -1787,7 +1806,7 @@
           /* Remove from priority. */
           newPriority = priority.filter((l) => l !== login);
         } else {
-          /* Add to priority (max 2). */
+          /* Add to priority (max = earning slot count). */
           newPriority = [...priority, login].slice(-2);
         }
         fetch('/api/points/prioritize', {
