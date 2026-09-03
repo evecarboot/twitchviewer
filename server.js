@@ -387,6 +387,7 @@ app.get('/api/points/status', (_req, res) => {
     watching: [...pointsWatchLogins],
     playing: [...pointsPlayingLogins],
     activeSlots: [...pointsActiveSlots],
+    bonusMonitored: getBonusMonitoredLogins(),
     priority: [...pointsPriorityLogins],
     balances: Object.fromEntries(pointsLastBalance),
     totalClaimed: pointsClaims.reduce((sum, c) => sum + (c.pointsEarned || 0), 0),
@@ -1659,273 +1660,405 @@ const pointsPendingBalanceCheck = new Map();
 /** Per-channel last known balance (for delta comparison). Map<login, number>. */
 const pointsLastBalance = new Map();
 
+/** Guard to prevent overlapping poll cycles. If a poll takes longer than the
+ *  15s interval, subsequent ticks will skip until the in-flight poll finishes. */
+let pointsPollInProgress = false;
+
+/** Set of claim IDs currently being claimed (in-flight). Prevents the same
+ *  availableClaim.id from being queued twice if two poll cycles overlap or
+ *  if a claim is still processing when the next poll finds it again. */
+const inFlightClaimIds = new Set();
+
+/** Compute the bonus-monitored set: Playing ∩ Live.
+ *  This is the set of channels that are both actively playing in the viewer
+ *  AND currently live on Twitch. All of these get ChannelPointsContext polls
+ *  and bonus claim monitoring — regardless of whether they're in the 2
+ *  earning slots. The earning slots are only for watch-credit reporting. */
+function getBonusMonitoredLogins() {
+  return [...pointsPlayingLogins].filter((l) => pointsWatchLogins.has(l));
+}
+
 async function pollChannelPoints() {
-  if (pointsWatchLogins.size === 0) {
-    console.info('[points] Poll skipped — no channels in watch list');
+  /* Guard: never allow overlapping poll cycles. If a previous poll is still
+     running (e.g. slow GQL responses), skip this tick entirely. */
+  if (pointsPollInProgress) {
+    console.info('[points] Poll skipped — previous cycle still in progress');
     return;
   }
-  const token = await getValidPointsToken();
-  if (!token) {
-    console.warn('[points] Poll skipped — no valid token');
-    return;
-  }
-  /* Client-Session-Id is generated once per application session (not per poll). */
-  const logins = [...pointsWatchLogins];
-  console.info(`[points] Polling ${logins.length} channels: ${logins.slice(0, 5).join(', ')}${logins.length > 5 ? '…' : ''}`);
+  pointsPollInProgress = true;
+  try {
+    /* Snapshot the bonus-monitored set at the start of the poll. This prevents
+       the set from changing mid-poll if the client updates the playing set
+       while we're still fetching ChannelPointsContext for earlier channels. */
+    const monitored = getBonusMonitoredLogins();
+    if (monitored.length === 0) {
+      console.info('[points] Poll skipped — no playing+live channels to monitor');
+      return;
+    }
+    const token = await getValidPointsToken();
+    if (!token) {
+      console.warn('[points] Poll skipped — no valid token');
+      return;
+    }
 
-  for (const login of logins) {
-    try {
-      /* ChannelPointsContext: persisted query that returns the channel's points
-         context, including any available bonus claim (the "+50" button).
-         Send ONLY the persisted operation (operationName + variables + extensions.
-         persistedQuery). No raw query text — a persisted hash describes an exact
-         GraphQL document and sending arbitrary text alongside produces
-         "persistedQuery sha256 hash does not match query body". */
-      const queryRes = await gqlWithPointsToken(
-        gqlPersistedOp('ChannelPointsContext', GQL_HASH_CHANNEL_POINTS_CONTEXT, {
-          channelLogin: login,
-        })
-      );
+    /* Log the full state breakdown each poll cycle. */
+    console.info(
+      `[points] Playing ${pointsPlayingLogins.size} | Live ${pointsWatchLogins.size} | ` +
+      `Earning ${pointsActiveSlots.length} | Bonus-monitored ${monitored.length}`
+    );
 
-      console.info(`[points] ${login}: ChannelPointsContext HTTP ${queryRes.status}`);
+    /* Client-Session-Id is generated once per application session (not per poll). */
+    const logins = monitored;
+    console.info(`[points] Polling ${logins.length} channels: ${logins.slice(0, 5).join(', ')}${logins.length > 5 ? '…' : ''}`);
 
-      if (queryRes.status === 401 || queryRes.status === 403) {
-        /* Genuine auth failure — try refreshing once, then skip this cycle.
-           Do NOT wipe the token for GQL errors or PersistedQueryNotFound. */
-        console.warn(`[points] ${login}: ${queryRes.status} — attempting token refresh…`);
-        const refreshed = await refreshPointsToken();
-        if (!refreshed) {
-          console.warn(`[points] ${login}: refresh failed — stopping poll`);
-          return;
-        }
-        continue;
-      }
+    /* Phase 1: Poll ChannelPointsContext for all monitored channels.
+       Collect any available claims into a queue for batch processing. */
+    const claimQueue = [];
 
-      if (queryRes.status !== 200) {
-        console.warn(`[points] ${login}: ChannelPointsContext HTTP ${queryRes.status}: ${queryRes.body.slice(0, 500)}`);
-        continue;
-      }
-
-      let j;
+    for (const login of logins) {
       try {
-        j = JSON.parse(queryRes.body);
-      } catch (e) {
-        console.warn(`[points] ${login}: ChannelPointsContext returned non-JSON: ${queryRes.body.slice(0, 500)}`);
-        continue;
-      }
+        /* ChannelPointsContext: persisted query that returns the channel's points
+           context, including any available bonus claim (the "+50" button).
+           Send ONLY the persisted operation (operationName + variables + extensions.
+           persistedQuery). No raw query text — a persisted hash describes an exact
+           GraphQL document and sending arbitrary text alongside produces
+           "persistedQuery sha256 hash does not match query body". */
+        const queryRes = await gqlWithPointsToken(
+          gqlPersistedOp('ChannelPointsContext', GQL_HASH_CHANNEL_POINTS_CONTEXT, {
+            channelLogin: login,
+          })
+        );
 
-      /* GQL errors array — log but do NOT wipe the token. PersistedQueryNotFound
-         was already handled above; other errors are schema/permission issues. */
-      if (j.errors && j.errors.length) {
-        console.warn(`[points] ${login}: ChannelPointsContext GQL errors: ${j.errors.map((e) => e.message).join('; ')}`);
-        continue;
-      }
+        console.info(`[points] ${login}: ChannelPointsContext HTTP ${queryRes.status}`);
 
-      if (!j.data) {
-        console.warn(`[points] ${login}: ChannelPointsContext no data object: ${queryRes.body.slice(0, 500)}`);
-        continue;
-      }
-
-      /* Log the first successful response structure once so we can verify the
-         correct data path for channel ID, points balance, and available claim. */
-      if (!pointsLoggedFirstResponse) {
-        pointsLoggedFirstResponse = true;
-        console.info(`[points] First successful ChannelPointsContext response for ${login}:`);
-        console.info(`[points]   raw: ${queryRes.body.slice(0, 1000)}`);
-        const community = j.data.community;
-        console.info(`[points]   data.community: ${JSON.stringify(community).slice(0, 500)}`);
-      }
-
-      /* The response structure is: data.community.channel.self.communityPoints
-         (community is an alias for the user query). */
-      const community = j.data.community;
-      if (!community || !community.id) {
-        console.warn(`[points] ${login}: no community/user in GQL response: ${queryRes.body.slice(0, 500)}`);
-        continue;
-      }
-      const channelId = community.id;
-      const cp =
-        community.channel &&
-        community.channel.self &&
-        community.channel.self.communityPoints;
-
-      if (!cp) {
-        /* Channel may not have community points enabled — normal, don't log. */
-        continue;
-      }
-
-      /* Track the current balance for this channel. */
-      const currentBalance = typeof cp.balance === 'number' ? cp.balance : null;
-      const prevBalance = pointsLastBalance.get(login);
-      if (currentBalance !== null) {
-        pointsLastBalance.set(login, currentBalance);
-      }
-
-      /* Log balance changes that aren't from a claim. Don't classify as
-         WATCH yet — a balance can change for other reasons. Just note
-         whether the channel is in an active slot so the user can correlate
-         the 5-minute cadence with active viewing. */
-      if (currentBalance !== null && prevBalance !== undefined && currentBalance !== prevBalance) {
-        const delta = currentBalance - prevBalance;
-        const pending = pointsPendingBalanceCheck.get(login);
-        /* Don't log here if it's a claim delta — that's logged below. */
-        if (!pending) {
-          const isActive = pointsActiveSlots.includes(login);
-          console.info(
-            `[points] ${login}: balance ${prevBalance} → ${currentBalance} ` +
-            `(Δ=${delta >= 0 ? '+' : ''}${delta}${isActive ? ', active-slot' : ''})`
-          );
+        if (queryRes.status === 401 || queryRes.status === 403) {
+          /* Genuine auth failure — try refreshing once, then skip this cycle.
+             Do NOT wipe the token for GQL errors or PersistedQueryNotFound. */
+          console.warn(`[points] ${login}: ${queryRes.status} — attempting token refresh…`);
+          const refreshed = await refreshPointsToken();
+          if (!refreshed) {
+            console.warn(`[points] ${login}: refresh failed — stopping poll`);
+            return;
+          }
+          continue;
         }
-      }
 
-      /* Check if we have a pending balance-delta verification for this channel
-         (i.e. we claimed a bonus recently and want to confirm via balance). */
-      const pending = pointsPendingBalanceCheck.get(login);
-      if (pending && currentBalance !== null) {
-        const delta = currentBalance - (pending.balanceBefore ?? 0);
-        console.info(`[points] ${login}: balance delta after claim ${pending.claimId.slice(0, 8)}…: ${pending.balanceBefore ?? '?'} → ${currentBalance} (Δ=${delta})`);
-        pointsPendingBalanceCheck.delete(login);
-        /* If we previously recorded the claim as +0 (because pointsEarned was
-           absent), update the recorded claim with the delta-derived amount. */
-        if (delta > 0) {
-          const claimIdx = pointsClaims.findIndex(
-            (c) => c.claimId === pending.claimId
-          );
-          if (claimIdx >= 0 && (!pointsClaims[claimIdx].pointsEarned || pointsClaims[claimIdx].pointsEarned === 0)) {
-            pointsClaims[claimIdx].pointsEarned = delta;
-            pointsClaims[claimIdx].balanceDelta = delta;
-            console.info(`[points] ${login}: updated claim ${pending.claimId.slice(0, 8)}… earned amount from balance delta: +${delta}`);
+        if (queryRes.status !== 200) {
+          console.warn(`[points] ${login}: ChannelPointsContext HTTP ${queryRes.status}: ${queryRes.body.slice(0, 500)}`);
+          continue;
+        }
+
+        let j;
+        try {
+          j = JSON.parse(queryRes.body);
+        } catch (e) {
+          console.warn(`[points] ${login}: ChannelPointsContext returned non-JSON: ${queryRes.body.slice(0, 500)}`);
+          continue;
+        }
+
+        /* GQL errors array — log but do NOT wipe the token. PersistedQueryNotFound
+           was already handled above; other errors are schema/permission issues. */
+        if (j.errors && j.errors.length) {
+          console.warn(`[points] ${login}: ChannelPointsContext GQL errors: ${j.errors.map((e) => e.message).join('; ')}`);
+          continue;
+        }
+
+        if (!j.data) {
+          console.warn(`[points] ${login}: ChannelPointsContext no data object: ${queryRes.body.slice(0, 500)}`);
+          continue;
+        }
+
+        /* Log the first successful response structure once so we can verify the
+           correct data path for channel ID, points balance, and available claim. */
+        if (!pointsLoggedFirstResponse) {
+          pointsLoggedFirstResponse = true;
+          console.info(`[points] First successful ChannelPointsContext response for ${login}:`);
+          console.info(`[points]   raw: ${queryRes.body.slice(0, 1000)}`);
+          const community = j.data.community;
+          console.info(`[points]   data.community: ${JSON.stringify(community).slice(0, 500)}`);
+        }
+
+        /* The response structure is: data.community.channel.self.communityPoints
+           (community is an alias for the user query). */
+        const community = j.data.community;
+        if (!community || !community.id) {
+          console.warn(`[points] ${login}: no community/user in GQL response: ${queryRes.body.slice(0, 500)}`);
+          continue;
+        }
+        const channelId = community.id;
+        const cp =
+          community.channel &&
+          community.channel.self &&
+          community.channel.self.communityPoints;
+
+        if (!cp) {
+          /* Channel may not have community points enabled — normal, don't log. */
+          continue;
+        }
+
+        /* Track the current balance for this channel — all monitored channels,
+           not just earning slots. */
+        const currentBalance = typeof cp.balance === 'number' ? cp.balance : null;
+        const prevBalance = pointsLastBalance.get(login);
+        if (currentBalance !== null) {
+          pointsLastBalance.set(login, currentBalance);
+        }
+
+        /* Log balance changes that aren't from a claim. Don't classify as
+           WATCH yet — a balance can change for other reasons. Just note
+           whether the channel is in an active slot so the user can correlate
+           the 5-minute cadence with active viewing. */
+        if (currentBalance !== null && prevBalance !== undefined && currentBalance !== prevBalance) {
+          const delta = currentBalance - prevBalance;
+          const pending = pointsPendingBalanceCheck.get(login);
+          /* Don't log here if it's a claim delta — that's logged below. */
+          if (!pending) {
+            const isActive = pointsActiveSlots.includes(login);
+            console.info(
+              `[points] ${login}: balance ${prevBalance} → ${currentBalance} ` +
+              `(Δ=${delta >= 0 ? '+' : ''}${delta}${isActive ? ', active-slot' : ''})`
+            );
           }
         }
-      }
 
-      /* availableClaim is a single object (not array) in the current schema. */
-      const claim = cp.availableClaim;
-
-      /* For active-slot channels, log the balance and claim state every poll
-         so the user can see the watch-credit progression (e.g. balance going
-         up by ~10-12 every 5 minutes, then availableClaim appearing). */
-      if (pointsActiveSlots.includes(login)) {
-        console.info(
-          `[points] ${login}: balance=${currentBalance ?? '?'} ` +
-          `availableClaim=${claim?.id ? claim.id.slice(0, 8) + '…' : 'null'}`
-        );
-      }
-
-      if (!claim || !claim.id) {
-        /* No bonus available right now — normal. */
-        continue;
-      }
-
-      console.info(`[points] ${login}: bonus claim ${claim.id} found`);
-      console.info(`[points] ${login}: balance before claim: ${currentBalance ?? 'unknown'}`);
-      console.info(`[points] ${login}: ClaimCommunityPoints…`);
-
-      /* ClaimCommunityPoints: persisted mutation that claims the bonus.
-         Send ONLY the persisted operation (no raw query text). */
-      const claimRes = await gqlWithPointsToken(
-        gqlPersistedOp('ClaimCommunityPoints', GQL_HASH_CLAIM_COMMUNITY_POINTS, {
-          input: { channelID: channelId, claimID: claim.id },
-        })
-      );
-
-      if (claimRes.status !== 200) {
-        console.warn(`[points] ${login}: ClaimCommunityPoints HTTP ${claimRes.status}: ${claimRes.body.slice(0, 500)}`);
-        continue;
-      }
-
-      let cj;
-      try {
-        cj = JSON.parse(claimRes.body);
-      } catch (e) {
-        console.warn(`[points] ${login}: ClaimCommunityPoints returned non-JSON: ${claimRes.body.slice(0, 500)}`);
-        continue;
-      }
-
-      /* Log the complete first successful ClaimCommunityPoints JSON response. */
-      if (!pointsLoggedFirstClaim) {
-        pointsLoggedFirstClaim = true;
-        console.info(`[points] First successful ClaimCommunityPoints response for ${login}:`);
-        console.info(`[points]   raw: ${claimRes.body.slice(0, 1000)}`);
-        console.info(`[points]   parsed: ${JSON.stringify(cj).slice(0, 800)}`);
-      }
-
-      if (cj.errors && cj.errors.length) {
-        console.warn(`[points] ${login}: ClaimCommunityPoints GQL errors: ${cj.errors.map((e) => e.message).join('; ')}`);
-        continue;
-      }
-
-      /* Determine if the claim was successful. Do NOT assume pointsEarned exists
-         at any specific path — inspect the response defensively by searching
-         multiple possible locations in the response tree. */
-      const claimData = cj.data?.claimCommunityPoints;
-      const claimObj = claimData?.claim;
-
-      /* Search multiple possible paths for pointsEarned — the response
-         structure has changed across Twitch API versions. */
-      const earnedFromResponse =
-        typeof claimObj?.pointsEarned === 'number' ? claimObj.pointsEarned :
-        typeof claimData?.pointsEarned === 'number' ? claimData.pointsEarned :
-        typeof cj.data?.claimCommunityPoints?.pointsEarned === 'number' ? cj.data.claimCommunityPoints.pointsEarned :
-        null;
-
-      /* If we still can't find it, log the full structure so we can see
-         where Twitch put it (or if it's genuinely absent). */
-      if (earnedFromResponse === null && claimData) {
-        console.info(`[points] ${login}: ClaimCommunityPoints response structure (searching for pointsEarned):`);
-        console.info(`[points]   data.claimCommunityPoints keys: ${Object.keys(claimData).join(', ')}`);
-        if (claimObj) {
-          console.info(`[points]   data.claimCommunityPoints.claim keys: ${Object.keys(claimObj).join(', ')}`);
+        /* Check if we have a pending balance-delta verification for this channel
+           (i.e. we claimed a bonus recently and want to confirm via balance). */
+        const pending = pointsPendingBalanceCheck.get(login);
+        if (pending && currentBalance !== null) {
+          const delta = currentBalance - (pending.balanceBefore ?? 0);
+          console.info(`[points] ${login}: balance delta after claim ${pending.claimId.slice(0, 8)}…: ${pending.balanceBefore ?? '?'} → ${currentBalance} (Δ=${delta})`);
+          pointsPendingBalanceCheck.delete(login);
+          /* If we previously recorded the claim as +0 (because pointsEarned was
+             absent), update the recorded claim with the delta-derived amount. */
+          if (delta > 0) {
+            const claimIdx = pointsClaims.findIndex(
+              (c) => c.claimId === pending.claimId
+            );
+            if (claimIdx >= 0 && (!pointsClaims[claimIdx].pointsEarned || pointsClaims[claimIdx].pointsEarned === 0)) {
+              pointsClaims[claimIdx].pointsEarned = delta;
+              pointsClaims[claimIdx].balanceDelta = delta;
+              console.info(`[points] ${login}: updated claim ${pending.claimId.slice(0, 8)}… earned amount from balance delta: +${delta}`);
+            }
+          }
         }
-      }
 
-      /* A successful claim typically returns data.claimCommunityPoints (even if
-         pointsEarned is absent). If the claim ID disappears on the next
-         ChannelPointsContext poll, that also confirms success. */
-      const claimSucceeded = Boolean(claimData);
+        /* availableClaim is a single object (not array) in the current schema. */
+        const claim = cp.availableClaim;
 
-      if (!claimSucceeded) {
-        console.warn(`[points] ${login}: ClaimCommunityPoints no data.claimCommunityPoints: ${claimRes.body.slice(0, 500)}`);
-        continue;
-      }
+        /* For active-slot channels, log the balance and claim state every poll
+           so the user can see the watch-credit progression (e.g. balance going
+           up by ~10-12 every 5 minutes, then availableClaim appearing). */
+        if (pointsActiveSlots.includes(login)) {
+          console.info(
+            `[points] ${login}: balance=${currentBalance ?? '?'} ` +
+            `availableClaim=${claim?.id ? claim.id.slice(0, 8) + '…' : 'null'}`
+          );
+        }
 
-      /* Record the claim. If pointsEarned is absent, record as successful with
-         earned=0 for now; the balance delta on the next poll will update it. */
-      const earned = earnedFromResponse ?? 0;
-      const claimRecord = {
-        login,
-        claimId: claim.id,
-        pointsEarned: earned,
-        ts: Date.now(),
-      };
-      pointsClaims.unshift(claimRecord);
-      if (pointsClaims.length > 50) pointsClaims.length = 50;
+        if (!claim || !claim.id) {
+          /* No bonus available right now — normal. */
+          continue;
+        }
 
-      /* Schedule a balance-delta check for the next ChannelPointsContext poll. */
-      if (earnedFromResponse === null && currentBalance !== null) {
-        pointsPendingBalanceCheck.set(login, {
-          balanceBefore: currentBalance,
+        /* Skip if this claim ID is already in-flight (being claimed by a
+           previous batch that hasn't finished yet). This prevents duplicate
+           concurrent claims for the same bonus. */
+        if (inFlightClaimIds.has(claim.id)) {
+          console.info(`[points] ${login}: bonus claim ${claim.id.slice(0, 8)}… already in-flight — skipping`);
+          continue;
+        }
+
+        console.info(`[points] ${login}: bonus claim ${claim.id} found`);
+
+        /* Add to the claim queue — claims are processed in batch after all
+           ChannelPointsContext polls complete. This separates monitoring
+           (all playing+live channels) from claiming (batched, concurrency-limited). */
+        claimQueue.push({
+          login,
+          channelId,
           claimId: claim.id,
-          claimTs: Date.now(),
+          balanceBefore: currentBalance,
         });
+      } catch (e) {
+        /* Log the full exception — do NOT swallow. Keep failures isolated
+           per channel — continue processing the remainder of the queue. */
+        console.warn(`[points] ${login}: error during poll: ${e.message || e}`);
+        console.warn(`[points] ${login}: stack: ${e.stack || '(no stack)'}`);
       }
-
-      if (earnedFromResponse !== null) {
-        console.info(`[points] ${login}: claimed +${earned} (from response)`);
-      } else {
-        console.info(`[points] ${login}: claim ${claim.id.slice(0, 8)}… accepted (pointsEarned absent — will verify via balance delta on next poll)`);
-      }
-    } catch (e) {
-      /* Log the full exception — do NOT swallow. */
-      console.warn(`[points] ${login}: error during poll: ${e.message || e}`);
-      console.warn(`[points] ${login}: stack: ${e.stack || '(no stack)'}`);
     }
+
+    /* Phase 2: Process the claim queue in batches of 2 (concurrency limit).
+       Claims from ALL monitored channels are processed — not just the 2
+       earning slots. The earning slots are only for watch-credit reporting. */
+    if (claimQueue.length > 0) {
+      console.info(`[points] ${claimQueue.length} bonus claim${claimQueue.length > 1 ? 's' : ''} available`);
+      await processClaimQueue(claimQueue);
+    }
+  } finally {
+    /* Always release the guard, even if the poll threw an uncaught error. */
+    pointsPollInProgress = false;
   }
 }
 
-/** Background poller: checks watched channels every 60s for available claims.
- *  The interval fires every 15s but each watcher is polled at most once per 60s. */
+/** Process a queue of bonus claims in batches of CLAIM_BATCH_SIZE (2).
+ *  Each batch runs claims concurrently; batches run sequentially. */
+const CLAIM_BATCH_SIZE = 2;
+
+async function processClaimQueue(queue) {
+  const total = queue.length;
+  const batches = Math.ceil(total / CLAIM_BATCH_SIZE);
+  let succeeded = 0;
+
+  for (let b = 0; b < batches; b++) {
+    const batch = queue.slice(b * CLAIM_BATCH_SIZE, (b + 1) * CLAIM_BATCH_SIZE);
+    const batchNum = b + 1;
+    console.info(`[points] Claim batch ${batchNum}/${batches}: ${batch.map((c) => c.login).join(', ')}`);
+
+    /* Process each claim in the batch concurrently. */
+    const results = await Promise.allSettled(
+      batch.map((claimItem) => processSingleClaim(claimItem))
+    );
+
+    for (let i = 0; i < results.length; i++) {
+      if (results[i].status === 'fulfilled' && results[i].value) {
+        succeeded++;
+      }
+    }
+  }
+
+  console.info(`[points] Claims complete: ${succeeded}/${total}`);
+}
+
+/** Process a single bonus claim. Returns true on success, false on failure.
+ *  This function is independent of the earning slots — it claims the bonus
+ *  for any monitored channel, regardless of watch-credit status.
+ *  The claim ID is added to inFlightClaimIds for the duration of the attempt
+ *  and removed in finally, so the same claim can never be queued twice. */
+async function processSingleClaim({ login, channelId, claimId, balanceBefore }) {
+  inFlightClaimIds.add(claimId);
+  try {
+    console.info(`[points] ${login}: ClaimCommunityPoints…`);
+
+    /* ClaimCommunityPoints: persisted mutation that claims the bonus.
+       Send ONLY the persisted operation (no raw query text). */
+    const claimRes = await gqlWithPointsToken(
+      gqlPersistedOp('ClaimCommunityPoints', GQL_HASH_CLAIM_COMMUNITY_POINTS, {
+        input: { channelID: channelId, claimID: claimId },
+      })
+    );
+
+    if (claimRes.status !== 200) {
+      console.warn(`[points] ${login}: ClaimCommunityPoints HTTP ${claimRes.status}: ${claimRes.body.slice(0, 500)}`);
+      return false;
+    }
+
+    let cj;
+    try {
+      cj = JSON.parse(claimRes.body);
+    } catch (e) {
+      console.warn(`[points] ${login}: ClaimCommunityPoints returned non-JSON: ${claimRes.body.slice(0, 500)}`);
+      return false;
+    }
+
+    /* Log the complete first successful ClaimCommunityPoints JSON response. */
+    if (!pointsLoggedFirstClaim) {
+      pointsLoggedFirstClaim = true;
+      console.info(`[points] First successful ClaimCommunityPoints response for ${login}:`);
+      console.info(`[points]   raw: ${claimRes.body.slice(0, 1000)}`);
+      console.info(`[points]   parsed: ${JSON.stringify(cj).slice(0, 800)}`);
+    }
+
+    if (cj.errors && cj.errors.length) {
+      console.warn(`[points] ${login}: ClaimCommunityPoints GQL errors: ${cj.errors.map((e) => e.message).join('; ')}`);
+      return false;
+    }
+
+    /* Determine if the claim was successful. Do NOT assume pointsEarned exists
+       at any specific path — inspect the response defensively by searching
+       multiple possible locations in the response tree. */
+    const claimData = cj.data?.claimCommunityPoints;
+    const claimObj = claimData?.claim;
+
+    /* Search multiple possible paths for pointsEarned — the response
+       structure has changed across Twitch API versions. */
+    const earnedFromResponse =
+      typeof claimObj?.pointsEarned === 'number' ? claimObj.pointsEarned :
+      typeof claimData?.pointsEarned === 'number' ? claimData.pointsEarned :
+      typeof cj.data?.claimCommunityPoints?.pointsEarned === 'number' ? cj.data.claimCommunityPoints.pointsEarned :
+      null;
+
+    /* If we still can't find it, log the full structure so we can see
+       where Twitch put it (or if it's genuinely absent). */
+    if (earnedFromResponse === null && claimData) {
+      console.info(`[points] ${login}: ClaimCommunityPoints response structure (searching for pointsEarned):`);
+      console.info(`[points]   data.claimCommunityPoints keys: ${Object.keys(claimData).join(', ')}`);
+      if (claimObj) {
+        console.info(`[points]   data.claimCommunityPoints.claim keys: ${Object.keys(claimObj).join(', ')}`);
+      }
+    }
+
+    /* A successful claim typically returns data.claimCommunityPoints (even if
+       pointsEarned is absent). If the claim ID disappears on the next
+       ChannelPointsContext poll, that also confirms success. */
+    const claimSucceeded = Boolean(claimData);
+
+    if (!claimSucceeded) {
+      console.warn(`[points] ${login}: ClaimCommunityPoints no data.claimCommunityPoints: ${claimRes.body.slice(0, 500)}`);
+      return false;
+    }
+
+    /* Record the claim. If pointsEarned is absent, record as successful with
+       earned=0 for now; the balance delta on the next poll will update it. */
+    const earned = earnedFromResponse ?? 0;
+    const claimRecord = {
+      login,
+      claimId,
+      pointsEarned: earned,
+      ts: Date.now(),
+    };
+    pointsClaims.unshift(claimRecord);
+    if (pointsClaims.length > 50) pointsClaims.length = 50;
+
+    /* Schedule a balance-delta check for the next ChannelPointsContext poll. */
+    if (earnedFromResponse === null && balanceBefore !== null) {
+      pointsPendingBalanceCheck.set(login, {
+        balanceBefore,
+        claimId,
+        claimTs: Date.now(),
+      });
+    }
+
+    /* Log success. Do NOT hardcode +50 — only report the amount if Twitch
+       actually returned it. Otherwise, log "amount unknown" and let the
+       balance-delta verification on the next poll determine the real amount. */
+    if (earnedFromResponse !== null) {
+      console.info(`[points] ${login}: claim succeeded (+${earned} from response)`);
+    } else {
+      console.info(`[points] ${login}: claim succeeded (amount unknown — will verify via balance delta on next poll)`);
+    }
+    return true;
+  } catch (e) {
+    /* Keep failures isolated per channel — don't abort the partner claim
+       or later batches. Promise.allSettled in processClaimQueue ensures
+       one rejection doesn't affect others. */
+    console.warn(`[points] ${login}: claim error: ${e.message || e}`);
+    console.warn(`[points] ${login}: stack: ${e.stack || '(no stack)'}`);
+    return false;
+  } finally {
+    /* Always remove from in-flight, regardless of success/failure/exception.
+       This ensures the same claim ID can be re-queued if needed on a future
+       poll (e.g. if this attempt failed and the claim is still available). */
+    inFlightClaimIds.delete(claimId);
+  }
+}
+
+/** Background poller: checks all playing+live channels every 60s for available
+ *  bonus claims. The interval fires every 15s but each channel is polled at
+ *  most once per 60s. This is independent of the 2 earning slots — ALL
+ *  playing+live channels are monitored for bonus claims. */
 setInterval(() => {
+  /* Only poll if there are channels to monitor (playing ∩ live). */
+  if (pointsPlayingLogins.size === 0) return;
   if (pointsWatchLogins.size === 0) return;
   if (Date.now() - pointsLastPoll < 60_000) return;
   if (!pointsToken) return;
