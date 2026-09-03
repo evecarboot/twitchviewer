@@ -222,6 +222,81 @@ body {
   font-family: monospace;
 }
 
+/* Points watch status — shows Playing/Live/Points-active counts and the
+   active slot allocation with click-to-prioritize circles. */
+.points-watch-status {
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border, #333);
+}
+.points-watch-counts {
+  display: flex;
+  gap: 1rem;
+  font-size: 0.85rem;
+  margin-bottom: 0.5rem;
+}
+.points-watch-counts strong {
+  color: var(--accent, #bf94ff);
+}
+.points-active-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+.points-active-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+  padding: 0.25rem 0.5rem;
+  border-radius: 4px;
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.15s;
+}
+.points-active-row:hover {
+  background: var(--bg, #1a1a1e);
+}
+.points-active-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 2px solid var(--border, #444);
+  flex-shrink: 0;
+  transition: all 0.15s;
+}
+.points-active-dot.earning {
+  background: #3ba55d;
+  border-color: #3ba55d;
+  box-shadow: 0 0 6px #3ba55d;
+}
+.points-active-dot.playing {
+  background: transparent;
+  border-color: var(--text-muted, #888);
+}
+.points-active-dot.idle {
+  background: transparent;
+  border-color: var(--border, #333);
+}
+.points-active-name {
+  flex: 1;
+  text-transform: capitalize;
+}
+.points-active-balance {
+  font-family: monospace;
+  color: var(--text-muted, #888);
+  font-size: 0.8rem;
+}
+.points-active-status {
+  font-size: 0.75rem;
+  color: var(--text-muted, #888);
+  text-transform: uppercase;
+  letter-spacing: 0.05rem;
+}
+.points-active-status.earning {
+  color: #3ba55d;
+}
+
 .channel-list {
   display: flex;
   flex-wrap: wrap;

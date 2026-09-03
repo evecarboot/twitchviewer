@@ -334,13 +334,61 @@ app.post('/api/points/watch', (req, res) => {
   res.json({ watching: [...pointsWatchLogins] });
 });
 
-/** Get recent claims + current watch list. */
+/** Client reports which streams are actively playing (have active video elements).
+ *  Only these streams are reported to Twitch's Spade telemetry for points earning.
+ *  This is distinct from the watch list (online channels) — playing means the
+ *  user is actually consuming the stream in the viewer. */
+app.post('/api/points/playing', (req, res) => {
+  if (!pointsToken?.accessToken) {
+    return res.status(401).json({ error: 'Not linked' });
+  }
+  const rawLogins = Array.isArray(req.body?.logins) ? req.body.logins : [];
+  const newPlaying = new Set(
+    rawLogins
+      .filter((l) => typeof l === 'string' && l.trim())
+      .map((l) => l.trim().toLowerCase())
+  );
+  /* Only log if the playing set changed (avoid noise). */
+  if (newPlaying.size !== pointsPlayingLogins.size ||
+      [...newPlaying].some((l) => !pointsPlayingLogins.has(l))) {
+    console.info(`[points] Playing set updated: ${newPlaying.size} streams (${[...newPlaying].slice(0, 5).join(', ')}${newPlaying.size > 5 ? '…' : ''})`);
+  }
+  pointsPlayingLogins = newPlaying;
+  res.json({ playing: [...pointsPlayingLogins] });
+});
+
+/** Manually prioritise channels for points-active slots. The user can pin
+ *  specific channels to fill the 2 concurrent-stream slots first. Pass an
+ *  empty array to clear manual priority (revert to automatic selection). */
+app.post('/api/points/prioritize', (req, res) => {
+  if (!pointsToken?.accessToken) {
+    return res.status(401).json({ error: 'Not linked' });
+  }
+  const rawLogins = Array.isArray(req.body?.logins) ? req.body.logins : [];
+  pointsPriorityLogins = rawLogins
+    .filter((l) => typeof l === 'string' && l.trim())
+    .map((l) => l.trim().toLowerCase())
+    .slice(0, POINTS_MAX_CONCURRENT);
+  console.info(`[points] Priority set: [${pointsPriorityLogins.join(', ') || 'none'}]`);
+  /* Force immediate recompute. */
+  recomputePointsActiveSlots();
+  res.json({
+    priority: [...pointsPriorityLogins],
+    activeSlots: [...pointsActiveSlots],
+  });
+});
+
+/** Get recent claims + current watch list + playing set + active slots. */
 app.get('/api/points/status', (_req, res) => {
   res.json({
     linked: Boolean(pointsToken?.accessToken),
     login: pointsToken?.login || null,
     claims: pointsClaims.slice(0, 20),
     watching: [...pointsWatchLogins],
+    playing: [...pointsPlayingLogins],
+    activeSlots: [...pointsActiveSlots],
+    priority: [...pointsPriorityLogins],
+    balances: Object.fromEntries(pointsLastBalance),
     totalClaimed: pointsClaims.reduce((sum, c) => sum + (c.pointsEarned || 0), 0),
   });
 });
@@ -1225,6 +1273,13 @@ const TWITCH_POINTS_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Appl
  * query body". */
 const GQL_HASH_CHANNEL_POINTS_CONTEXT = '7fe050e3761eb2cf258d70ee1a21cbd76fa8cf3d7e7b12fc437e7029d446b5e3';
 const GQL_HASH_CLAIM_COMMUNITY_POINTS = '46aaeebe02c99afdf4fc97c7c0cba964124bf6b0af229395f1f6d1feed05b3d0';
+/* VideoPlayerStreamInfoOverlayChannel — returns stream broadcast_id, game info.
+ * Used for spade minute-watched payload (broadcast_id is required). */
+const GQL_HASH_STREAM_INFO = '198492e0857f6aedead9665c81c5a06d67b25b58034649687124083ff288597d';
+/* PlaybackAccessToken — authenticated playback token. The token value embeds
+ * user_id, channel_id, player_type, user_ip. Used to establish an authenticated
+ * watch session. */
+const GQL_HASH_PLAYBACK_ACCESS_TOKEN = '3093517e37e4f4cb48906155bcd894150aef92617939236d2508f3375ab732ce';
 
 /** Build a persisted-query GQL operation object (hash only, no query text). */
 function gqlPersistedOp(operationName, sha256Hash, variables) {
@@ -1299,7 +1354,7 @@ function savePointsToken(token) {
   }
 }
 
-/** @type {{accessToken: string, refreshToken: string, expiresAt: number, login: string, clientId: string} | null} */
+/** @type {{accessToken: string, refreshToken: string, expiresAt: number, login: string, userId: string|null, clientId: string} | null} */
 let pointsToken = loadPointsToken();
 
 /* If the persisted token was obtained with a different client_id (e.g. the old
@@ -1309,6 +1364,37 @@ if (pointsToken && pointsToken.clientId && pointsToken.clientId !== TWITCH_POINT
   console.info(`[points] Persisted token was for client ${pointsToken.clientId.slice(0, 8)}… — clearing (now using ${TWITCH_POINTS_CLIENT_ID.slice(0, 8)}…)`);
   pointsToken = null;
   try { fs.unlinkSync(pointsTokenPath); } catch { /* ignore */ }
+}
+
+/* Backfill userId if the persisted token predates the userId field (don't
+   force a re-link just because userId wasn't stored yet). The token itself
+   is still valid — we just need the numeric user ID for Spade telemetry. */
+if (pointsToken && pointsToken.accessToken && !pointsToken.userId) {
+  (async () => {
+    try {
+      const userRes = await fetch('https://api.twitch.tv/helix/users', {
+        headers: {
+          Authorization: `Bearer ${pointsToken.accessToken}`,
+          'Client-ID': TWITCH_POINTS_CLIENT_ID,
+        },
+      });
+      if (userRes.ok) {
+        const userBody = await userRes.json();
+        const userId = userBody.data?.[0]?.id || null;
+        if (userId) {
+          pointsToken.userId = userId;
+          savePointsToken(pointsToken);
+          console.info(`[points] Backfilled userId for ${pointsToken.login}: ${userId}`);
+        }
+      } else if (userRes.status === 401 || userRes.status === 403) {
+        console.warn(`[points] Token invalid during userId backfill (${userRes.status}) — will refresh on next GQL call`);
+      } else {
+        console.warn(`[points] Helix user lookup failed during backfill (${userRes.status})`);
+      }
+    } catch (e) {
+      console.warn(`[points] userId backfill error: ${e.message}`);
+    }
+  })();
 }
 
 /** In-memory state for the device code flow (short-lived, expires in ~5 min). */
@@ -1423,6 +1509,7 @@ async function pollPointsDeviceFlow() {
 
   /* Success — resolve the user's login via Helix (using the same token/client). */
   let login = 'unknown';
+  let userId = null;
   try {
     const userRes = await fetch('https://api.twitch.tv/helix/users', {
       headers: {
@@ -1433,6 +1520,7 @@ async function pollPointsDeviceFlow() {
     if (userRes.ok) {
       const userBody = await userRes.json();
       login = userBody.data?.[0]?.login || 'unknown';
+      userId = userBody.data?.[0]?.id || null;
     } else {
       console.warn(`[points] Helix user lookup failed (${userRes.status}) — token is valid but login unknown`);
     }
@@ -1447,6 +1535,7 @@ async function pollPointsDeviceFlow() {
        token (~60 days). We'll refresh on 401 instead of proactively. */
     expiresAt: Date.now() + ((data.expires_in || 5184000) * 1000),
     login,
+    userId,
     clientId: TWITCH_POINTS_CLIENT_ID,
   };
   savePointsToken(pointsToken);
@@ -1488,6 +1577,7 @@ async function refreshPointsToken() {
       /* Twitch's TV client doesn't return expires_in — assume long-lived. */
       expiresAt: Date.now() + ((data.expires_in || 5184000) * 1000),
       login: pointsToken.login,
+      userId: pointsToken.userId,
       clientId: TWITCH_POINTS_CLIENT_ID,
     };
     savePointsToken(pointsToken);
@@ -1671,6 +1761,23 @@ async function pollChannelPoints() {
         pointsLastBalance.set(login, currentBalance);
       }
 
+      /* Log balance changes that aren't from a claim. Don't classify as
+         WATCH yet — a balance can change for other reasons. Just note
+         whether the channel is in an active slot so the user can correlate
+         the 5-minute cadence with active viewing. */
+      if (currentBalance !== null && prevBalance !== undefined && currentBalance !== prevBalance) {
+        const delta = currentBalance - prevBalance;
+        const pending = pointsPendingBalanceCheck.get(login);
+        /* Don't log here if it's a claim delta — that's logged below. */
+        if (!pending) {
+          const isActive = pointsActiveSlots.includes(login);
+          console.info(
+            `[points] ${login}: balance ${prevBalance} → ${currentBalance} ` +
+            `(Δ=${delta >= 0 ? '+' : ''}${delta}${isActive ? ', active-slot' : ''})`
+          );
+        }
+      }
+
       /* Check if we have a pending balance-delta verification for this channel
          (i.e. we claimed a bonus recently and want to confirm via balance). */
       const pending = pointsPendingBalanceCheck.get(login);
@@ -1694,6 +1801,17 @@ async function pollChannelPoints() {
 
       /* availableClaim is a single object (not array) in the current schema. */
       const claim = cp.availableClaim;
+
+      /* For active-slot channels, log the balance and claim state every poll
+         so the user can see the watch-credit progression (e.g. balance going
+         up by ~10-12 every 5 minutes, then availableClaim appearing). */
+      if (pointsActiveSlots.includes(login)) {
+        console.info(
+          `[points] ${login}: balance=${currentBalance ?? '?'} ` +
+          `availableClaim=${claim?.id ? claim.id.slice(0, 8) + '…' : 'null'}`
+        );
+      }
+
       if (!claim || !claim.id) {
         /* No bonus available right now — normal. */
         continue;
@@ -1738,11 +1856,28 @@ async function pollChannelPoints() {
       }
 
       /* Determine if the claim was successful. Do NOT assume pointsEarned exists
-         at any specific path — inspect the response defensively. */
+         at any specific path — inspect the response defensively by searching
+         multiple possible locations in the response tree. */
       const claimData = cj.data?.claimCommunityPoints;
       const claimObj = claimData?.claim;
+
+      /* Search multiple possible paths for pointsEarned — the response
+         structure has changed across Twitch API versions. */
       const earnedFromResponse =
-        typeof claimObj?.pointsEarned === 'number' ? claimObj.pointsEarned : null;
+        typeof claimObj?.pointsEarned === 'number' ? claimObj.pointsEarned :
+        typeof claimData?.pointsEarned === 'number' ? claimData.pointsEarned :
+        typeof cj.data?.claimCommunityPoints?.pointsEarned === 'number' ? cj.data.claimCommunityPoints.pointsEarned :
+        null;
+
+      /* If we still can't find it, log the full structure so we can see
+         where Twitch put it (or if it's genuinely absent). */
+      if (earnedFromResponse === null && claimData) {
+        console.info(`[points] ${login}: ClaimCommunityPoints response structure (searching for pointsEarned):`);
+        console.info(`[points]   data.claimCommunityPoints keys: ${Object.keys(claimData).join(', ')}`);
+        if (claimObj) {
+          console.info(`[points]   data.claimCommunityPoints.claim keys: ${Object.keys(claimObj).join(', ')}`);
+        }
+      }
 
       /* A successful claim typically returns data.claimCommunityPoints (even if
          pointsEarned is absent). If the claim ID disappears on the next
@@ -1801,6 +1936,333 @@ setInterval(() => {
     console.warn(`[points] stack: ${e.stack || '(no stack)'}`);
   });
 }, 15_000);
+
+/* --- Spade watch-progress telemetry (authenticated) ---
+ *
+ * Twitch credits channel points based on "minute-watched" events sent to a
+ * Spade telemetry endpoint. Without these events, Twitch doesn't know the
+ * authenticated user is watching, so no bonus claims appear.
+ *
+ * This subsystem:
+ *  1. Discovers the Spade URL by scraping Twitch's settings.js bundle
+ *  2. Gets each playing channel's broadcast_id via GQL (VideoPlayerStreamInfoOverlayChannel)
+ *  3. Sends minute-watched POSTs every ~20s for up to 2 concurrent streams
+ *     (Twitch's hard limit for points earning)
+ *
+ * Only channels whose streams are ACTIVELY PLAYING in the viewer are reported
+ * (not merely online or in the watch list). The client reports the playing
+ * set via /api/points/playing. */
+
+/** Set of Twitch logins currently being played (active video elements). */
+let pointsPlayingLogins = new Set();
+
+/** Cached spade URL (discovered from Twitch settings.js). */
+let spadeUrl = null;
+let spadeUrlDiscoveredAt = 0;
+const SPADE_URL_TTL_MS = 10 * 60 * 1000; /* refresh every 10 min */
+
+/** Cached stream info per login: {channelId, broadcastId, game, gameId, ts}. */
+const streamInfoCache = new Map();
+const STREAM_INFO_TTL_MS = 60 * 1000; /* refresh every 60s */
+
+/** Discover the Spade URL by scraping Twitch's settings.js bundle.
+ *  The URL is dynamic — Twitch rotates it. We fetch the channel page, extract
+ *  the settings.js URL, then extract spade_url from that JS bundle. */
+async function discoverSpadeUrl() {
+  if (spadeUrl && Date.now() - spadeUrlDiscoveredAt < SPADE_URL_TTL_MS) {
+    return spadeUrl;
+  }
+  try {
+    /* Fetch any Twitch channel page to find the settings.js URL. */
+    const pageRes = await fetch('https://www.twitch.tv/', {
+      headers: { 'User-Agent': TWITCH_POINTS_USER_AGENT },
+    });
+    if (!pageRes.ok) {
+      console.warn(`[points] Spade URL discovery: twitch.tv returned ${pageRes.status}`);
+      return null;
+    }
+    const pageText = await pageRes.text();
+    /* Extract the settings.js URL from the page HTML. */
+    const settingsMatch = pageText.match(
+      /https:\/\/(?:static\.twitchcdn\.net|assets\.twitch\.tv)\/config\/settings\.[a-f0-9]+\.js/i
+    );
+    if (!settingsMatch) {
+      console.warn('[points] Spade URL discovery: could not find settings.js URL in page');
+      return null;
+    }
+    const settingsUrl = settingsMatch[0];
+    const settingsRes = await fetch(settingsUrl, {
+      headers: { 'User-Agent': TWITCH_POINTS_USER_AGENT },
+    });
+    if (!settingsRes.ok) {
+      console.warn(`[points] Spade URL discovery: settings.js returned ${settingsRes.status}`);
+      return null;
+    }
+    const settingsText = await settingsRes.text();
+    /* Extract spade_url from the settings JS bundle. */
+    const spadeMatch = settingsText.match(/"spade_url":"(.*?)"/);
+    if (!spadeMatch) {
+      console.warn('[points] Spade URL discovery: could not find spade_url in settings.js');
+      return null;
+    }
+    spadeUrl = spadeMatch[1];
+    spadeUrlDiscoveredAt = Date.now();
+    console.info(`[points] Spade URL discovered: ${spadeUrl}`);
+    return spadeUrl;
+  } catch (e) {
+    console.warn(`[points] Spade URL discovery error: ${e.message || e}`);
+    return null;
+  }
+}
+
+/** Get stream info (broadcast_id, channel_id, game) for a login via GQL.
+ *  Uses the VideoPlayerStreamInfoOverlayChannel persisted query. */
+async function getStreamInfoForSpade(login) {
+  const cached = streamInfoCache.get(login);
+  if (cached && Date.now() - cached.ts < STREAM_INFO_TTL_MS) {
+    return cached;
+  }
+  try {
+    const res = await gqlWithPointsToken(
+      gqlPersistedOp('VideoPlayerStreamInfoOverlayChannel', GQL_HASH_STREAM_INFO, {
+        channel: login,
+      })
+    );
+    if (res.status !== 200) {
+      console.warn(`[points] ${login}: StreamInfo HTTP ${res.status}`);
+      return null;
+    }
+    const j = JSON.parse(res.body);
+    if (j.errors && j.errors.length) {
+      console.warn(`[points] ${login}: StreamInfo GQL errors: ${j.errors.map((e) => e.message).join('; ')}`);
+      return null;
+    }
+    const user = j.data?.user;
+    if (!user || !user.stream) {
+      /* Channel is offline — no stream info. */
+      return null;
+    }
+    const info = {
+      channelId: user.id,
+      broadcastId: user.stream.id,
+      game: user.broadcastSettings?.game?.displayName || null,
+      gameId: user.broadcastSettings?.game?.id || null,
+      ts: Date.now(),
+    };
+    streamInfoCache.set(login, info);
+    return info;
+  } catch (e) {
+    console.warn(`[points] ${login}: StreamInfo error: ${e.message || e}`);
+    return null;
+  }
+}
+
+/** Send a minute-watched event to the Spade endpoint for a channel.
+ *  The payload is base64-encoded JSON sent as form-encoded `data=<base64>`.
+ *  Twitch expects HTTP 204 No Content on success. */
+async function sendMinuteWatched(login, streamInfo) {
+  if (!spadeUrl) {
+    const discovered = await discoverSpadeUrl();
+    if (!discovered) return false;
+  }
+  if (!pointsToken?.userId) {
+    console.warn('[points] Cannot send minute-watched — no user_id');
+    return false;
+  }
+
+  const eventProperties = {
+    channel_id: streamInfo.channelId,
+    broadcast_id: streamInfo.broadcastId,
+    player: 'site',
+    user_id: pointsToken.userId,
+    live: true,
+    channel: login,
+  };
+  /* Include game info for drop attribution (Twitch now requires it). */
+  if (streamInfo.game && streamInfo.gameId) {
+    eventProperties.game = streamInfo.game;
+    eventProperties.game_id = streamInfo.gameId;
+  }
+
+  const payload = [{ event: 'minute-watched', properties: eventProperties }];
+  const jsonStr = JSON.stringify(payload);
+  const b64 = Buffer.from(jsonStr).toString('base64');
+  const formData = `data=${encodeURIComponent(b64)}`;
+
+  try {
+    const res = await new Promise((resolve, reject) => {
+      const url = new URL(spadeUrl);
+      const req = https.request(
+        url,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Content-Length': Buffer.byteLength(formData),
+            'User-Agent': TWITCH_POINTS_USER_AGENT,
+          },
+        },
+        (resp) => {
+          const chunks = [];
+          resp.on('data', (c) => chunks.push(c));
+          resp.on('end', () => {
+            resolve({ status: resp.statusCode, body: Buffer.concat(chunks).toString('utf8') });
+          });
+        }
+      );
+      req.on('error', reject);
+      req.setTimeout(10000, () => req.destroy(new Error('Spade timeout')));
+      req.write(formData);
+      req.end();
+    });
+
+    if (res.status === 204) {
+      return true;
+    }
+    console.warn(`[points] ${login}: Spade minute-watched HTTP ${res.status}: ${res.body.slice(0, 200)}`);
+    return false;
+  } catch (e) {
+    console.warn(`[points] ${login}: Spade minute-watched error: ${e.message || e}`);
+    return false;
+  }
+}
+
+/** Twitch limits points earning to 2 concurrent streams. */
+const POINTS_MAX_CONCURRENT = 2;
+
+/* --- Sticky points-active slot allocation ---
+ *
+ * Points-active slots are "sticky" — once a channel is assigned a slot, it
+ * keeps it until one of:
+ *   - the channel goes offline (no longer in the live set)
+ *   - the channel stops playing (no longer in the playing set)
+ *   - the user manually prioritises a different channel
+ *
+ * This prevents the selected pair from jumping around every 20 seconds, which
+ * would break watch streaks (Twitch requires 10+ minutes for streak credit).
+ *
+ * The user can also manually pin channels to slots via /api/points/prioritize.
+ * Manually-prioritised channels take the slots first; remaining slots are
+ * filled from eligible channels in playing-set order. */
+
+/** @type {string[]} Ordered list of logins the user manually prioritised. */
+let pointsPriorityLogins = [];
+/** @type {string[]} Current sticky slot allocation (up to 2 logins). */
+let pointsActiveSlots = [];
+
+/** Recompute the points-active slots from the eligible set.
+ *  Eligible = Playing ∩ Live. Sticky: existing slots are kept if still
+ *  eligible. Manual priority pins fill first. */
+function recomputePointsActiveSlots() {
+  const playingSet = pointsPlayingLogins;
+  const liveSet = pointsWatchLogins;
+  /* Eligible = playing ∩ live. */
+  const eligible = [...playingSet].filter((l) => liveSet.has(l));
+
+  /* Start with manually-prioritised channels that are still eligible. */
+  const slots = [];
+  const used = new Set();
+  for (const p of pointsPriorityLogins) {
+    if (eligible.includes(p) && !used.has(p) && slots.length < POINTS_MAX_CONCURRENT) {
+      slots.push(p);
+      used.add(p);
+    }
+  }
+
+  /* Keep existing sticky slots if still eligible. */
+  for (const s of pointsActiveSlots) {
+    if (eligible.includes(s) && !used.has(s) && slots.length < POINTS_MAX_CONCURRENT) {
+      slots.push(s);
+      used.add(s);
+    }
+  }
+
+  /* Fill remaining slots from eligible channels (in playing-set order). */
+  for (const e of eligible) {
+    if (!used.has(e) && slots.length < POINTS_MAX_CONCURRENT) {
+      slots.push(e);
+      used.add(e);
+    }
+  }
+
+  /* Detect slot changes and log the reason for each change. */
+  const oldSlots = pointsActiveSlots;
+  const oldKey = oldSlots.join(',');
+  const newKey = slots.join(',');
+  if (oldKey !== newKey) {
+    /* Log each slot position for clear debugging. */
+    for (let i = 0; i < POINTS_MAX_CONCURRENT; i++) {
+      const oldLogin = oldSlots[i] || null;
+      const newLogin = slots[i] || null;
+      if (oldLogin === newLogin) {
+        if (oldLogin) console.info(`[points] Slot ${i + 1}: ${oldLogin} retained`);
+      } else if (oldLogin && newLogin) {
+        let reason;
+        if (!playingSet.has(oldLogin)) reason = 'stopped playing';
+        else if (!liveSet.has(oldLogin)) reason = 'offline';
+        else reason = 'displaced by priority';
+        console.info(`[points] Slot ${i + 1}: ${oldLogin} removed — ${reason}`);
+        console.info(`[points] Slot ${i + 1}: ${newLogin} assigned — eligible`);
+      } else if (oldLogin && !newLogin) {
+        let reason;
+        if (!playingSet.has(oldLogin)) reason = 'stopped playing';
+        else if (!liveSet.has(oldLogin)) reason = 'offline';
+        else reason = 'no longer eligible';
+        console.info(`[points] Slot ${i + 1}: ${oldLogin} removed — ${reason}`);
+      } else if (!oldLogin && newLogin) {
+        console.info(`[points] Slot ${i + 1}: ${newLogin} assigned — eligible`);
+      }
+    }
+    console.info(
+      `[points] Active slots: [${slots.join(', ') || 'none'}] ` +
+      `(Playing ${playingSet.size}, Live ${liveSet.size}, Eligible ${eligible.length})`
+    );
+  }
+  pointsActiveSlots = slots;
+}
+
+/** Background spade sender: sends minute-watched events every ~20s for up to
+ *  2 actively-playing, live streams. Uses sticky slot allocation. */
+setInterval(async () => {
+  if (!pointsToken) return;
+
+  /* Recompute eligible slots each cycle (cheap — just set operations). */
+  recomputePointsActiveSlots();
+
+  if (pointsActiveSlots.length === 0) {
+    /* Still log the distinction so the user can see the state. */
+    const playing = pointsPlayingLogins.size;
+    const live = pointsWatchLogins.size;
+    if (playing > 0 || live > 0) {
+      console.info(`[points] Watch report: Playing ${playing}, Live ${live}, Points-active 0 (no eligible)`);
+    }
+    return;
+  }
+
+  console.info(
+    `[points] Watch report: Playing ${pointsPlayingLogins.size}, ` +
+    `Live ${pointsWatchLogins.size}, Points-active ${pointsActiveSlots.length} ` +
+    `[${pointsActiveSlots.join(', ')}]`
+  );
+
+  for (const login of pointsActiveSlots) {
+    try {
+      const streamInfo = await getStreamInfoForSpade(login);
+      if (!streamInfo) {
+        /* Stream may have gone offline since the slot was assigned — skip
+           this cycle. The next recompute will remove it. */
+        console.info(`[points] ${login}: no stream info (may have gone offline)`);
+        continue;
+      }
+      const ok = await sendMinuteWatched(login, streamInfo);
+      if (ok) {
+        console.info(`[points] ${login}: minute-watched sent (spade 204)`);
+      }
+    } catch (e) {
+      console.warn(`[points] ${login}: watch report error: ${e.message || e}`);
+    }
+  }
+}, 20_000);
 
 /** Parse a Twitch master playlist and return the variant URL matching `quality`.
  *  Twitch names variants like "720p60", "480p30", "360p30", "160p30", "audio_only", "chunked".

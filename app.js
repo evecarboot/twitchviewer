@@ -122,6 +122,10 @@
     pointsLinked: document.getElementById('points-linked'),
     pointsLinkedLogin: document.getElementById('points-linked-login'),
     pointsClaimsSummary: document.getElementById('points-claims-summary'),
+    pointsCountPlaying: document.getElementById('points-count-playing'),
+    pointsCountLive: document.getElementById('points-count-live'),
+    pointsCountActive: document.getElementById('points-count-active'),
+    pointsActiveList: document.getElementById('points-active-list'),
   };
 
   function loadState() {
@@ -1523,6 +1527,7 @@
       /* Online status changed — update the points watch list so the server
          only polls live channels for bonus claims. */
       syncPointsWatch();
+      syncPointsPlaying();
       const nextViewerCounts = new Map();
       for (const [login, count] of Object.entries(data.viewers || {})) {
         nextViewerCounts.set(login.toLowerCase(), count);
@@ -1693,8 +1698,115 @@
         span.textContent = `Auto-claimed ${data.totalClaimed} pts`;
         els.toolbarMeta.appendChild(span);
       }
+      /* Render the Playing/Live/Points-active counts and slot list. */
+      if (els.pointsCountPlaying) {
+        els.pointsCountPlaying.textContent = data.playing?.length || 0;
+      }
+      if (els.pointsCountLive) {
+        els.pointsCountLive.textContent = data.watching?.length || 0;
+      }
+      if (els.pointsCountActive) {
+        els.pointsCountActive.textContent = data.activeSlots?.length || 0;
+      }
+      /* Render the active slot list with click-to-prioritize circles. */
+      if (els.pointsActiveList) {
+        renderPointsActiveList(data);
+      }
     } catch {
       /* ignore */
+    }
+  }
+
+  /** Render the points-active slot list with earning/playing indicators.
+   *  Clicking a row toggles it as a priority slot (fills one of the 2
+   *  concurrent-stream slots first). */
+  function renderPointsActiveList(data) {
+    const playing = data.playing || [];
+    const activeSlots = data.activeSlots || [];
+    const priority = data.priority || [];
+    const balances = data.balances || {};
+    const watching = data.watching || [];
+
+    /* Build a combined unique list of all playing + active channels. */
+    const allLogins = [...new Set([...playing, ...activeSlots])];
+    /* Sort: active slots first, then playing, alphabetical. */
+    allLogins.sort((a, b) => {
+      const aActive = activeSlots.includes(a) ? 0 : 1;
+      const bActive = activeSlots.includes(b) ? 0 : 1;
+      if (aActive !== bActive) return aActive - bActive;
+      return a.localeCompare(b);
+    });
+
+    /* Limit to a reasonable number for the modal (show all playing + active). */
+    const display = allLogins.slice(0, 15);
+
+    els.pointsActiveList.innerHTML = '';
+    display.forEach((login) => {
+      const isActive = activeSlots.includes(login);
+      const isPlaying = playing.includes(login);
+      const isLive = watching.includes(login);
+      const isPriority = priority.includes(login);
+      const balance = balances[login];
+
+      const row = document.createElement('div');
+      row.className = 'points-active-row';
+
+      const dot = document.createElement('span');
+      dot.className = 'points-active-dot ' + (isActive ? 'earning' : isPlaying ? 'playing' : 'idle');
+      row.appendChild(dot);
+
+      const name = document.createElement('span');
+      name.className = 'points-active-name';
+      name.textContent = login;
+      row.appendChild(name);
+
+      if (balance !== undefined) {
+        const bal = document.createElement('span');
+        bal.className = 'points-active-balance';
+        bal.textContent = balance.toLocaleString();
+        row.appendChild(bal);
+      }
+
+      const status = document.createElement('span');
+      status.className = 'points-active-status ' + (isActive ? 'earning' : '');
+      if (isActive) {
+        status.textContent = isPriority ? 'Earning ★' : 'Earning';
+      } else if (isPlaying && isLive) {
+        status.textContent = 'Eligible';
+      } else if (isPlaying) {
+        status.textContent = 'Playing';
+      } else {
+        status.textContent = 'Live';
+      }
+      row.appendChild(status);
+
+      /* Click to toggle priority for this channel. */
+      row.addEventListener('click', () => {
+        let newPriority;
+        if (isPriority) {
+          /* Remove from priority. */
+          newPriority = priority.filter((l) => l !== login);
+        } else {
+          /* Add to priority (max 2). */
+          newPriority = [...priority, login].slice(-2);
+        }
+        fetch('/api/points/prioritize', {
+          ...FETCH_OPTS,
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ logins: newPriority }),
+        }).then(() => refreshPointsStatus()).catch(() => {});
+      });
+
+      els.pointsActiveList.appendChild(row);
+    });
+
+    if (display.length === 0) {
+      const empty = document.createElement('p');
+      empty.className = 'text-muted';
+      empty.style.fontSize = '0.85rem';
+      empty.textContent = 'No streams playing. Start watching to earn points.';
+      els.pointsActiveList.appendChild(empty);
     }
   }
 
@@ -1719,6 +1831,36 @@
       });
     } catch {
       /* non-critical — will retry on next fullRender */
+    }
+  }
+
+  /** Report which Twitch streams are actively playing (have active video
+   *  elements in the viewer). Only these streams are sent to Twitch's Spade
+   *  telemetry for points earning — not merely online or in the grid. */
+  async function syncPointsPlaying() {
+    if (!pointsLinked) return;
+    /* Scan all cells for Twitch streams with active (non-paused, non-ended)
+       video elements. This identifies streams the user is actually watching. */
+    const playingLogins = [];
+    const cells = document.querySelectorAll('.cell');
+    cells.forEach((cell) => {
+      const video = cell.querySelector('video.cell-video');
+      if (!video || video.paused || video.ended) return;
+      /* Extract the Twitch login from the cell's channel key (e.g. "t:login"). */
+      const key = cell.dataset.channelKey || '';
+      if (!key.startsWith('t:')) return;
+      const login = key.slice(2).toLowerCase();
+      if (login) playingLogins.push(login);
+    });
+    try {
+      await fetch('/api/points/playing', {
+        ...FETCH_OPTS,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ logins: playingLogins }),
+      });
+    } catch {
+      /* non-critical */
     }
   }
 
@@ -3031,6 +3173,7 @@
     updatePriorityEditButtonVisibility();
     updateRefreshStreamsButton();
     syncPointsWatch();
+    syncPointsPlaying();
     requestAnimationFrame(() => {
       requestAnimationFrame(() => layoutGridToViewport());
     });
@@ -3439,10 +3582,12 @@
     fullRender();
     schedulePoll();
     scheduleCategoryPoll();
-    /* Poll for points status every 60s if linked (server polls Twitch at
-       the same cadence). */
+    /* Poll for points status every 30s if linked — the watch status UI
+       needs to update to reflect playing/live/active changes. The server
+       polls Twitch GQL at 60s cadence, but playing/active slots update
+       every 20s. */
     if (!pointsStatusTimer) {
-      pointsStatusTimer = setInterval(refreshPointsStatus, 60_000);
+      pointsStatusTimer = setInterval(refreshPointsStatus, 30_000);
     }
     console.info(
       `[twitchviewer] Twitch playback: ${twitchPlayback}. proxy = streamlink pass-through (no ffmpeg, quality per tile size); iframe = Twitch.Player (setQuality: ~480p when Priority tiles off, Auto when on); hls = legacy streamlink+ffmpeg transcode. Run twitchviewerAutoplayDiagnostics().`
