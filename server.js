@@ -368,7 +368,7 @@ app.post('/api/points/prioritize', (req, res) => {
   pointsPriorityLogins = rawLogins
     .filter((l) => typeof l === 'string' && l.trim())
     .map((l) => l.trim().toLowerCase())
-    .slice(0, POINTS_MAX_CONCURRENT);
+    .slice(0, POINTS_MAX_ACTIVE);
   console.info(`[points] Priority set: [${pointsPriorityLogins.join(', ') || 'none'}]`);
   /* Force immediate recompute. */
   recomputePointsActiveSlots();
@@ -1262,6 +1262,21 @@ const TWITCH_POINTS_CLIENT_VERSION = 'ef928475-9403-42f2-8a34-55784bd08e16';
 /** User-Agent header value — matches rdavydov's Windows Chrome user agent. */
 const TWITCH_POINTS_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36';
 
+/** Debug flag for verbose points logging (full GQL response dumps).
+ *  Set POINTS_DEBUG=1 to enable; 0 or unset = disabled. */
+const POINTS_DEBUG = process.env.POINTS_DEBUG === '1';
+
+/** Maximum number of concurrent earning (watch-credit) slots. Twitch
+ *  historically limits this to 2, but it's configurable so we can
+ *  experimentally test whether more simultaneous streams earn points.
+ *  POINTS_MAX_ACTIVE env var, integer 1–20, default 2. */
+const POINTS_MAX_ACTIVE = (() => {
+  const raw = parseInt(process.env.POINTS_MAX_ACTIVE, 10);
+  if (Number.isInteger(raw) && raw >= 1 && raw <= 20) return raw;
+  return 2;
+})();
+console.info(`[points] Max earning slots: ${POINTS_MAX_ACTIVE}`);
+
 /* --- Persisted GQL operation hashes ---
  * These are Twitch's internal persisted-query hashes from rdavydov's
  * Twitch-Channel-Points-Miner-v2 (master branch). If Twitch changes their GQL
@@ -1653,10 +1668,6 @@ let pointsLoggedFirstResponse = false;
 /** Track whether we've logged the first successful ClaimCommunityPoints
  *  response (full JSON) for debugging. Reset on server start. */
 let pointsLoggedFirstClaim = false;
-/** Per-channel balance snapshot taken before a claim, so we can compute the
- *  earned amount via balance delta on the next ChannelPointsContext poll.
- *  Map<login, { balanceBefore: number, claimId: string, claimTs: number }>. */
-const pointsPendingBalanceCheck = new Map();
 /** Per-channel last known balance (for delta comparison). Map<login, number>. */
 const pointsLastBalance = new Map();
 
@@ -1804,42 +1815,18 @@ async function pollChannelPoints() {
           pointsLastBalance.set(login, currentBalance);
         }
 
-        /* Log balance changes that aren't from a claim. Don't classify as
-           WATCH yet — a balance can change for other reasons. Just note
-           whether the channel is in an active slot so the user can correlate
-           the 5-minute cadence with active viewing. */
+        /* Log balance changes. Since we now update pointsLastBalance
+           immediately from currentPoints after a claim, any delta seen here
+           is a genuine non-claim change (typically watch points). Don't
+           classify as WATCH yet — just note whether the channel is in an
+           active slot so the user can correlate the cadence. */
         if (currentBalance !== null && prevBalance !== undefined && currentBalance !== prevBalance) {
           const delta = currentBalance - prevBalance;
-          const pending = pointsPendingBalanceCheck.get(login);
-          /* Don't log here if it's a claim delta — that's logged below. */
-          if (!pending) {
-            const isActive = pointsActiveSlots.includes(login);
-            console.info(
-              `[points] ${login}: balance ${prevBalance} → ${currentBalance} ` +
-              `(Δ=${delta >= 0 ? '+' : ''}${delta}${isActive ? ', active-slot' : ''})`
-            );
-          }
-        }
-
-        /* Check if we have a pending balance-delta verification for this channel
-           (i.e. we claimed a bonus recently and want to confirm via balance). */
-        const pending = pointsPendingBalanceCheck.get(login);
-        if (pending && currentBalance !== null) {
-          const delta = currentBalance - (pending.balanceBefore ?? 0);
-          console.info(`[points] ${login}: balance delta after claim ${pending.claimId.slice(0, 8)}…: ${pending.balanceBefore ?? '?'} → ${currentBalance} (Δ=${delta})`);
-          pointsPendingBalanceCheck.delete(login);
-          /* If we previously recorded the claim as +0 (because pointsEarned was
-             absent), update the recorded claim with the delta-derived amount. */
-          if (delta > 0) {
-            const claimIdx = pointsClaims.findIndex(
-              (c) => c.claimId === pending.claimId
-            );
-            if (claimIdx >= 0 && (!pointsClaims[claimIdx].pointsEarned || pointsClaims[claimIdx].pointsEarned === 0)) {
-              pointsClaims[claimIdx].pointsEarned = delta;
-              pointsClaims[claimIdx].balanceDelta = delta;
-              console.info(`[points] ${login}: updated claim ${pending.claimId.slice(0, 8)}… earned amount from balance delta: +${delta}`);
-            }
-          }
+          const isActive = pointsActiveSlots.includes(login);
+          console.info(
+            `[points] ${login}: balance ${prevBalance} → ${currentBalance} ` +
+            `(Δ=${delta >= 0 ? '+' : ''}${delta}${isActive ? ', active-slot' : ''})`
+          );
         }
 
         /* availableClaim is a single object (not array) in the current schema. */
@@ -1965,7 +1952,7 @@ async function processSingleClaim({ login, channelId, claimId, balanceBefore }) 
        confirmed and the dump is no longer needed in normal operation. */
     if (!pointsLoggedFirstClaim) {
       pointsLoggedFirstClaim = true;
-      if (process.env.POINTS_DEBUG) {
+      if (POINTS_DEBUG) {
         console.info(`[points] First successful ClaimCommunityPoints response for ${login}:`);
         console.info(`[points]   raw: ${claimRes.body.slice(0, 1000)}`);
         console.info(`[points]   parsed: ${JSON.stringify(cj).slice(0, 800)}`);
@@ -2249,9 +2236,6 @@ async function sendMinuteWatched(login, streamInfo) {
   }
 }
 
-/** Twitch limits points earning to 2 concurrent streams. */
-const POINTS_MAX_CONCURRENT = 2;
-
 /* --- Sticky points-active slot allocation ---
  *
  * Points-active slots are "sticky" — once a channel is assigned a slot, it
@@ -2285,7 +2269,7 @@ function recomputePointsActiveSlots() {
   const slots = [];
   const used = new Set();
   for (const p of pointsPriorityLogins) {
-    if (eligible.includes(p) && !used.has(p) && slots.length < POINTS_MAX_CONCURRENT) {
+    if (eligible.includes(p) && !used.has(p) && slots.length < POINTS_MAX_ACTIVE) {
       slots.push(p);
       used.add(p);
     }
@@ -2293,7 +2277,7 @@ function recomputePointsActiveSlots() {
 
   /* Keep existing sticky slots if still eligible. */
   for (const s of pointsActiveSlots) {
-    if (eligible.includes(s) && !used.has(s) && slots.length < POINTS_MAX_CONCURRENT) {
+    if (eligible.includes(s) && !used.has(s) && slots.length < POINTS_MAX_ACTIVE) {
       slots.push(s);
       used.add(s);
     }
@@ -2301,7 +2285,7 @@ function recomputePointsActiveSlots() {
 
   /* Fill remaining slots from eligible channels (in playing-set order). */
   for (const e of eligible) {
-    if (!used.has(e) && slots.length < POINTS_MAX_CONCURRENT) {
+    if (!used.has(e) && slots.length < POINTS_MAX_ACTIVE) {
       slots.push(e);
       used.add(e);
     }
@@ -2313,7 +2297,7 @@ function recomputePointsActiveSlots() {
   const newKey = slots.join(',');
   if (oldKey !== newKey) {
     /* Log each slot position for clear debugging. */
-    for (let i = 0; i < POINTS_MAX_CONCURRENT; i++) {
+    for (let i = 0; i < POINTS_MAX_ACTIVE; i++) {
       const oldLogin = oldSlots[i] || null;
       const newLogin = slots[i] || null;
       if (oldLogin === newLogin) {

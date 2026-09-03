@@ -3585,9 +3585,15 @@
     /* Poll for points status every 30s if linked — the watch status UI
        needs to update to reflect playing/live/active changes. The server
        polls Twitch GQL at 60s cadence, but playing/active slots update
-       every 20s. */
+       every 20s. When the points modal is open, poll every 5s for
+       near-real-time balance updates; when closed, every 30s. */
     if (!pointsStatusTimer) {
-      pointsStatusTimer = setInterval(refreshPointsStatus, 30_000);
+      const pollPointsStatus = () => {
+        refreshPointsStatus();
+        const modalOpen = els.pointsModal && !els.pointsModal.hidden;
+        pointsStatusTimer = setTimeout(pollPointsStatus, modalOpen ? 5_000 : 30_000);
+      };
+      pointsStatusTimer = setTimeout(pollPointsStatus, 30_000);
     }
     console.info(
       `[twitchviewer] Twitch playback: ${twitchPlayback}. proxy = streamlink pass-through (no ffmpeg, quality per tile size); iframe = Twitch.Player (setQuality: ~480p when Priority tiles off, Auto when on); hls = legacy streamlink+ffmpeg transcode. Run twitchviewerAutoplayDiagnostics().`
