@@ -1691,8 +1691,11 @@
         ? video.getVideoPlaybackQuality().droppedVideoFrames
         : '?';
 
-      /* Stall count (we track via a simple counter on the video element). */
+      /* Stall count and total stall duration. stalls=3 alone doesn't tell you
+         whether they were three 100ms hiccups or three 5-second freezes. */
       const stalls = video._stallCount || 0;
+      const stallMs = video._totalStallMs || 0;
+      const stallTime = (stallMs / 1000).toFixed(2);
 
       /* EXT-X-PROGRAM-DATE-TIME wall-clock latency.
        *
@@ -1747,7 +1750,7 @@
         `[TWITCH LATENCY] ch=${login} focused=${focused} q=${quality} ` +
         `hls_latency=${hlsLatency}s playback_latency=${playbackLatency}s ` +
         `live_edge_age=${liveEdgeAge}s buffer_ahead=${bufferAhead}s ` +
-        `dropped=${dropped} stalls=${stalls} ` +
+        `dropped=${dropped} stalls=${stalls} stall_time=${stallTime}s ` +
         `currentTime=${video.currentTime.toFixed(2)} ` +
         `readyState=${video.readyState} paused=${video.paused}`
       );
@@ -2868,9 +2871,27 @@
       // Log pause events for diagnostics — the user reports random pauses with no
       // console errors, so we need to see what state the video/hls is in when it pauses.
       if (twitchHls) {
-        /* Track stalls (buffer underruns) for latency logging. */
+        /* Track stalls (buffer underruns) and total stall duration for latency
+           logging. stalls=3 alone doesn't tell you whether they were three
+           100ms hiccups or three 5-second freezes — stall_time distinguishes
+           them, which matters for choosing between latency profiles. */
         video._stallCount = 0;
-        video.addEventListener('waiting', () => { video._stallCount = (video._stallCount || 0) + 1; });
+        video._stallStartedAt = null;
+        video._totalStallMs = 0;
+        const endStall = () => {
+          if (video._stallStartedAt != null) {
+            video._totalStallMs += performance.now() - video._stallStartedAt;
+            video._stallStartedAt = null;
+          }
+        };
+        video.addEventListener('waiting', () => {
+          if (video._stallStartedAt == null) {
+            video._stallStartedAt = performance.now();
+            video._stallCount = (video._stallCount || 0) + 1;
+          }
+        });
+        video.addEventListener('playing', endStall);
+        video.addEventListener('canplay', endStall);
         video.addEventListener('pause', () => {
           const r = cell.getBoundingClientRect();
           const onScreen = r.bottom > 0 && r.top < window.innerHeight && r.right > 0 && r.left < window.innerWidth;
