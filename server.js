@@ -2455,6 +2455,12 @@ async function resolveTwitchDirectApi(login, quality, playerType = 'embed') {
       player: 'twitchweb',
       playlist_include_framerate: 'true',
       supported_codecs: 'avc1',
+      /* fast_bread requests a "fast broadcast" playlist from Twitch's usher.
+         This is an undocumented parameter used by third-party Twitch playback
+         implementations to request a lower-latency playlist. Treated as an
+         optimization, not a guaranteed API feature — if Twitch drops it,
+         the usher just ignores the unknown param. */
+      fast_bread: 'true',
       token: token.value,
       sig: token.signature,
     });

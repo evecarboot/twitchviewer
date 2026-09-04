@@ -1577,6 +1577,183 @@
   let pointsPollTimer = null;
   let pointsStatusTimer = null;
 
+  /* --- Focus stream (viewer pin) ---
+   *  The user can pin one stream as their "focus" stream. This stream:
+   *    - Gets aggressive low-latency hls.js config
+   *    - Gets a visual pin indicator on the tile
+   *    - (Future: audio, larger tile/layout, quality preference)
+   *
+   *  This is deliberately SEPARATE from channel-points priority. Pinning a
+   *  stream to watch it closely should NOT silently knock another channel
+   *  out of an earning slot. Points priority is managed independently via
+   *  the points modal. If the user later wants to link them, that would be
+   *  an explicit opt-in feature.
+   *
+   *  Clicking the pin button on an already-focused stream unpins it.
+   *  Only one stream can be focused at a time. */
+  let focusStreamLogin = null;
+
+  /** Set or clear the focus stream. Updates all tile pin buttons and applies
+   *  the focused/background hls.js latency profile. Does NOT change points
+   *  earning-slot priority — that is a separate concept. */
+  function setFocusStream(login) {
+    if (focusStreamLogin === login) {
+      /* Clicking the already-focused pin unpins it. */
+      focusStreamLogin = null;
+    } else {
+      focusStreamLogin = login;
+    }
+    /* Update all pin buttons to reflect the new state. */
+    document.querySelectorAll('.cell-focus-pin').forEach((btn) => {
+      const cellLogin = btn.dataset.twitchLogin;
+      const isFocused = cellLogin === focusStreamLogin;
+      btn.classList.toggle('focused', isFocused);
+      btn.title = isFocused ? 'Unfocus stream' : 'Focus stream';
+      btn.setAttribute('aria-pressed', isFocused ? 'true' : 'false');
+    });
+    /* Apply hls.js config changes (focused stream gets aggressive low-latency). */
+    applyFocusHlsConfig();
+    console.info(`[focus] ${focusStreamLogin ? 'Pinned: ' + focusStreamLogin : 'Unpinned (no focus)'}`);
+  }
+
+  /** Apply aggressive hls.js config to the focused stream and safe config to
+   *  background streams. Called when focus changes. */
+  function applyFocusHlsConfig() {
+    document.querySelectorAll('.cell').forEach((cell) => {
+      const video = cell.querySelector('video.cell-video');
+      if (!video || !video._hls) return;
+      const login = video._twitchLogin;
+      const focused = login === focusStreamLogin;
+      const hls = video._hls;
+      /* Apply different latency profiles for focused vs background streams.
+       * These are starting values — should be tested and tuned. */
+      if (focused) {
+        hls.config.liveSyncDurationCount = 1;
+        hls.config.liveMaxLatencyDurationCount = 3;
+        hls.config.maxBufferLength = 8;
+        hls.config.maxLiveSyncPlaybackRate = 1.05;
+      } else {
+        hls.config.liveSyncDurationCount = 3;
+        hls.config.liveMaxLatencyDurationCount = 6;
+        hls.config.maxBufferLength = 15;
+        hls.config.maxLiveSyncPlaybackRate = 1.0;
+      }
+    });
+  }
+
+  /* --- Latency timing logs ---
+   *  Periodically logs per-stream latency stats so we can measure where delay
+   *  comes from before tuning hls.js parameters. Logs:
+   *    - hls.js reported latency (hls.latency = live edge - current playback position)
+   *    - buffer ahead (video.buffered end - video.currentTime)
+   *    - dropped frames / stalls
+   *    - EXT-X-PROGRAM-DATE-TIME wall-clock latency (if the playlist contains PDT tags)
+   *
+   *  Enabled when POINTS_DEBUG=1 or via a dedicated LATENCY_DEBUG flag. Logs
+   *  every ~10s for the focused stream, every ~30s for background streams. */
+  const LATENCY_DEBUG = (() => {
+    try { return localStorage.getItem('latency_debug') === '1'; } catch { return false; }
+  })();
+
+  let latencyLogTimer = null;
+
+  function startLatencyLogging() {
+    if (latencyLogTimer) return;
+    latencyLogTimer = setInterval(logLatencyStats, 10000);
+  }
+
+  function stopLatencyLogging() {
+    if (latencyLogTimer) { clearInterval(latencyLogTimer); latencyLogTimer = null; }
+  }
+
+  function logLatencyStats() {
+    if (!LATENCY_DEBUG) return;
+    const now = performance.now();
+    document.querySelectorAll('.cell').forEach((cell) => {
+      const video = cell.querySelector('video.cell-video');
+      if (!video || !video._hls) return;
+      const login = video._twitchLogin || '?';
+      const hls = video._hls;
+      const focused = login === focusStreamLogin;
+
+      /* hls.js live latency: distance from the live edge to current playback. */
+      const hlsLatency = hls.latency != null ? hls.latency.toFixed(2) : '?';
+
+      /* Buffer ahead: how much video is buffered past the current position. */
+      let bufferAhead = '?';
+      if (video.buffered.length > 0) {
+        const end = video.buffered.end(video.buffered.length - 1);
+        bufferAhead = (end - video.currentTime).toFixed(2);
+      }
+
+      /* Dropped frames from the video element. */
+      const dropped = video.getVideoPlaybackQuality
+        ? video.getVideoPlaybackQuality().droppedVideoFrames
+        : '?';
+
+      /* Stall count (we track via a simple counter on the video element). */
+      const stalls = video._stallCount || 0;
+
+      /* EXT-X-PROGRAM-DATE-TIME wall-clock latency.
+       *
+       *  The PDT tag marks when a segment was broadcast (wall-clock time).
+       *  To estimate the viewer's wall-clock playback latency, we find the
+       *  fragment at the current playback position, interpolate to its exact
+       *  wall-clock time, and compare to Date.now().
+       *
+       *  This is an estimate, not mathematically exact capture-to-screen
+       *  latency — it depends on Twitch's PDT timestamps and the viewer PC's
+       *  system clock accuracy. Still far more useful than "it feels 15s
+       *  behind" for tuning hls.js parameters.
+       *
+       *  We compute two values:
+       *    - playback_latency: estimated wall-clock delay based on Twitch PDT
+       *      for the segment the viewer is currently watching.
+       *    - live_edge_age: wall-clock age of the newest segment's end in the
+       *      playlist (how fresh the playlist itself is). Falls back to
+       *      programDateTime + duration if endProgramDateTime is unavailable. */
+      let playbackLatency = '?';
+      let liveEdgeAge = '?';
+      const details = hls.latestLevelDetails;
+      if (details && details.fragments && details.fragments.length > 0) {
+        const frags = details.fragments;
+        const ct = video.currentTime;
+
+        /* Find the fragment the viewer is currently playing. */
+        const currentFrag = frags.find(
+          (f) => f && f.programDateTime != null &&
+                   ct >= f.start && ct < f.start + f.duration
+        );
+        if (currentFrag) {
+          /* Interpolate within the fragment to get the exact wall-clock time
+             at the current playback position. */
+          const playbackWallClock =
+            currentFrag.programDateTime + ((ct - currentFrag.start) * 1000);
+          playbackLatency = ((Date.now() - playbackWallClock) / 1000).toFixed(2);
+        }
+
+        /* Age of the live edge: how old is the newest segment's end? */
+        const lastFrag = frags[frags.length - 1];
+        if (lastFrag && lastFrag.endProgramDateTime != null) {
+          liveEdgeAge = ((Date.now() - lastFrag.endProgramDateTime) / 1000).toFixed(2);
+        } else if (lastFrag && lastFrag.programDateTime != null) {
+          liveEdgeAge = ((Date.now() - (lastFrag.programDateTime + lastFrag.duration * 1000)) / 1000).toFixed(2);
+        }
+      }
+
+      const quality = video._twitchQuality || '?';
+
+      console.log(
+        `[TWITCH LATENCY] ch=${login} focused=${focused} q=${quality} ` +
+        `hls_latency=${hlsLatency}s playback_latency=${playbackLatency}s ` +
+        `live_edge_age=${liveEdgeAge}s buffer_ahead=${bufferAhead}s ` +
+        `dropped=${dropped} stalls=${stalls} ` +
+        `currentTime=${video.currentTime.toFixed(2)} ` +
+        `readyState=${video.readyState} paused=${video.paused}`
+      );
+    });
+  }
+
   async function refreshPointsAuth() {
     try {
       const res = await fetch('/api/points-auth/status', FETCH_OPTS);
@@ -2578,6 +2755,16 @@
     video.setAttribute('playsinline', '');
     video.autoplay = state.autoplay;
 
+    /* Right-click on the video → set/unset focus stream. This is a secondary
+       shortcut to the pin button in the tile chrome. Both call the same
+       setFocusStream(login) function. */
+    video.addEventListener('contextmenu', (ev) => {
+      const login = video._twitchLogin || cell.dataset.twitchLogin;
+      if (!login) return;
+      ev.preventDefault();
+      setFocusStream(login);
+    });
+
     const fail = (msg) => {
       if (cell.querySelector('.cell-hls-error')) return;
       const errEl = document.createElement('div');
@@ -2628,26 +2815,48 @@
         // and compete with rendering → high CPU and jank.
         enableWorker: true,
         ...(twitchHls
-          ? {
-              maxBufferLength: 30,
-              maxMaxBufferLength: 60,
-              backBufferLength: 30,
-              liveSyncDurationCount: 4,
-              liveMaxLatencyDurationCount: 12,
-              maxLiveSyncPlaybackRate: 1.5,
-              // Twitch CDN URLs expire after ~1-2 min. When a segment fetch fails (503 from
-              // our proxy), hls.js retries the same URL. With the default 6 retries it gives
-              // up in ~30s and declares a fatal error — killing the tile. Bump retries so
-              // it survives until the playlist reloads with fresh segment URLs (the server
-              // invalidates its cache on 403/404, so the next playlist poll re-resolves).
-              fragLoadingMaxRetry: 20,
-              fragLoadingRetryDelay: 500,
-              fragLoadingMaxRetryTimeout: 8000,
-              manifestLoadingMaxRetry: 8,
-              manifestLoadingRetryDelay: 500,
-              levelLoadingMaxRetry: 8,
-              levelLoadingRetryDelay: 500,
-            }
+          ? (() => {
+              /* Focused stream gets aggressive low-latency config; background
+                 streams get stable multiview config. The focus can change at
+                 runtime — applyFocusHlsConfig() updates these values when the
+                 pin is toggled. These are starting values for new tiles. */
+              const tileLogin = cell.dataset.twitchLogin || '';
+              const focused = tileLogin === focusStreamLogin;
+              return {
+                /* Common Twitch-specific settings (retry survival, worker). */
+                backBufferLength: 30,
+                // Twitch CDN URLs expire after ~1-2 min. When a segment fetch fails (503 from
+                // our proxy), hls.js retries the same URL. With the default 6 retries it gives
+                // up in ~30s and declares a fatal error — killing the tile. Bump retries so
+                // it survives until the playlist reloads with fresh segment URLs (the server
+                // invalidates its cache on 403/404, so the next playlist poll re-resolves).
+                fragLoadingMaxRetry: 20,
+                fragLoadingRetryDelay: 500,
+                fragLoadingMaxRetryTimeout: 8000,
+                manifestLoadingMaxRetry: 8,
+                manifestLoadingRetryDelay: 500,
+                levelLoadingMaxRetry: 8,
+                levelLoadingRetryDelay: 500,
+                /* Latency profile — focused vs background. These values are
+                   starting points and should be tested/tuned with the latency
+                   logging enabled (localStorage.latency_debug = '1'). */
+                ...(focused
+                  ? {
+                      maxBufferLength: 8,
+                      maxMaxBufferLength: 16,
+                      liveSyncDurationCount: 1,
+                      liveMaxLatencyDurationCount: 3,
+                      maxLiveSyncPlaybackRate: 1.05,
+                    }
+                  : {
+                      maxBufferLength: 15,
+                      maxMaxBufferLength: 30,
+                      liveSyncDurationCount: 3,
+                      liveMaxLatencyDurationCount: 6,
+                      maxLiveSyncPlaybackRate: 1.0,
+                    }),
+              };
+            })()
           : {}),
       });
       hls.loadSource(playbackUrl);
@@ -2659,6 +2868,9 @@
       // Log pause events for diagnostics — the user reports random pauses with no
       // console errors, so we need to see what state the video/hls is in when it pauses.
       if (twitchHls) {
+        /* Track stalls (buffer underruns) for latency logging. */
+        video._stallCount = 0;
+        video.addEventListener('waiting', () => { video._stallCount = (video._stallCount || 0) + 1; });
         video.addEventListener('pause', () => {
           const r = cell.getBoundingClientRect();
           const onScreen = r.bottom > 0 && r.top < window.innerHeight && r.right > 0 && r.left < window.innerWidth;
@@ -2743,6 +2955,23 @@
   function attachCellChatToggle(cell, login) {
     if (!login) return;
     cell.dataset.twitchLogin = login;
+
+    /* Focus/pin button: sets this stream as the focus stream (priority
+       earning slot 1 + aggressive low-latency hls.js config). Clicking
+       an already-focused pin unpins it. */
+    const pinBtn = document.createElement('button');
+    pinBtn.type = 'button';
+    pinBtn.className = 'cell-focus-pin';
+    pinBtn.dataset.twitchLogin = login;
+    pinBtn.title = 'Focus stream';
+    pinBtn.setAttribute('aria-pressed', 'false');
+    pinBtn.textContent = '★';
+    pinBtn.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      setFocusStream(login);
+    });
+    cell.appendChild(pinBtn);
 
     const wrap = document.createElement('div');
     wrap.className = 'cell-chat-wrap';
@@ -3597,6 +3826,7 @@
     await refreshCategoryFollows();
     await refreshAuth();
     await refreshPointsAuth();
+    startLatencyLogging();
     setupGridDrag();
     fullRender();
     schedulePoll();
