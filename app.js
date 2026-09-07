@@ -2659,10 +2659,9 @@
             if (video) {
               const hls = video._hls;
               if (!visible) {
-                // Mark as auto-paused so the pause event listener knows this isn't
-                // a user action. The flag is reset in the pause handler.
-                video._autoPaused = true;
-                video.pause();
+                // Stop fetching segments for offscreen tiles to save bandwidth/CPU.
+                // The play/pause decision is delegated to reconcilePlayback so all
+                // callers use the same logic and can't fight each other.
                 if (hls && typeof hls.stopLoad === 'function') {
                   try {
                     hls.stopLoad();
@@ -2670,6 +2669,7 @@
                     /* ignore */
                   }
                 }
+                reconcilePlayback(cell, video, 'observer-offscreen');
               } else {
                 if (hls && typeof hls.startLoad === 'function') {
                   try {
@@ -2678,10 +2678,7 @@
                     /* ignore */
                   }
                 }
-                // Only auto-play if autoplay is enabled. Without this check, the
-                // observer plays tiles when they scroll into view even when the
-                // user has turned autoplay off.
-                if (state.autoplay) video.play().catch(() => {});
+                reconcilePlayback(cell, video, 'observer-visible');
               }
             }
           });
@@ -2795,6 +2792,62 @@
     if (!cell || !cell.isConnected) return false;
     const r = cell.getBoundingClientRect();
     return r.bottom > 0 && r.top < window.innerHeight && r.right > 0 && r.left < window.innerWidth;
+  }
+
+  /** THE single authority on whether a tile's video should be playing or paused.
+   *  All callers (IntersectionObserver, MANIFEST_PARSED, bufferStalledError recovery,
+   *  ended recovery) MUST route through this function instead of calling video.play()
+   *  or video.pause() directly. This eliminates the PLAY→PAUSE→PLAY thrashing that
+   *  happens when multiple independent callers fight over playback state.
+   *
+   *  The desired state is computed from ALL factors:
+   *    - state.autoplay (global autoplay toggle)
+   *    - isCellVisible(cell) (strict viewport check)
+   *    - video._userPaused (user paused via native controls — respect until user plays)
+   *    - video.ended (stream ended — don't play until source is reloaded)
+   *
+   *  @param {HTMLElement} cell
+   *  @param {HTMLVideoElement} video
+   *  @param {string} reason — who called this (for diagnostics)
+   *  @param {{ forcePlay?: boolean }} opts — forcePlay bypasses visibility/userPaused
+   *    (used by the ended-recovery path after a source reload, where we know we want
+   *    to play even though the tile might briefly report as not visible during the
+   *    reload transition). */
+  function reconcilePlayback(cell, video, reason, opts) {
+    if (!video || !video.isConnected) return;
+    const visible = isCellVisible(cell);
+    const forcePlay = Boolean(opts && opts.forcePlay);
+    const shouldPlay =
+      forcePlay ||
+      (state.autoplay && visible && !video._userPaused && !video.ended);
+
+    if (shouldPlay && video.paused) {
+      // Mark that this play() comes from reconcile, not the user. The pause event
+      // listener uses this to distinguish auto-pauses from user pauses.
+      video._reconcilePlaying = true;
+      video
+        .play()
+        .catch(() => {})
+        .finally(() => {
+          video._reconcilePlaying = false;
+        });
+    } else if (!shouldPlay && !video.paused) {
+      video._autoPaused = true;
+      video.pause();
+    }
+    // Log every state transition with the caller's reason — this instantly exposes
+    // which caller is responsible for contradictory PLAY/PAUSE decisions.
+    const desired = shouldPlay ? 'PLAY' : 'PAUSE';
+    const acted = (shouldPlay && video.paused) || (!shouldPlay && !video.paused)
+      ? `→${desired}`
+      : 'no-op';
+    console.log(
+      `[twitchviewer] STATE ch=${video._twitchLogin || '?'} gen=${video._twitchGen || 0} ` +
+      `desired=${desired} ${acted} reason=${reason} ` +
+      `onScreen=${visible} autoplay=${state.autoplay} ` +
+      `userPaused=${!!video._userPaused} ended=${video.ended} ` +
+      `q=${video._twitchQuality || '?'}`
+    );
   }
 
   /**
@@ -2922,8 +2975,9 @@
         // Only autoplay if the tile is visible. The IntersectionObserver pauses
         // offscreen tiles, and without this check every quality-change loadSource()
         // would fire MANIFEST_PARSED → play() on offscreen tiles, fighting the
-        // observer and causing PLAY→PAUSE thrashing.
-        if (state.autoplay && isCellVisible(cell)) video.play().catch(() => {});
+        // observer and causing PLAY→PAUSE thrashing. Route through reconcilePlayback
+        // so the decision is centralized and consistent with the observer.
+        reconcilePlayback(cell, video, 'manifest-parsed');
       });
       // Log pause events for diagnostics — the user reports random pauses with no
       // console errors, so we need to see what state the video/hls is in when it pauses.
@@ -2954,9 +3008,18 @@
           const onScreen = r.bottom > 0 && r.top < window.innerHeight && r.right > 0 && r.left < window.innerWidth;
           const auto = video._autoPaused;
           video._autoPaused = false;
+          // If the pause wasn't from reconcilePlayback (auto) and wasn't from the
+          // browser auto-pausing on buffer underrun, it's a user pause via the
+          // native controls. Track it so reconcilePlayback respects it — otherwise
+          // the stall-recovery or manifest-parsed handler would immediately undo
+          // the user's pause.
+          if (!auto && !video._reconcilePlaying && !video.ended) {
+            video._userPaused = true;
+          }
           console.log(
             `[twitchviewer] PAUSE ch=${video._twitchLogin || '?'} gen=${video._twitchGen || 0} q=${video._twitchQuality || '?'} ` +
             `onScreen=${onScreen} autoplay=${state.autoplay} auto=${auto} ` +
+            `userPaused=${!!video._userPaused} ` +
             `readyState=${video.readyState} networkState=${video.networkState} ` +
             `paused=${video.paused} ended=${video.ended} ` +
             `hlsCurrentLevel=${hls.currentLevel} hlsLoadLevel=${hls.loadLevel} ` +
@@ -2964,6 +3027,12 @@
           );
         });
         video.addEventListener('play', () => {
+          // If the play wasn't from reconcilePlayback, it's a user play via the
+          // native controls — clear the userPaused flag so reconcilePlayback
+          // doesn't re-pause on the next visibility change.
+          if (!video._reconcilePlaying) {
+            video._userPaused = false;
+          }
           console.log(`[twitchviewer] PLAY  ch=${video._twitchLogin || '?'} gen=${video._twitchGen || 0} q=${video._twitchQuality || '?'}`);
         });
         /* Live stream ended unexpectedly — for a Twitch live stream this means the
@@ -3003,20 +3072,16 @@
         }
         // Non-fatal buffer stall: the browser auto-pauses when the buffer underruns.
         // hls.js refills the buffer but does NOT call video.play() — so the video stays
-        // paused. Wait for hls.js to append new data, then resume playback.
-        // ONLY resume if the tile is visible — without this check, the stall handler
-        // calls play() on offscreen tiles that the IntersectionObserver has paused,
-        // causing PLAY→PAUSE→PLAY thrashing.
+        // paused. Wait for hls.js to append new data, then reconcile playback (which
+        // checks visibility + autoplay + userPaused centrally, so it can't fight the
+        // IntersectionObserver).
         if (!data.fatal && twitchHls && data.details === 'bufferStalledError') {
           if (state.autoplay) {
             const gen = video._twitchGen || 0;
             const resumeOnBuffer = () => {
               if (!video.isConnected) return;
               if ((video._twitchGen || 0) !== gen) return; // quality changed since
-              if (video.paused && !video.ended && state.autoplay && isCellVisible(cell)) {
-                video.play().catch(() => {});
-                console.log(`[twitchviewer] RESUME after stall ch=${video._twitchLogin || '?'} gen=${gen}`);
-              }
+              reconcilePlayback(cell, video, 'stall-recover');
             };
             // Give hls.js 2s to append new segments, then resume.
             setTimeout(resumeOnBuffer, 2000);
@@ -3039,7 +3104,8 @@
       });
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
       video.src = playbackUrl;
-      if (state.autoplay) video.play().catch(() => {});
+      // Route through reconcilePlayback for consistency with the hls.js path.
+      if (state.autoplay) reconcilePlayback(cell, video, 'native-hls-mount');
     } else {
       fail('HLS not supported in this browser.');
     }
