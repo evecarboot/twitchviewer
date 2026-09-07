@@ -720,14 +720,42 @@
   // To keep 15+ simultaneous tiles from melting the browser decoder, small tiles fetch a
   // lower variant (360p/480p) and only large tiles fetch 720p60. Thresholds are in CSS px².
   // Tuned for weaker CPUs (e.g. i5-6400): a 2x2 grid on 1080p gets 360p30 per tile, not 480p30.
-  const TWITCH_PROXY_TIER_360 = 550000; // ~960x570 — covers typical 2x2/3x2 grid tiles
-  const TWITCH_PROXY_TIER_480 = 1200000; // ~1280x940 — big tiles / 1x2 layouts
-  // Above 480 tier → 720p60 (or env default if TWITCH_STREAMLINK_QUALITY is set higher).
+  //
+  // Hysteresis: upgrade and downgrade use DIFFERENT thresholds so a tile hovering near a
+  // boundary doesn't oscillate 360p↔480p on every layout micro-change. Each tier has an
+  // "up" threshold (must exceed to upgrade) and a "down" threshold (must drop below to
+  // downgrade). The gap between them is the dead zone where quality stays put.
+  const TWITCH_PROXY_TIER_360 = 550000; // baseline midpoint (~960x570)
+  const TWITCH_PROXY_TIER_480 = 1200000; // baseline midpoint (~1280x940)
+  // Hysteresis bands — ~15% above/below the baseline thresholds.
+  const TWITCH_PROXY_TIER_360_UP = 630000; // 360→480: must exceed this
+  const TWITCH_PROXY_TIER_360_DN = 470000; // 480→360: must drop below this
+  const TWITCH_PROXY_TIER_480_UP = 1380000; // 480→720: must exceed this
+  const TWITCH_PROXY_TIER_480_DN = 1020000; // 720→480: must drop below this
+  // Cooldown: don't change quality more than once per tile in this window. Prevents
+  // rapid 360→480→360 cycles when the grid is still settling after a resize/reorder.
+  const TWITCH_QUALITY_COOLDOWN_MS = 5000;
 
-  function twitchQualityForCell(w, h) {
+  function twitchQualityForCell(w, h, currentQuality) {
     const px = Math.max(0, w | 0) * Math.max(0, h | 0);
-    if (px < TWITCH_PROXY_TIER_360) return '360p30';
-    if (px < TWITCH_PROXY_TIER_480) return '480p30';
+    // No current quality (initial mount) — use baseline thresholds for a stable first pick.
+    if (!currentQuality) {
+      if (px < TWITCH_PROXY_TIER_360) return '360p30';
+      if (px < TWITCH_PROXY_TIER_480) return '480p30';
+      return '720p60';
+    }
+    // Hysteresis: use different thresholds depending on what we're currently at.
+    if (currentQuality === '360p30') {
+      if (px >= TWITCH_PROXY_TIER_360_UP) return '480p30';
+      return '360p30';
+    }
+    if (currentQuality === '480p30') {
+      if (px < TWITCH_PROXY_TIER_360_DN) return '360p30';
+      if (px >= TWITCH_PROXY_TIER_480_UP) return '720p60';
+      return '480p30';
+    }
+    // 720p60 (or any other quality)
+    if (px < TWITCH_PROXY_TIER_480_DN) return '480p30';
     return '720p60';
   }
 
@@ -737,19 +765,27 @@
   }
 
   /** Re-evaluate quality for already-mounted proxy cells after a layout change.
-   *  Only reloads the HLS source when the tile crossed a quality tier (avoids thrash). */
+   *  Only reloads the HLS source when the tile crossed a quality tier (with hysteresis
+   *  to avoid oscillation) AND the per-tile cooldown has elapsed. */
   function refreshTwitchProxyQualities() {
     if (twitchPlayback !== 'proxy') return;
+    const now = performance.now();
     const roots = [els.grid, els.gridPriority].filter(Boolean);
     for (const root of roots) {
       for (const cell of root.querySelectorAll('.cell')) {
         const video = cell.querySelector('video.cell-video');
         if (!video || !video._hls) continue;
-        const want = twitchQualityForCell(cell.clientWidth, cell.clientHeight);
+        const want = twitchQualityForCell(cell.clientWidth, cell.clientHeight, video._twitchQuality);
         if (video._twitchQuality === want) continue;
+        // Cooldown: skip if we changed quality recently. This prevents 360→480→360
+        // cycles while the grid is still settling after a resize or reorder.
+        if (video._twitchQualityChangedAt && (now - video._twitchQualityChangedAt) < TWITCH_QUALITY_COOLDOWN_MS) continue;
         const login = video._twitchLogin;
         if (!login) continue;
         video._twitchQuality = want;
+        video._twitchQualityChangedAt = now;
+        video._twitchGen = (video._twitchGen || 0) + 1;
+        console.log(`[twitchviewer] SOURCE ch=${login} gen=${video._twitchGen} q=${want}`);
         try {
           video._hls.loadSource(twitchProxyPlaybackUrl(login, want));
         } catch {
@@ -2623,6 +2659,9 @@
             if (video) {
               const hls = video._hls;
               if (!visible) {
+                // Mark as auto-paused so the pause event listener knows this isn't
+                // a user action. The flag is reset in the pause handler.
+                video._autoPaused = true;
                 video.pause();
                 if (hls && typeof hls.stopLoad === 'function') {
                   try {
@@ -2639,7 +2678,10 @@
                     /* ignore */
                   }
                 }
-                video.play().catch(() => {});
+                // Only auto-play if autoplay is enabled. Without this check, the
+                // observer plays tiles when they scroll into view even when the
+                // user has turned autoplay off.
+                if (state.autoplay) video.play().catch(() => {});
               }
             }
           });
@@ -2742,6 +2784,17 @@
     if (!els.gridArea || gridDragBound) return;
     gridDragBound = true;
     els.gridArea.addEventListener('pointerdown', onGridPointerDown);
+  }
+
+  /** Check if a cell is currently in the viewport. Used by the centralized play/pause
+   *  logic so that stall recovery and manifest-parsed handlers don't call play() on
+   *  offscreen tiles that the IntersectionObserver has already paused. Without this,
+   *  the stall handler and the quality-change MANIFEST_PARSED handler fight the
+   *  IntersectionObserver, causing rapid PLAY→PAUSE→PLAY thrashing. */
+  function isCellVisible(cell) {
+    if (!cell || !cell.isConnected) return false;
+    const r = cell.getBoundingClientRect();
+    return r.bottom > 0 && r.top < window.innerHeight && r.right > 0 && r.left < window.innerWidth;
   }
 
   /**
@@ -2866,7 +2919,11 @@
       hls.attachMedia(video);
       video._hls = hls;
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        if (state.autoplay) video.play().catch(() => {});
+        // Only autoplay if the tile is visible. The IntersectionObserver pauses
+        // offscreen tiles, and without this check every quality-change loadSource()
+        // would fire MANIFEST_PARSED → play() on offscreen tiles, fighting the
+        // observer and causing PLAY→PAUSE thrashing.
+        if (state.autoplay && isCellVisible(cell)) video.play().catch(() => {});
       });
       // Log pause events for diagnostics — the user reports random pauses with no
       // console errors, so we need to see what state the video/hls is in when it pauses.
@@ -2895,9 +2952,11 @@
         video.addEventListener('pause', () => {
           const r = cell.getBoundingClientRect();
           const onScreen = r.bottom > 0 && r.top < window.innerHeight && r.right > 0 && r.left < window.innerWidth;
+          const auto = video._autoPaused;
+          video._autoPaused = false;
           console.log(
-            `[twitchviewer] PAUSE ch=${video._twitchLogin || '?'} q=${video._twitchQuality || '?'} ` +
-            `onScreen=${onScreen} autoplay=${state.autoplay} ` +
+            `[twitchviewer] PAUSE ch=${video._twitchLogin || '?'} gen=${video._twitchGen || 0} q=${video._twitchQuality || '?'} ` +
+            `onScreen=${onScreen} autoplay=${state.autoplay} auto=${auto} ` +
             `readyState=${video.readyState} networkState=${video.networkState} ` +
             `paused=${video.paused} ended=${video.ended} ` +
             `hlsCurrentLevel=${hls.currentLevel} hlsLoadLevel=${hls.loadLevel} ` +
@@ -2905,7 +2964,32 @@
           );
         });
         video.addEventListener('play', () => {
-          console.log(`[twitchviewer] PLAY  ch=${video._twitchLogin || '?'} q=${video._twitchQuality || '?'}`);
+          console.log(`[twitchviewer] PLAY  ch=${video._twitchLogin || '?'} gen=${video._twitchGen || 0} q=${video._twitchQuality || '?'}`);
+        });
+        /* Live stream ended unexpectedly — for a Twitch live stream this means the
+         * HLS playlist ran out of segments (CDN URL expired, playlist stale, or
+         * transient server issue). The stream is almost certainly still live, so
+         * reload the source with a fresh proxy URL instead of leaving the tile
+         * dead on a paused thumbnail. Uses generation tracking so a quality change
+         * that happened during the backoff doesn't cause a stale reload. */
+        video.addEventListener('ended', () => {
+          if (!twitchHls) return;
+          const login = video._twitchLogin || '?';
+          const gen = video._twitchGen || 0;
+          console.log(`[twitchviewer] ENDED ch=${login} gen=${gen} — scheduling source reload`);
+          setTimeout(() => {
+            if (!video.isConnected) return;
+            if ((video._twitchGen || 0) !== gen) return; // quality changed since
+            if (!video._hls) return;
+            const quality = video._twitchQuality || '360p30';
+            video._twitchGen = (video._twitchGen || 0) + 1;
+            console.log(`[twitchviewer] SOURCE ch=${login} gen=${video._twitchGen} q=${quality} (ended recovery)`);
+            try {
+              video._hls.loadSource(twitchProxyPlaybackUrl(login, quality));
+            } catch {
+              /* ignore */
+            }
+          }, 2000);
         });
       }
       hls.on(Hls.Events.ERROR, (_, data) => {
@@ -2913,20 +2997,25 @@
         // happening before the video pauses.
         if (twitchHls) {
           console.log(
-            `[twitchviewer] HLS ERROR ch=${video._twitchLogin || '?'} ` +
+            `[twitchviewer] HLS ERROR ch=${video._twitchLogin || '?'} gen=${video._twitchGen || 0} ` +
             `fatal=${data.fatal} type=${data.type} details=${data.details}`
           );
         }
         // Non-fatal buffer stall: the browser auto-pauses when the buffer underruns.
         // hls.js refills the buffer but does NOT call video.play() — so the video stays
         // paused. Wait for hls.js to append new data, then resume playback.
+        // ONLY resume if the tile is visible — without this check, the stall handler
+        // calls play() on offscreen tiles that the IntersectionObserver has paused,
+        // causing PLAY→PAUSE→PLAY thrashing.
         if (!data.fatal && twitchHls && data.details === 'bufferStalledError') {
           if (state.autoplay) {
+            const gen = video._twitchGen || 0;
             const resumeOnBuffer = () => {
               if (!video.isConnected) return;
-              if (video.paused && !video.ended && state.autoplay) {
+              if ((video._twitchGen || 0) !== gen) return; // quality changed since
+              if (video.paused && !video.ended && state.autoplay && isCellVisible(cell)) {
                 video.play().catch(() => {});
-                console.log(`[twitchviewer] RESUME after stall ch=${video._twitchLogin || '?'}`);
+                console.log(`[twitchviewer] RESUME after stall ch=${video._twitchLogin || '?'} gen=${gen}`);
               }
             };
             // Give hls.js 2s to append new segments, then resume.
