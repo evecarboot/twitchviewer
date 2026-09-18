@@ -3,7 +3,8 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test tests/*.test.mjs"
   },
   "dependencies": {
     "connect-sqlite3": "^0.9.16",

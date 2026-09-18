@@ -694,7 +694,14 @@
       window.setTimeout(() => {
         if (!cell.isConnected || player._twitchPlaybackStarted) return;
         try {
-          if (typeof player.setMuted === 'function') player.setMuted(true);
+          /* Re-assert muted ONLY when the player is still muted — an explicit
+             user unmute is an audio choice, and automation must never undo it. */
+          if (
+            !TwitchPlayback.twitchEmbedUserUnmuted(player) &&
+            typeof player.setMuted === 'function'
+          ) {
+            player.setMuted(true);
+          }
           if (typeof player.play === 'function') player.play();
         } catch {
           /* ignore */
@@ -787,6 +794,7 @@
         video._twitchGen = (video._twitchGen || 0) + 1;
         console.log(`[twitchviewer] SOURCE ch=${login} gen=${video._twitchGen} q=${want}`);
         try {
+          if (video._pb) video._pb.noteSourceReload();
           video._hls.loadSource(twitchProxyPlaybackUrl(login, want));
         } catch {
           /* ignore */
@@ -969,7 +977,13 @@
              stuck on its paused thumbnail when a stream resumes. */
           player._twitchPlaybackStarted = false;
           try {
-            if (typeof player.setMuted === 'function') player.setMuted(true);
+            /* Respect an explicit user unmute — don't re-mute on stream resume. */
+            if (
+              !TwitchPlayback.twitchEmbedUserUnmuted(player) &&
+              typeof player.setMuted === 'function'
+            ) {
+              player.setMuted(true);
+            }
             if (typeof player.play === 'function') player.play();
           } catch {
             /* ignore */
@@ -2683,7 +2697,13 @@
             }
           });
         },
-        { root: null, rootMargin: '120px', threshold: 0.1 }
+        /* Canonical visibility == isCellVisible (any real overlap). Previously
+           rootMargin 120px + threshold 0.1 meant the observer could declare a
+           tile "offscreen" — stopping HLS loads and starving its buffer —
+           while reconcilePlayback still computed it visible and wanted it
+           playing: a self-sustaining stall→pause→resume loop near viewport
+           edges. One definition of "eligible for auto playback" now. */
+        { root: null, rootMargin: '0px', threshold: 0 }
       );
       obs.observe(cell);
       cellObservers.push(obs);
@@ -2794,60 +2814,78 @@
     return r.bottom > 0 && r.top < window.innerHeight && r.right > 0 && r.left < window.innerWidth;
   }
 
+  /** Verbose per-event playback diagnostics: localStorage.playback_debug = '1'.
+   *  Off by default — media events are frequent and the trace is for debugging. */
+  const PLAYBACK_DEBUG = (() => {
+    try {
+      return localStorage.getItem('playback_debug') === '1';
+    } catch {
+      return false;
+    }
+  })();
+
+  /** Most recent keydown anywhere in the document — keyboard media control
+   *  (space/k or hardware play/pause keys) doesn't move focus to the video. */
+  let lastPageKeydownAt = -Infinity;
+  document.addEventListener(
+    'keydown',
+    () => {
+      lastPageKeydownAt = performance.now();
+    },
+    true
+  );
+
+  /**
+   * Was a media event caused by a real user gesture targeting this video?
+   * navigator.userActivation.isActive is the only reliable activation signal
+   * for native-controls interactions (control clicks never produce DOM events
+   * outside the UA shadow root), but it's frame-wide — an unrelated page click
+   * coinciding with a browser/HLS pause would be misclassified as a user pause.
+   * TwitchPlayback.isUserGesture scopes the activation to the element:
+   * the video itself focused (control clicks focus it), or no specific focus
+   * (legacy/browsers that never focus <video>), or a fresh keydown.
+   *
+   * When the API is unavailable we return true so unclassified pauses keep the
+   * legacy "treated as user pause" behavior — never worse than before.
+   */
+  function playbackUserGesture(video) {
+    try {
+      return TwitchPlayback.isUserGesture({
+        ua: navigator.userActivation,
+        activeElement: document.activeElement,
+        video,
+        looseElements: [document.body, document.documentElement],
+        lastKeydownAt: lastPageKeydownAt,
+        now: performance.now(),
+      });
+    } catch {
+      return true;
+    }
+  }
+
   /** THE single authority on whether a tile's video should be playing or paused.
    *  All callers (IntersectionObserver, MANIFEST_PARSED, bufferStalledError recovery,
-   *  ended recovery) MUST route through this function instead of calling video.play()
-   *  or video.pause() directly. This eliminates the PLAY→PAUSE→PLAY thrashing that
-   *  happens when multiple independent callers fight over playback state.
-   *
-   *  The desired state is computed from ALL factors:
-   *    - state.autoplay (global autoplay toggle)
-   *    - isCellVisible(cell) (strict viewport check)
-   *    - video._userPaused (user paused via native controls — respect until user plays)
-   *    - video.ended (stream ended — don't play until source is reloaded)
+   *  ended recovery) route through this function, which delegates to the per-tile
+   *  playback controller (video._pb, see playback-controller.js). The controller
+   *  owns the desired state, command idempotence, and event provenance:
+   *    - desired = forcePlay || (autoplay && visible && !userPaused && !ended)
+   *    - browser/autoplay-policy/underrun pauses are 'external', NOT user pauses
+   *    - a real user pause is detected via user activation, not event timing
+   *    - audio state (muted) is tracked separately from playback state
    *
    *  @param {HTMLElement} cell
    *  @param {HTMLVideoElement} video
    *  @param {string} reason — who called this (for diagnostics)
-   *  @param {{ forcePlay?: boolean }} opts — forcePlay bypasses visibility/userPaused
-   *    (used by the ended-recovery path after a source reload, where we know we want
-   *    to play even though the tile might briefly report as not visible during the
-   *    reload transition). */
+   *  @param {{ forcePlay?: boolean }} opts — forcePlay bypasses visibility/userPaused */
   function reconcilePlayback(cell, video, reason, opts) {
     if (!video || !video.isConnected) return;
-    const visible = isCellVisible(cell);
-    const forcePlay = Boolean(opts && opts.forcePlay);
-    const shouldPlay =
-      forcePlay ||
-      (state.autoplay && visible && !video._userPaused && !video.ended);
-
-    if (shouldPlay && video.paused) {
-      // Mark that this play() comes from reconcile, not the user. The pause event
-      // listener uses this to distinguish auto-pauses from user pauses.
-      video._reconcilePlaying = true;
-      video
-        .play()
-        .catch(() => {})
-        .finally(() => {
-          video._reconcilePlaying = false;
-        });
-    } else if (!shouldPlay && !video.paused) {
-      video._autoPaused = true;
-      video.pause();
+    if (video._pb) {
+      video._pb.reconcile(reason, opts);
+      return;
     }
-    // Log every state transition with the caller's reason — this instantly exposes
-    // which caller is responsible for contradictory PLAY/PAUSE decisions.
-    const desired = shouldPlay ? 'PLAY' : 'PAUSE';
-    const acted = (shouldPlay && video.paused) || (!shouldPlay && !video.paused)
-      ? `→${desired}`
-      : 'no-op';
-    console.log(
-      `[twitchviewer] STATE ch=${video._twitchLogin || '?'} gen=${video._twitchGen || 0} ` +
-      `desired=${desired} ${acted} reason=${reason} ` +
-      `onScreen=${visible} autoplay=${state.autoplay} ` +
-      `userPaused=${!!video._userPaused} ended=${video.ended} ` +
-      `q=${video._twitchQuality || '?'}`
-    );
+    if (PLAYBACK_DEBUG) {
+      console.log(`[twitchviewer] STATE reason=${reason} — no playback controller on video`);
+    }
   }
 
   /**
@@ -2863,6 +2901,74 @@
     video.playsInline = true;
     video.setAttribute('playsinline', '');
     video.autoplay = state.autoplay;
+
+    /* Per-tile playback state machine — the single authority for this video's
+       play/pause intent (see playback-controller.js). Audio state (muted) is
+       deliberately separate from playback state. */
+    const pb = TwitchPlayback.create(
+      {
+        get paused() {
+          return video.paused;
+        },
+        get muted() {
+          return video.muted;
+        },
+        get ended() {
+          return video.ended;
+        },
+        play: () => video.play(),
+        pause: () => video.pause(),
+        setMuted: (v) => {
+          video.muted = v;
+        },
+      },
+      {
+        isAutoplayEnabled: () => state.autoplay,
+        isVisible: () => isCellVisible(cell),
+        log: (line) =>
+          console.warn(
+            `[twitchviewer] PLAYBACK ch=${video._twitchLogin || cell.dataset.twitchLogin || '?'} ${line}`
+          ),
+        debug: (line) => {
+          if (PLAYBACK_DEBUG) {
+            console.log(
+              `[twitchviewer] PB ch=${video._twitchLogin || cell.dataset.twitchLogin || '?'} ${line}`
+            );
+          }
+        },
+      }
+    );
+    video._pb = pb;
+
+    /* Classify every pause/play by provenance so that browser autoplay-policy
+       pauses (e.g. Chromium pausing an unmuted-muted-autoplay element), buffer
+       underrun pauses, and app-issued pauses are never mistaken for user intent. */
+    video.addEventListener('pause', () => {
+      const kind = pb.onPause(playbackUserGesture(video));
+      if (PLAYBACK_DEBUG) {
+        console.log(
+          `[twitchviewer] PAUSE ch=${video._twitchLogin || '?'} gen=${video._twitchGen || 0} kind=${kind} ` +
+            `paused=${video.paused} muted=${video.muted} readyState=${video.readyState} ` +
+            `networkState=${video.networkState}`
+        );
+      }
+    });
+    video.addEventListener('play', () => {
+      const kind = pb.onPlay(playbackUserGesture(video));
+      if (PLAYBACK_DEBUG) {
+        console.log(
+          `[twitchviewer] PLAY ch=${video._twitchLogin || '?'} gen=${video._twitchGen || 0} kind=${kind}`
+        );
+      }
+    });
+    /* Audio intent: a user-gesture mute/unmute is recorded as an audio choice;
+       it never feeds back into the play/pause decision. */
+    video.addEventListener('volumechange', () => {
+      pb.onVolumeChange(playbackUserGesture(video));
+    });
+    video.addEventListener('ended', () => {
+      pb.onEnded();
+    });
 
     /* Right-click on the video → set/unset focus stream. This is a secondary
        shortcut to the pin button in the tile chrome. Both call the same
@@ -3003,38 +3109,6 @@
         });
         video.addEventListener('playing', endStall);
         video.addEventListener('canplay', endStall);
-        video.addEventListener('pause', () => {
-          const r = cell.getBoundingClientRect();
-          const onScreen = r.bottom > 0 && r.top < window.innerHeight && r.right > 0 && r.left < window.innerWidth;
-          const auto = video._autoPaused;
-          video._autoPaused = false;
-          // If the pause wasn't from reconcilePlayback (auto) and wasn't from the
-          // browser auto-pausing on buffer underrun, it's a user pause via the
-          // native controls. Track it so reconcilePlayback respects it — otherwise
-          // the stall-recovery or manifest-parsed handler would immediately undo
-          // the user's pause.
-          if (!auto && !video._reconcilePlaying && !video.ended) {
-            video._userPaused = true;
-          }
-          console.log(
-            `[twitchviewer] PAUSE ch=${video._twitchLogin || '?'} gen=${video._twitchGen || 0} q=${video._twitchQuality || '?'} ` +
-            `onScreen=${onScreen} autoplay=${state.autoplay} auto=${auto} ` +
-            `userPaused=${!!video._userPaused} ` +
-            `readyState=${video.readyState} networkState=${video.networkState} ` +
-            `paused=${video.paused} ended=${video.ended} ` +
-            `hlsCurrentLevel=${hls.currentLevel} hlsLoadLevel=${hls.loadLevel} ` +
-            `bufferEnd=${hls.bufferEnd ? hls.bufferEnd.toFixed(1) : '?'}`
-          );
-        });
-        video.addEventListener('play', () => {
-          // If the play wasn't from reconcilePlayback, it's a user play via the
-          // native controls — clear the userPaused flag so reconcilePlayback
-          // doesn't re-pause on the next visibility change.
-          if (!video._reconcilePlaying) {
-            video._userPaused = false;
-          }
-          console.log(`[twitchviewer] PLAY  ch=${video._twitchLogin || '?'} gen=${video._twitchGen || 0} q=${video._twitchQuality || '?'}`);
-        });
         /* Live stream ended unexpectedly — for a Twitch live stream this means the
          * HLS playlist ran out of segments (CDN URL expired, playlist stale, or
          * transient server issue). The stream is almost certainly still live, so
@@ -3054,6 +3128,7 @@
             video._twitchGen = (video._twitchGen || 0) + 1;
             console.log(`[twitchviewer] SOURCE ch=${login} gen=${video._twitchGen} q=${quality} (ended recovery)`);
             try {
+              if (video._pb) video._pb.noteSourceReload();
               video._hls.loadSource(twitchProxyPlaybackUrl(login, quality));
             } catch {
               /* ignore */
@@ -3093,11 +3168,23 @@
         // which hits our proxy with a fresh resolve → fresh CDN URLs). Media error →
         // recoverMediaError() (resets the media element internally).
         if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-          try { hls.startLoad(); } catch { /* ignore */ }
+          /* Guard: an in-flight abort can surface as a fatal network error just
+             as the observer stopLoads an offscreen/detached tile — restarting
+             load here would silently undo the offscreen bandwidth saving. The
+             observer-visible path calls startLoad() again when the tile
+             returns, so skipping it now loses nothing. */
+          try {
+            if (video.isConnected && isCellVisible(cell)) hls.startLoad();
+          } catch { /* ignore */ }
           return;
         }
         if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-          try { hls.recoverMediaError(); } catch { /* ignore */ }
+          try {
+            /* recoverMediaError detaches+reattaches the media element — the
+               resulting pause is app-caused, not user intent. */
+            if (video._pb) video._pb.noteSourceReload();
+            hls.recoverMediaError();
+          } catch { /* ignore */ }
           return;
         }
         fail(formatHlsFatalError(data));

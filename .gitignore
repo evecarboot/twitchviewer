@@ -3,7 +3,9 @@ certs/
 cert/
 .env
 .sessions/
-.sessions.sqlite
+.sessions.sqlite*
 .hls-transcode/
+points-device-id.txt
+points-token.json
 .env.example
 AGENTS.md
