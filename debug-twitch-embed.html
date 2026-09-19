@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>TwitchViewer — bare Twitch embed diagnostic</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  /* Bare diagnostic page: neutral background, fixed compliant player
+     rectangles (>=400x300), NO overlays/transforms/filters/clipping over
+     the embeds — exactly what Twitch's own autoplay requirements demand. */
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #101014;
+    color: #ddd;
+    font: 13px/1.4 system-ui, sans-serif;
+  }
+  header {
+    padding: 10px 14px;
+    border-bottom: 1px solid #333;
+  }
+  header h1 { font-size: 15px; margin: 0 0 6px; }
+  header .meta { color: #9aa; margin-bottom: 6px; }
+  header nav a { color: #7fb4ff; margin-right: 10px; }
+  #summary {
+    margin: 8px 0 0;
+    padding: 6px 8px;
+    background: #181822;
+    border: 1px solid #333;
+    white-space: pre-wrap;
+    font-family: ui-monospace, monospace;
+    font-size: 12px;
+  }
+  #notes { color: #897; font-size: 12px; margin-top: 6px; }
+  #grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    padding: 12px;
+  }
+  .slot { display: flex; flex-direction: column; }
+  .slot .cap {
+    font-family: ui-monospace, monospace;
+    font-size: 11px;
+    color: #8ab;
+    padding: 2px 0;
+  }
+  .slot .box {
+    width: 500px;
+    height: 320px;
+    background: #000;
+    position: relative;
+    outline: 1px solid #2a2a33;
+  }
+  .slot .box > * { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
+  .slot .events {
+    font-family: ui-monospace, monospace;
+    font-size: 10.5px;
+    color: #7a8;
+    max-width: 500px;
+    white-space: pre-wrap;
+    min-height: 2.2em;
+  }
+  .slot.playing .cap { color: #5e5; }
+  .slot.failed .cap { color: #e66; }
+  button {
+    background: #2a2a3a; color: #dde; border: 1px solid #445;
+    padding: 4px 10px; cursor: pointer; font-size: 12px; margin-right: 8px;
+  }
+  button:hover { background: #3a3a4e; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Bare Twitch embed diagnostic</h1>
+  <div class="meta" id="meta"></div>
+  <nav id="nav"></nav>
+  <div id="summary">initializing…</div>
+  <div id="notes">
+    Page JS cannot see HTTP status inside cross-origin Twitch iframes — to
+    count k.twitchcdn.net 429s / integrity failures / "style visibility"
+    errors, keep DevTools open (Network filter: twitchcdn; Console filter:
+    autoplay). This page reports what IS observable: SDK script load, player
+    lifecycle events with timestamps, iframe load events, long tasks, and
+    whether the browser kills this page's probe WebGL context
+    ("Too many active WebGL contexts" symptom).
+  </div>
+  <div style="margin-top:6px">
+    <button id="copy">Copy report JSON</button>
+    <button id="rel">Reload (same params)</button>
+  </div>
+</header>
+<div id="grid"></div>
+<script>
+(function () {
+  'use strict';
+  var qs = new URLSearchParams(location.search);
+  var TYPE = (qs.get('type') || 'sdk').toLowerCase();            // sdk | iframe
+  var COUNT = Math.max(1, Math.min(12, parseInt(qs.get('count') || '1', 10) || 1));
+  var STAGGER = Math.max(0, parseInt(qs.get('stagger') || '0', 10) || 0);
+  var chanList = (qs.get('channels') || '').split(',').map(function (s) { return s.trim().toLowerCase(); }).filter(Boolean);
+  var single = (qs.get('channel') || '').trim().toLowerCase();
+  var PARENT = location.hostname;
+  var t0 = performance.now();
+  var grid = document.getElementById('grid');
+  var summaryEl = document.getElementById('summary');
+  var state = {
+    type: TYPE, count: COUNT, stagger: STAGGER, parent: PARENT,
+    visibilityState: document.visibilityState,
+    sdkScript: 'pending', webglProbeLost: false, longTasks: 0,
+    slots: []
+  };
+
+  /* --- WebGL probe: this context is created BEFORE the embeds. If the
+     browser sheds "oldest" WebGL contexts under multi-embed pressure, our
+     probe is among the victims — webglcontextlost is observable, unlike the
+     console warning itself. --- */
+  try {
+    var probe = document.createElement('canvas');
+    var gl = probe.getContext('webgl') || probe.getContext('experimental-webgl');
+    if (gl) {
+      probe.addEventListener('webglcontextlost', function () {
+        state.webglProbeLost = true;
+        log('GLOBAL', 'webglcontextlost — browser shed this page\'s probe context');
+        refresh();
+      });
+    } else {
+      state.webglProbeLost = 'unavailable';
+    }
+  } catch (e) { state.webglProbeLost = 'unavailable'; }
+
+  /* --- Long-task observer: coarse main-thread pressure signal --- */
+  try {
+    new PerformanceObserver(function (list) {
+      state.longTasks += list.getEntries().length;
+      refresh();
+    }).observe({ type: 'longtask', buffered: true });
+  } catch (e) { /* unsupported — fine */ }
+
+  function now() { return Math.round(performance.now() - t0); }
+  function log(slotIdx, msg) {
+    var s = state.slots[slotIdx];
+    if (s) { s.last = msg; s.events.push(now() + 'ms ' + msg); }
+    refresh();
+  }
+
+  /* --- Summary + copyable report --- */
+  function report() {
+    return {
+      generatedAt: new Date().toISOString(),
+      elapsedMs: now(),
+      userAgent: navigator.userAgent,
+      type: state.type, count: state.count, stagger: state.stagger,
+      parent: state.parent,
+      visibilityState: document.visibilityState,
+      sdkScript: state.sdkScript,
+      webglProbeLost: state.webglProbeLost,
+      longTasks: state.longTasks,
+      jsHeapMB: (performance.memory ? Math.round(performance.memory.usedJSHeapSize / 1048576) : null),
+      slots: state.slots.map(function (s) {
+        return {
+          i: s.i, channel: s.channel,
+          createdAt: s.createdAt, readyAt: s.readyAt, onlineAt: s.onlineAt,
+          playAt: s.playAt, playingAt: s.playingAt, pauseAt: s.pauseAt,
+          offlineAt: s.offlineAt, blockedAt: s.blockedAt, endedAt: s.endedAt,
+          iframeLoadAt: s.iframeLoadAt,
+          msToReady: s.readyAt != null ? s.readyAt - s.createdAt : null,
+          msToPlaying: s.playingAt != null ? s.playingAt - s.createdAt : null,
+          events: s.events
+        };
+      })
+    };
+  }
+  window.debugEmbedReport = report;
+
+  function refresh() {
+    var r = state.slots.filter(function (s) { return s.readyAt != null; }).length;
+    var p = state.slots.filter(function (s) { return s.playingAt != null; }).length;
+    var b = state.slots.filter(function (s) { return s.blockedAt != null; }).length;
+    var o = state.slots.filter(function (s) { return s.offlineAt != null; }).length;
+    summaryEl.textContent =
+      'created=' + state.slots.length + '/' + state.count +
+      '  ready=' + r + '  playing=' + p + '  blocked=' + b + '  offline=' + o +
+      '  sdk=' + state.sdkScript +
+      '  webglProbeLost=' + state.webglProbeLost +
+      '  longTasks=' + state.longTasks +
+      '  heap=' + (performance.memory ? Math.round(performance.memory.usedJSHeapSize / 1048576) + 'MB' : 'n/a') +
+      '  t=' + now() + 'ms';
+  }
+
+  /* --- SDK script loading (type=sdk only) --- */
+  var sdkReady = null;
+  function ensureSdk() {
+    if (sdkReady) return sdkReady;
+    sdkReady = new Promise(function (resolve, reject) {
+      if (window.Twitch && window.Twitch.Player) { state.sdkScript = 'present'; return resolve(); }
+      var s = document.createElement('script');
+      s.src = 'https://embed.twitch.tv/embed/v1.js';
+      s.async = true;
+      s.onload = function () { state.sdkScript = 'loaded'; resolve(); };
+      s.onerror = function () { state.sdkScript = 'FAILED'; reject(new Error('embed/v1.js failed')); };
+      document.head.appendChild(s);
+    });
+    return sdkReady;
+  }
+
+  /* --- Slot creation --- */
+  function makeSlot(i, channel) {
+    var slot = document.createElement('div');
+    slot.className = 'slot';
+    slot.innerHTML =
+      '<div class="cap">#' + i + ' ' + channel + ' — created</div>' +
+      '<div class="box"></div>' +
+      '<div class="events"></div>';
+    grid.appendChild(slot);
+    var rec = { i: i, channel: channel, createdAt: now(), events: [], last: 'created' };
+    state.slots.push(rec);
+    return { el: slot, rec: rec };
+  }
+  function evLine(i) {
+    return state.slots[i].events.join('\n');
+  }
+  function paintEvents(i) {
+    grid.children[i].querySelector('.events').textContent = evLine(i);
+    var s = state.slots[i];
+    var cap = grid.children[i].querySelector('.cap');
+    cap.textContent = '#' + i + ' ' + s.channel + ' — ' + s.last;
+    if (s.playingAt != null) grid.children[i].classList.add('playing');
+    if (s.blockedAt != null) grid.children[i].classList.add('failed');
+  }
+  function mark(i, field, label) {
+    var s = state.slots[i];
+    if (s[field] == null) s[field] = now();
+    s.last = label;
+    s.events.push(now() + 'ms ' + label);
+    paintEvents(i); refresh();
+  }
+
+  function mountSdk(i, channel, box) {
+    var host = document.createElement('div');
+    host.id = 'dbg-host-' + i;
+    box.appendChild(host);
+    ensureSdk().then(function () {
+      var player;
+      try {
+        player = new Twitch.Player(host.id, {
+          channel: channel,
+          width: '100%',
+          height: '100%',
+          parent: [PARENT],
+          autoplay: true,
+          muted: true
+        });
+      } catch (e) {
+        mark(i, 'blockedAt', 'player constructor threw: ' + e.message);
+        return;
+      }
+      var T = Twitch.Player;
+      [['READY', 'readyAt', 'READY'], ['PLAY', 'playAt', 'PLAY'],
+       ['PLAYING', 'playingAt', 'PLAYING'], ['PAUSE', 'pauseAt', 'PAUSE'],
+       ['ENDED', 'endedAt', 'ENDED'], ['ONLINE', 'onlineAt', 'ONLINE'],
+       ['OFFLINE', 'offlineAt', 'OFFLINE'],
+       ['PLAYBACK_BLOCKED', 'blockedAt', 'PLAYBACK_BLOCKED']].forEach(function (m) {
+        if (!T[m[0]]) return;
+        player.addEventListener(T[m[0]], function () { mark(i, m[1], m[2]); });
+      });
+    }).catch(function (e) {
+      mark(i, 'blockedAt', 'sdk load failed: ' + e.message);
+    });
+  }
+
+  function mountIframe(i, channel, box) {
+    var f = document.createElement('iframe');
+    var p = new URLSearchParams();
+    p.set('channel', channel);
+    p.set('autoplay', 'true');
+    p.set('muted', 'true');
+    p.append('parent', PARENT);
+    f.src = 'https://player.twitch.tv/?' + p.toString();
+    f.allow = 'autoplay; fullscreen; picture-in-picture; clipboard-write; encrypted-media; web-share';
+    f.addEventListener('load', function () {
+      mark(i, 'iframeLoadAt', 'IFRAME_LOAD (player state not observable parent-side — verify visually + DevTools console)');
+    });
+    f.addEventListener('error', function () {
+      mark(i, 'blockedAt', 'IFRAME_ERROR');
+    });
+    box.appendChild(f);
+  }
+
+  /* --- Params display + nav matrix --- */
+  document.getElementById('meta').textContent =
+    'type=' + TYPE + '  count=' + COUNT + '  stagger=' + STAGGER + 'ms  parent=' + PARENT +
+    '  vis=' + document.visibilityState;
+  var nav = document.getElementById('nav');
+  [['count=1', 1], ['count=2', 2], ['count=4', 4], ['count=8', 8]].forEach(function (m) {
+    var u = new URLSearchParams(qs); u.set('count', m[1]);
+    var a = document.createElement('a'); a.href = '?' + u.toString(); a.textContent = m[0]; nav.appendChild(a);
+  });
+  nav.appendChild(document.createTextNode(' | '));
+  [[0], [500], [1000], [2000]].forEach(function (m) {
+    var u = new URLSearchParams(qs); u.set('stagger', m[0]);
+    var a = document.createElement('a'); a.href = '?' + u.toString(); a.textContent = 'stagger=' + m[0]; nav.appendChild(a);
+  });
+  nav.appendChild(document.createTextNode(' | '));
+  ['sdk', 'iframe'].forEach(function (t) {
+    var u = new URLSearchParams(qs); u.set('type', t);
+    var a = document.createElement('a'); a.href = '?' + u.toString(); a.textContent = 'type=' + t; nav.appendChild(a);
+  });
+
+  document.getElementById('copy').addEventListener('click', function () {
+    var j = JSON.stringify(report(), null, 2);
+    (navigator.clipboard ? navigator.clipboard.writeText(j) : Promise.reject())
+      .catch(function () { prompt('Copy report:', j); });
+  });
+  document.getElementById('rel').addEventListener('click', function () { location.reload(); });
+
+  /* --- Create slots, staggered --- */
+  var DEFAULT_CHANNELS = ['rocketleague', 'gaules', 'gamesdonequick', 'esl_csgo', 'dota2ti', 'fps_shaka', 'tarik', 'shroud'];
+  for (var i = 0; i < COUNT; i++) {
+    (function (i) {
+      var channel = single || (chanList.length ? chanList[i % chanList.length] : DEFAULT_CHANNELS[i % DEFAULT_CHANNELS.length]);
+      setTimeout(function () {
+        var slot = makeSlot(i, channel);
+        var box = slot.el.querySelector('.box');
+        if (TYPE === 'iframe') mountIframe(i, channel, box);
+        else mountSdk(i, channel, box);
+      }, i * STAGGER);
+    })(i);
+  }
+  setInterval(refresh, 2000);
+})();
+</script>
+</body>
+</html>

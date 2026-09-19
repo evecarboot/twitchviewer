@@ -2914,6 +2914,13 @@ app.get('/api/twitch-live/:login/:file', async (req, res) => {
   });
 });
 
+/* Bare-embed diagnostic page — isolates official Twitch embeds from the full
+   app (no grid/overlays/points/chat). Used to test Edge "style visibility"
+   and multi-embed initialization in a clean environment. Dev tool only;
+   does not touch saved channels. */
+app.get('/debug/twitch-embed', (_req, res) => {
+  res.sendFile(path.join(root, 'debug-twitch-embed.html'));
+});
 app.get('/', (_req, res) => {
   res.sendFile(path.join(root, 'index.html'));
 });

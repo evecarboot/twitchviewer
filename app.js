@@ -36,6 +36,22 @@
   let apiConfigured = false;
   /** 'hls' = Twitch via streamlink+ffmpeg on server; 'iframe' = official embed */
   let twitchPlayback = 'iframe';
+  /* Dev-only isolation control (?debugIframeLimit=N): cap how many official
+     Twitch embeds may be mounted at once — used for the Edge/Windows
+     multi-embed initialization tests. Never persisted; a plain reload
+     restores normal behaviour. Counted as live embed DOM nodes, so
+     re-renders/removals can't exceed it. */
+  const debugIframeLimit = (() => {
+    try {
+      const n = parseInt(
+        new URLSearchParams(location.search).get('debugIframeLimit') || '',
+        10
+      );
+      return Number.isFinite(n) && n >= 0 ? n : null;
+    } catch {
+      return null;
+    }
+  })();
   /* Server-reported: embedded Twitch ad filtering enabled where the playback
      mode supports it (proxy playlist swap / hls streamlink reader). */
   let twitchFilterAds = false;
@@ -3723,10 +3739,21 @@
         const playbackUrl = `${location.origin}/api/twitch-live/${encodeURIComponent(login)}/playlist.m3u8`;
         mountHlsVideoInCell(cell, ch, playbackUrl, { twitchHls: true });
       } else {
-        attachTwitchEmbedCell(cell, login);
+        /* .twitch-embed-host is appended synchronously by attachTwitchEmbedCell
+           (the player itself mounts later via the paintable/mount queue), so
+           counting hosts counts every cell that intends to mount — including
+           ones built in this same tick. */
+        const liveEmbeds = document.querySelectorAll(
+          '.twitch-embed-host'
+        ).length;
+        const skipped =
+          debugIframeLimit !== null && liveEmbeds >= debugIframeLimit;
+        if (!skipped) attachTwitchEmbedCell(cell, login);
         const lab = document.createElement('div');
         lab.className = 'cell-label';
-        lab.textContent = login;
+        lab.textContent = skipped
+          ? `${login} — iframe mount skipped (debugIframeLimit=${debugIframeLimit})`
+          : login;
         controlsParent.appendChild(lab);
         /* Bar goes on last so it stays on top of the embed host in DOM order
            too (z-index already guarantees it). */
