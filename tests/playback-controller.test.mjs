@@ -573,3 +573,73 @@ test('twitchIframeCellDiagnostics: no player → player null, missing cell → a
   const d2 = TwitchPlayback.twitchIframeCellDiagnostics(null);
   assert.deepEqual(d2, { channel: null, cellSize: null, iframe: null, player: null });
 });
+
+/* --- Twitch embed compliance constants --- */
+
+test('TWITCH_IFRAME_MIN_* constants satisfy Twitch embed requirements', () => {
+  assert.equal(TwitchPlayback.TWITCH_IFRAME_MIN_W, 400);
+  assert.equal(TwitchPlayback.TWITCH_IFRAME_MIN_H, 300);
+  assert.ok(TwitchPlayback.TWITCH_IFRAME_HEADER_H > 0);
+  assert.equal(
+    TwitchPlayback.TWITCH_IFRAME_MIN_CELL_W,
+    TwitchPlayback.TWITCH_IFRAME_MIN_W
+  );
+  assert.equal(
+    TwitchPlayback.TWITCH_IFRAME_MIN_CELL_H,
+    TwitchPlayback.TWITCH_IFRAME_MIN_H + TwitchPlayback.TWITCH_IFRAME_HEADER_H,
+    'cell must hold a >=300px embed plus the control bar'
+  );
+});
+
+/* --- Read-only style-visibility / occlusion diagnostics --- */
+
+function makeVisCell({ iframe, overlays = {} } = {}) {
+  return {
+    dataset: { channelKey: 't:somechan' },
+    querySelector: (sel) =>
+      sel.includes('player.twitch.tv') ? iframe : overlays[sel] || null,
+  };
+}
+
+function makeIframeRect(rect, { above = [] } = {}) {
+  return {
+    tagName: 'IFRAME',
+    parentElement: null,
+    getBoundingClientRect: () => rect,
+    contains: () => false,
+    _above: above,
+  };
+}
+
+test('twitchIframeVisibilityDiagnostics: no iframe → null report, never throws', () => {
+  const d = TwitchPlayback.twitchIframeVisibilityDiagnostics(makeVisCell());
+  assert.equal(d.channel, 'somechan');
+  assert.equal(d.iframe, null);
+  assert.equal(TwitchPlayback.twitchIframeVisibilityDiagnostics(null).iframe, null);
+});
+
+test('twitchIframeVisibilityDiagnostics: overlay elements are reported above the iframe', () => {
+  const rect = { left: 0, top: 0, right: 527, bottom: 361, width: 527, height: 361, x: 0, y: 0 };
+  const dragStrip = { tagName: 'DIV', className: 'cell-drag-handle' };
+  const iframe = makeIframeRect(rect);
+  // elementsFromPoint at right-center returns the drag strip on top of the iframe.
+  const efp = (x, y) => (x > rect.right - 30 ? [dragStrip, iframe] : [iframe]);
+  const d = TwitchPlayback.twitchIframeVisibilityDiagnostics(
+    makeVisCell({ iframe }),
+    efp
+  );
+  assert.equal(d.iframe.meetsMinSize, true);
+  assert.equal(d.occlusion.center.iframeHit, true);
+  assert.equal(d.occlusion.center.aboveIframe.length, 0);
+  assert.equal(d.occlusion.rightCenter.iframeHit, true);
+  assert.deepEqual(d.occlusion.rightCenter.aboveIframe, ['div.cell-drag-handle']);
+});
+
+test('twitchIframeVisibilityDiagnostics: missing elementsFromPoint → occlusion null', () => {
+  const rect = { left: 0, top: 0, right: 500, bottom: 300, width: 500, height: 300, x: 0, y: 0 };
+  const d = TwitchPlayback.twitchIframeVisibilityDiagnostics(
+    makeVisCell({ iframe: makeIframeRect(rect) }),
+    null
+  );
+  assert.equal(d.occlusion, null);
+});

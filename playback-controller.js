@@ -337,6 +337,19 @@
   const TWITCH_IFRAME_PLAY_RETRY_DELAYS = [150, 500, 1200, 2500, 5000, 8000, 12000, 16000, 25000, 40000];
 
   /**
+   * Twitch embed autoplay compliance constants (dev.twitch.tv/docs/embed):
+   * the interactive player must be at least 400x300 AND unobscured. In iframe
+   * mode every TwitchViewer control (label, pin, chat toggle, drag grip) lives
+   * in a dedicated header strip above the embed — never painted over the
+   * iframe — so the embed keeps its full cell area minus the header.
+   */
+  const TWITCH_IFRAME_MIN_W = 400;
+  const TWITCH_IFRAME_MIN_H = 300;
+  const TWITCH_IFRAME_HEADER_H = 26;
+  const TWITCH_IFRAME_MIN_CELL_W = TWITCH_IFRAME_MIN_W;
+  const TWITCH_IFRAME_MIN_CELL_H = TWITCH_IFRAME_MIN_H + TWITCH_IFRAME_HEADER_H;
+
+  /**
    * Read-only per-cell diagnostics for a Twitch.Player iframe tile. Used by
    * window.twitchviewerIframeDiagnostics() — safe to run any time: calls only
    * documented getter APIs, guards every call, and mutates nothing. Missing
@@ -413,13 +426,223 @@
     return d;
   }
 
+  /**
+   * Read-only occlusion audit for a Twitch.Player iframe tile — approximates
+   * what Twitch's in-iframe IntersectionObserver v2 "style visibility" check
+   * sees. Samples document.elementsFromPoint at points covering the iframe
+   * rect and reports which elements sit on top of the iframe at each point
+   * (elements with pointer-events:none are skipped by elementsFromPoint —
+   * that's noted, since IOv2 counts painted pixels regardless). Also reports
+   * computed-style disqualifiers on the iframe and every ancestor that can
+   * make IOv2 report isVisible=false (hidden/invisible/zero-opacity).
+   * Never mutates anything; missing APIs yield null, not throws.
+   */
+  function twitchIframeVisibilityDiagnostics(cell, elementsFromPoint) {
+    const d = {
+      channel: null,
+      iframe: null,
+      ancestors: [],
+      occlusion: null,
+      overlayRects: {},
+    };
+    if (!cell || typeof cell.querySelector !== 'function') return d;
+    try {
+      const key = (cell.dataset && cell.dataset.channelKey) || '';
+      d.channel = key.replace(/^t:/, '') || null;
+    } catch {
+      /* ignore */
+    }
+    const iframe = cell.querySelector('iframe[src*="player.twitch.tv"]');
+    if (!iframe || typeof iframe.getBoundingClientRect !== 'function') return d;
+
+    const rect = iframe.getBoundingClientRect();
+    const vw =
+      typeof window !== 'undefined' && window.innerWidth ? window.innerWidth : 0;
+    const vh =
+      typeof window !== 'undefined' && window.innerHeight
+        ? window.innerHeight
+        : 0;
+    const overlapW = Math.max(
+      0,
+      Math.min(rect.right, vw) - Math.max(rect.left, 0)
+    );
+    const overlapH = Math.max(
+      0,
+      Math.min(rect.bottom, vh) - Math.max(rect.top, 0)
+    );
+
+    const cs =
+      typeof window !== 'undefined' && window.getComputedStyle
+        ? (el) => {
+            try {
+              return window.getComputedStyle(el);
+            } catch {
+              return null;
+            }
+          }
+        : () => null;
+    const pick = (s) =>
+      s
+        ? {
+            display: s.display,
+            visibility: s.visibility,
+            opacity: s.opacity,
+            position: s.position,
+            zIndex: s.zIndex,
+            transform: s.transform,
+            filter: s.filter,
+            contain: s.contain,
+            contentVisibility: s.contentVisibility,
+            overflow: s.overflow,
+            pointerEvents: s.pointerEvents,
+          }
+        : null;
+
+    d.iframe = {
+      w: Math.round(rect.width * 10) / 10,
+      h: Math.round(rect.height * 10) / 10,
+      x: Math.round(rect.x * 10) / 10,
+      y: Math.round(rect.y * 10) / 10,
+      viewport: { w: vw, h: vh },
+      viewportOverlapW: Math.round(overlapW * 10) / 10,
+      viewportOverlapH: Math.round(overlapH * 10) / 10,
+      viewportRatio:
+        rect.width > 0 && rect.height > 0
+          ? Math.round(
+              ((overlapW * overlapH) / (rect.width * rect.height)) * 1000
+            ) / 1000
+          : 0,
+      fullyInViewport:
+        rect.left >= 0 &&
+        rect.top >= 0 &&
+        rect.right <= vw &&
+        rect.bottom <= vh,
+      meetsMinSize: rect.width >= 400 && rect.height >= 300,
+      style: pick(cs(iframe)),
+    };
+
+    /* Ancestor chain — a display:none / visibility:hidden / opacity:0 ancestor
+       (or one still mid-layout) makes Twitch's in-iframe check fail even when
+       the final layout looks fine. */
+    try {
+      let el = iframe.parentElement;
+      while (el && el.nodeType === 1) {
+        const cls = el.className && String(el.className).split(' ')[0];
+        d.ancestors.push({
+          tag: el.tagName ? el.tagName.toLowerCase() : '?',
+          cls: cls || null,
+          style: pick(cs(el)),
+        });
+        if (el === (cell.ownerDocument && cell.ownerDocument.body)) break;
+        el = el.parentElement;
+      }
+    } catch {
+      /* ignore */
+    }
+
+    /* Occlusion sampling: for each sample point over the iframe rect, list the
+       top elements that are NOT the iframe (or inside it). These are what
+       Twitch's IOv2 occlusion check can count as "obscured". */
+    if (typeof elementsFromPoint === 'function') {
+      const inset = 4;
+      const pts = [
+        ['center', rect.left + rect.width / 2, rect.top + rect.height / 2],
+        ['topCenter', rect.left + rect.width / 2, rect.top + inset],
+        [
+          'bottomCenter',
+          rect.left + rect.width / 2,
+          rect.bottom - inset,
+        ],
+        ['leftCenter', rect.left + inset, rect.top + rect.height / 2],
+        ['rightCenter', rect.right - inset, rect.top + rect.height / 2],
+        ['topLeft', rect.left + inset, rect.top + inset],
+        ['topRight', rect.right - inset, rect.top + inset],
+        ['bottomLeft', rect.left + inset, rect.bottom - inset],
+        ['bottomRight', rect.right - inset, rect.bottom - inset],
+      ];
+      const describe = (el) => {
+        if (!el || !el.tagName) return String(el);
+        const cls =
+          el.className && typeof el.className === 'string'
+            ? '.' + el.className.split(' ').join('.')
+            : '';
+        return `${el.tagName.toLowerCase()}${cls}`;
+      };
+      const out = {};
+      for (const [name, x, y] of pts) {
+        try {
+          const stack = elementsFromPoint(x, y) || [];
+          const above = [];
+          let hitIframe = false;
+          for (const el of stack) {
+            if (el === iframe) {
+              hitIframe = true;
+              break;
+            }
+            if (typeof iframe.contains === 'function' && iframe.contains(el))
+              continue;
+            above.push(describe(el));
+          }
+          out[name] = { iframeHit: hitIframe, aboveIframe: above };
+        } catch {
+          out[name] = { iframeHit: null, aboveIframe: ['<error>'] };
+        }
+      }
+      d.occlusion = out;
+    }
+
+    /* Known TwitchViewer overlay rectangles — for correlating the samples
+       above with the controls we intentionally place on tiles. */
+    try {
+      for (const sel of [
+        '.cell-label',
+        '.cell-drag-handle',
+        '.cell-focus-pin',
+        '.cell-chat-toggle',
+        '.cell-chat-wrap',
+        '.cell-hls-error',
+      ]) {
+        const el = cell.querySelector(sel);
+        if (!el || typeof el.getBoundingClientRect !== 'function') continue;
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 && r.height === 0) continue;
+        const iw = Math.max(
+          0,
+          Math.min(r.right, rect.right) - Math.max(r.left, rect.left)
+        );
+        const ih = Math.max(
+          0,
+          Math.min(r.bottom, rect.bottom) - Math.max(r.top, rect.top)
+        );
+        if (iw > 0 && ih > 0) {
+          d.overlayRects[sel.slice(1)] = {
+            overlapsIframe: true,
+            w: Math.round(iw),
+            h: Math.round(ih),
+            pointerEvents: pick(cs(el))?.pointerEvents || null,
+          };
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+
+    return d;
+  }
+
   return {
     create,
     isUserGesture,
     twitchEmbedUserUnmuted,
     twitchCellIsPlaying,
     twitchIframeCellDiagnostics,
+    twitchIframeVisibilityDiagnostics,
     TWITCH_IFRAME_PLAY_RETRY_DELAYS,
+    TWITCH_IFRAME_MIN_W,
+    TWITCH_IFRAME_MIN_H,
+    TWITCH_IFRAME_HEADER_H,
+    TWITCH_IFRAME_MIN_CELL_W,
+    TWITCH_IFRAME_MIN_CELL_H,
     PAUSE_USER,
     PAUSE_AUTO,
     PAUSE_RELOAD,

@@ -628,6 +628,126 @@ body.grid-dragging .cell video.cell-video {
   background: rgba(0, 0, 0, 0.85);
 }
 
+/* --- Official Twitch.Player embed tiles (.cell-twitch-embed) ----------------
+   Twitch's embed autoplay enforcement uses an IntersectionObserver-v2
+   "style visibility" check inside the iframe: ANY element painted over the
+   player (labels, buttons, drag strips) counts as "obscured" and muted
+   autoplay is refused. So on official-embed cells every TwitchViewer control
+   lives in a 26px header bar ABOVE the iframe — nothing overlaps it.
+   Grid minimums keep the embed area >= 400x300 (see app.js
+   TWITCH_IFRAME_MIN_CELL_*). */
+.cell-embed-bar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 4px;
+  z-index: 12;
+  background: linear-gradient(to bottom, rgba(0, 0, 0, 0.85), rgba(0, 0, 0, 0.7));
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  box-sizing: border-box;
+  overflow: hidden;
+}
+
+/* Controls inside the bar become static flex items — never positioned over
+   the iframe. */
+.cell.cell-twitch-embed .cell-embed-bar .cell-label,
+.cell.cell-twitch-embed .cell-embed-bar .cell-focus-pin,
+.cell.cell-twitch-embed .cell-embed-bar .cell-chat-toggle,
+.cell.cell-twitch-embed .cell-embed-bar .cell-chat-expand,
+.cell.cell-twitch-embed .cell-embed-bar .cell-drag-handle {
+  position: static;
+  inset: auto;
+  flex: 0 0 auto;
+}
+
+/* Bar layout order is fixed regardless of DOM order: label | grip | buttons. */
+.cell.cell-twitch-embed .cell-embed-bar .cell-label {
+  order: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 60%;
+}
+
+/* The drag grip fills the spare bar space — drag from anywhere on the bar
+   that isn't a button. */
+.cell.cell-twitch-embed .cell-embed-bar .cell-drag-handle {
+  order: 2;
+  flex: 1 1 auto;
+  align-self: stretch;
+  width: auto;
+  background: none;
+  border-radius: 0;
+}
+
+.cell.cell-twitch-embed .cell-embed-bar .cell-focus-pin {
+  order: 3;
+}
+.cell.cell-twitch-embed .cell-embed-bar .cell-chat-toggle {
+  order: 4;
+}
+.cell.cell-twitch-embed .cell-embed-bar .cell-chat-expand {
+  order: 5;
+}
+
+/* Expand button lives in the bar too; it's display:none until chat opens. */
+.cell.cell-twitch-embed .cell-embed-bar .cell-chat-expand {
+  border-radius: 4px;
+}
+
+/* The embed host drops below the bar; the js-host div and iframe fill it.
+   height:auto is required — the base rule sets inset:0 AND height:100%, which
+   over-constrains the box (top+height win, bottom ignored) and would leave
+   the host 26px too tall, spilling under the next row's tiles. */
+.cell.cell-twitch-embed .twitch-embed-host {
+  top: 26px;
+  height: auto;
+}
+
+/* Chat pane docks under the bar so tile controls stay reachable. */
+.cell.cell-twitch-embed .cell-chat-wrap {
+  top: 26px;
+}
+
+/* Side-by-side chat must never shrink the embed below Twitch's 400px minimum
+   width — reserve the embed's 400px + a small gap first. */
+.cell.cell-twitch-embed.cell-chat-open {
+  --cell-chat-w: min(400px, calc(100% - 404px));
+}
+
+/* The generic chat-open rule sets right:var(--cell-chat-w) + width:auto on
+   the host AND the js-host AND the iframe — nested levels each subtract the
+   chat width again, and for the iframe width:auto resolves to the 300px
+   replaced-element intrinsic size anyway. On official-embed cells only the
+   OUTER host shifts; the js-host and player iframe simply fill it. The chat
+   iframe inside the wrap likewise fills its own container. */
+.cell.cell-twitch-embed.cell-chat-open .twitch-embed-js-host,
+.cell.cell-twitch-embed.cell-chat-open .twitch-embed-js-host iframe,
+.cell.cell-twitch-embed.cell-chat-open .cell-chat-wrap iframe {
+  right: 0;
+  width: 100%;
+}
+
+/* When the cell can't fit a 400px embed plus a usable chat, JS forces
+   expanded mode: chat covers the whole area under the bar (user intent —
+   the embed may pause behind it, matching Twitch's own occlusion rules). */
+.cell.cell-twitch-embed.cell-chat-expanded {
+  --cell-chat-w: 100%;
+}
+
+/* The bar keeps all controls on top of both the embed and an open chat pane,
+   so the toggle/expand buttons stay reachable in every chat state. */
+.cell.cell-twitch-embed.cell-chat-open .cell-chat-toggle,
+.cell.cell-twitch-embed.cell-chat-expanded .cell-chat-toggle,
+.cell.cell-twitch-embed.cell-chat-expanded .cell-chat-expand {
+  border-radius: 4px;
+}
+
 /* The chat pane docks on the right of the tile; video shrinks to the left.
    Normal width ~400px for reading chat alongside video. When the user needs
    to interact with Twitch's channel-points popup (which clips inside the

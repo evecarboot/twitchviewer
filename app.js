@@ -419,11 +419,19 @@
   }
 
   /**
-   * Twitch docs recommend ~400x300 minimum for embeds, but that can force very sparse
-   * layouts on ultrawide/fullscreen. Use a softer minimum so 5+ streams can still tile.
+   * Twitch embed requirements: the interactive player must be >=400x300 and
+   * unobscured. Official-embed cells carry a 26px control bar above the
+   * iframe, so the CELL minimum is 400 x (300 + bar). Anything smaller can't
+   * satisfy Twitch's own size check — smaller cells would be dead tiles.
    */
-  const GRID_MIN_CELL_W = 320;
-  const GRID_MIN_CELL_H = 180;
+  const GRID_MIN_CELL_W =
+    (typeof TwitchPlayback !== 'undefined' &&
+      TwitchPlayback.TWITCH_IFRAME_MIN_CELL_W) ||
+    400;
+  const GRID_MIN_CELL_H =
+    (typeof TwitchPlayback !== 'undefined' &&
+      TwitchPlayback.TWITCH_IFRAME_MIN_CELL_H) ||
+    326;
   // For non-iframe modes (HLS <video> path, YouTube embeds, etc.) we can allow
   // smaller cells than the Twitch autoplay-sensitive iframe minimum.
   // This prevents "single-line strip" layouts on shorter viewports.
@@ -765,6 +773,15 @@
   }
 
   function scheduleTwitchPlayRetries(player, cell) {
+    /* One pending schedule per player — READY, ONLINE and PLAYBACK_BLOCKED
+       can each request retries, and without this guard they stack: every
+       nudge is a silent no-op against a rejected/dead embed, and repeated
+       play() calls also accumulate listeners inside Twitch's own EventEmitter
+       (seen in Edge as "11 Playing listeners added"). Pending timeouts keep
+       nudging on their own; a fresh schedule only arms after the last one
+       ends or PLAYING clears the flag. */
+    if (player._twitchRetriesScheduled) return;
+    player._twitchRetriesScheduled = true;
     TwitchPlayback.TWITCH_IFRAME_PLAY_RETRY_DELAYS.forEach((ms) => {
       window.setTimeout(() => {
         if (!cell.isConnected || player._twitchPlaybackStarted) return;
@@ -792,6 +809,7 @@
        can't remount a healthy newer player. At most 2 remounts per cell. */
     const delays = TwitchPlayback.TWITCH_IFRAME_PLAY_RETRY_DELAYS;
     window.setTimeout(() => {
+      player._twitchRetriesScheduled = false;
       if (!cell.isConnected || !state.autoplay) return;
       if (cell._twitchPlayer !== player) return;
       if (player._twitchPlaybackStarted || cell._twitchPlaying) return;
@@ -1057,8 +1075,14 @@
           return;
         }
         const r = wrap.getBoundingClientRect();
-        const w = Math.max(GRID_MIN_CELL_W, Math.round(r.width));
-        const h = Math.max(GRID_MIN_CELL_H, Math.round(r.height));
+        const w = Math.max(
+          TwitchPlayback.TWITCH_IFRAME_MIN_W || 400,
+          Math.round(r.width)
+        );
+        const h = Math.max(
+          TwitchPlayback.TWITCH_IFRAME_MIN_H || 300,
+          Math.round(r.height)
+        );
         let player;
         try {
           /* Optional embed params (muted, autoplay). https://dev.twitch.tv/docs/embed/video-and-clips/ */
@@ -1143,6 +1167,9 @@
         player.addEventListener(Twitch.Player.PLAYING, () => {
           if (PLAYBACK_DEBUG) console.log(`[twitchviewer] IFRAME ch=${login} ev=playing`);
           player._twitchPlaybackStarted = true;
+          /* Free the retry-schedule slot — a later ONLINE can arm a fresh
+             bounded schedule if the stream drops and comes back. */
+          player._twitchRetriesScheduled = false;
           cell._twitchPlayingAt = Date.now();
           cell._twitchBgPaused = false;
           setTwitchCellPlaying(cell, true, 'playing');
@@ -3469,9 +3496,14 @@
    *  This means all visible tiles' chats load in the background, so any toggle
    *  is snappy. The trade-off is more network/memory (one chat iframe per
    *  Twitch tile), which is acceptable since chat iframes are lightweight. */
-  function attachCellChatToggle(cell, login) {
+  function attachCellChatToggle(cell, login, controlsParent) {
     if (!login) return;
     cell.dataset.twitchLogin = login;
+    /* Official-embed cells pass a .cell-embed-bar as controlsParent so tile
+       controls live above the iframe instead of over it (Twitch's IOv2
+       "style visibility" autoplay check treats anything painted on top of
+       the embed as occlusion). Native-video modes keep the overlay design. */
+    const ctrlHost = controlsParent || cell;
 
     /* Focus/pin button: sets this stream as the focus stream (priority
        earning slot 1 + aggressive low-latency hls.js config). Clicking
@@ -3488,7 +3520,7 @@
       ev.stopPropagation();
       setFocusStream(login);
     });
-    cell.appendChild(pinBtn);
+    ctrlHost.appendChild(pinBtn);
 
     const wrap = document.createElement('div');
     wrap.className = 'cell-chat-wrap';
@@ -3506,7 +3538,7 @@
       const open = cell.classList.contains('cell-chat-open');
       setCellChatOpen(cell, login, !open);
     });
-    cell.appendChild(btn);
+    ctrlHost.appendChild(btn);
 
     /* Expand button: temporarily overlays the chat across the entire tile so
        Twitch's channel-points popup (which clips at normal width) has enough
@@ -3521,7 +3553,7 @@
       ev.stopPropagation();
       toggleCellChatExpand(cell);
     });
-    cell.appendChild(expandBtn);
+    ctrlHost.appendChild(expandBtn);
 
     /* Stagger chat iframe creation across tiles so we don't fire 15+ embed
        requests at Twitch simultaneously. The queue serializes preload creation
@@ -3555,6 +3587,21 @@
 
   function showCellChat(cell) {
     cell.classList.add('cell-chat-open');
+    /* Official Twitch embeds must stay >=400px wide (Twitch autoplay/embed
+       requirements). Side-by-side chat that would shrink the player below
+       400 + ~160px usable chat is not allowed — cover the tile instead
+       (expanded mode). CSS enforces the same bound via --cell-chat-w. */
+    if (cell.classList.contains('cell-twitch-embed')) {
+      const usableChat = cell.clientWidth - 404;
+      if (usableChat < 160) {
+        cell.classList.add('cell-chat-expanded');
+        const expandBtn = cell.querySelector('.cell-chat-expand');
+        if (expandBtn) {
+          expandBtn.textContent = '⤡';
+          expandBtn.title = 'Collapse chat back to side panel';
+        }
+      }
+    }
     const wrap = cell.querySelector('.cell-chat-wrap');
     if (wrap) wrap.setAttribute('aria-hidden', 'false');
     const btn = cell.querySelector('.cell-chat-toggle');
@@ -3584,6 +3631,16 @@
   }
 
   function toggleCellChatExpand(cell) {
+    /* Refuse to collapse an official-embed tile to side-by-side when the
+       player would end up <400px wide — stay expanded (user can close chat
+       with the tile's Chat button). */
+    if (
+      cell.classList.contains('cell-twitch-embed') &&
+      cell.classList.contains('cell-chat-expanded') &&
+      cell.clientWidth - 404 < 160
+    ) {
+      return;
+    }
     const expanded = cell.classList.toggle('cell-chat-expanded');
     const expandBtn = cell.querySelector('.cell-chat-expand');
     if (expandBtn) {
@@ -3620,15 +3677,31 @@
     cell.className = 'cell';
     cell.dataset.cellIndex = String(cellIndex);
     cell.dataset.channelKey = channelKey(ch);
+    const t = getChannelType(ch);
+    /* Official Twitch.Player embeds must not be obscured by page elements
+       (Twitch enforces this with an in-iframe IntersectionObserver-v2
+       "style visibility" check that refuses muted autoplay). Give these
+       cells a 26px header bar and move every control into it so nothing
+       paints over the iframe. Native <video> tiles keep overlays. */
+    const twitchIframeCell = t === 'twitch' && twitchPlayback === 'iframe';
+    let embedBar = null;
+    let controlsParent = cell;
+    if (twitchIframeCell) {
+      cell.classList.add('cell-twitch-embed');
+      embedBar = document.createElement('div');
+      embedBar.className = 'cell-embed-bar';
+      controlsParent = embedBar;
+    }
     const dragHandle = document.createElement('div');
     dragHandle.className = 'cell-drag-handle';
-    dragHandle.title = 'Drag (hold) along the right edge to reorder';
-    cell.appendChild(dragHandle);
-    const t = getChannelType(ch);
+    dragHandle.title = twitchIframeCell
+      ? 'Drag (hold) along the top bar to reorder'
+      : 'Drag (hold) along the right edge to reorder';
+    controlsParent.appendChild(dragHandle);
 
     if (t === 'twitch') {
       const login = getTwitchLogin(ch);
-      attachCellChatToggle(cell, login);
+      attachCellChatToggle(cell, login, controlsParent);
       if (twitchPlayback === 'proxy') {
         // Mount immediately with a conservative default quality (360p30). The cell may not
         // have a size yet (CSS grid hasn't reflowed), so we can't pick the right quality tier
@@ -3654,7 +3727,10 @@
         const lab = document.createElement('div');
         lab.className = 'cell-label';
         lab.textContent = login;
-        cell.appendChild(lab);
+        controlsParent.appendChild(lab);
+        /* Bar goes on last so it stays on top of the embed host in DOM order
+           too (z-index already guarantees it). */
+        if (embedBar) cell.appendChild(embedBar);
       }
     } else if (t === 'youtube') {
       const iframe = document.createElement('iframe');
@@ -4362,8 +4438,94 @@
     };
   }
 
+  /**
+   * Style-visibility / occlusion audit for official Twitch embeds — built to
+   * debug Twitch's in-iframe "style visibility" autoplay rejection (an
+   * IntersectionObserver-v2 isVisible check). For each tile it reports the
+   * iframe rect vs viewport, computed-style disqualifiers up the ancestor
+   * chain, which elements sit above the iframe at 9 sample points
+   * (elementsFromPoint), and — when the browser supports it — an actual
+   * IntersectionObserver v2 sample on each player iframe (the closest we can
+   * get to Twitch's own check from the parent page). Read-only; safe output
+   * (no tokens/cookies). Returns a Promise resolving to the report.
+   */
+  function exposeTwitchIframeVisibilityDiagnostics() {
+    window.twitchviewerIframeVisibilityDiagnostics = async function () {
+      const efp =
+        typeof document.elementsFromPoint === 'function'
+          ? document.elementsFromPoint.bind(document)
+          : null;
+      const roots = [document.getElementById('grid'), document.getElementById('grid-priority')].filter(Boolean);
+      const cells = [];
+      roots.forEach((r) => r.querySelectorAll('.cell').forEach((c) => cells.push(c)));
+
+      const tiles = cells.map((cell) =>
+        TwitchPlayback.twitchIframeVisibilityDiagnostics(cell, efp)
+      );
+
+      /* Parent-side IOv2 sample per player iframe — approximates the
+         visibility verdict Twitch's in-iframe observer computes. Entries
+         expose isVisible only when the browser implements IOv2
+         (trackVisibility); older engines just omit it. */
+      const iov2Supported = typeof IntersectionObserver !== 'undefined';
+      const sampleIoV2 = (iframe) =>
+        new Promise((resolve) => {
+          if (!iov2Supported || !iframe) return resolve(null);
+          let done = false;
+          const finish = (v) => {
+            if (done) return;
+            done = true;
+            try {
+              io.disconnect();
+            } catch {
+              /* ignore */
+            }
+            resolve(v);
+          };
+          let io;
+          try {
+            io = new IntersectionObserver(
+              (entries) => {
+                const e = entries[entries.length - 1];
+                finish({
+                  isVisible: e.isVisible,
+                  intersectionRatio:
+                    Math.round(e.intersectionRatio * 1000) / 1000,
+                });
+              },
+              { trackVisibility: true, delay: 100 }
+            );
+            io.observe(iframe);
+          } catch {
+            return resolve(null);
+          }
+          window.setTimeout(() => finish(null), 1200);
+        });
+
+      const iframes = cells.map((c) =>
+        c.querySelector('iframe[src*="player.twitch.tv"]')
+      );
+      for (let i = 0; i < tiles.length; i++) {
+        /* Sequential sampling keeps observer count tiny; ~250ms total. */
+        tiles[i].iov2ParentSample = await sampleIoV2(iframes[i]);
+      }
+
+      const report = {
+        generatedAt: new Date().toISOString(),
+        visibilityState: document.visibilityState,
+        iov2Supported,
+        note: 'aboveIframe lists elements painted over the player at each sample point — anything non-empty there can trip Twitch\'s "style visibility" autoplay rejection. elementsFromPoint skips pointer-events:none elements but IOv2 still counts their pixels.',
+        tiles,
+      };
+      console.log('[twitchviewer] iframe VISIBILITY diagnostics — copy everything below this line:');
+      console.log(JSON.stringify(report, null, 2));
+      return report;
+    };
+  }
+
   exposeTwitchAutoplayHelp();
   exposeTwitchIframeDiagnostics();
+  exposeTwitchIframeVisibilityDiagnostics();
 
   (async function init() {
     const qs = new URLSearchParams(location.search);
