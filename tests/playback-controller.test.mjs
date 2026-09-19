@@ -436,3 +436,140 @@ test('user pause then external play → controller re-pauses (autoplay attr on r
   assert.equal(ctl.userPaused, true);
   assert.deepEqual(media.calls, ['pause']);
 });
+
+/* --- Canonical per-cell Twitch playing state (channel-points tracking) ---
+   syncPointsPlaying() must count a tile only when it is REALLY playing.
+   Native tiles prove it via the video element; cross-origin Twitch.Player
+   iframe tiles prove it via the event-confirmed _twitchPlaying flag. */
+
+function makeCell({ video, player, playingFlag } = {}) {
+  return {
+    querySelector: () => video || null,
+    _twitchPlayer: player || null,
+    _twitchPlaying: playingFlag,
+  };
+}
+
+test('twitchCellIsPlaying: native video playing → true', () => {
+  const cell = makeCell({ video: { paused: false, ended: false } });
+  assert.equal(TwitchPlayback.twitchCellIsPlaying(cell), true);
+});
+
+test('twitchCellIsPlaying: native video paused → false', () => {
+  const cell = makeCell({ video: { paused: true, ended: false } });
+  assert.equal(TwitchPlayback.twitchCellIsPlaying(cell), false);
+});
+
+test('twitchCellIsPlaying: native video ended → false', () => {
+  const cell = makeCell({ video: { paused: false, ended: true } });
+  assert.equal(TwitchPlayback.twitchCellIsPlaying(cell), false);
+});
+
+test('twitchCellIsPlaying: iframe player + confirmed PLAYING flag → true', () => {
+  const cell = makeCell({ player: { getMuted: () => true }, playingFlag: true });
+  assert.equal(TwitchPlayback.twitchCellIsPlaying(cell), true);
+});
+
+test('twitchCellIsPlaying: iframe player mounted but not confirmed playing → false', () => {
+  // READY / PLAY / ONLINE / PLAYBACK_BLOCKED states — mounted, not playing.
+  for (const flag of [false, undefined]) {
+    const cell = makeCell({ player: { getMuted: () => true }, playingFlag: flag });
+    assert.equal(TwitchPlayback.twitchCellIsPlaying(cell), false);
+  }
+});
+
+test('twitchCellIsPlaying: iframe element present but no player → false', () => {
+  assert.equal(TwitchPlayback.twitchCellIsPlaying(makeCell()), false);
+});
+
+test('twitchCellIsPlaying: missing cell → false (fail safe)', () => {
+  assert.equal(TwitchPlayback.twitchCellIsPlaying(null), false);
+  assert.equal(TwitchPlayback.twitchCellIsPlaying(undefined), false);
+});
+
+/* --- Twitch.Player autoplay retry schedule --- */
+
+test('TWITCH_IFRAME_PLAY_RETRY_DELAYS: bounded, increasing, covers the init race', () => {
+  const d = TwitchPlayback.TWITCH_IFRAME_PLAY_RETRY_DELAYS;
+  assert.ok(Array.isArray(d) && d.length > 0 && d.length <= 12, 'bounded retry count');
+  assert.ok(d.every((ms) => Number.isFinite(ms) && ms > 0), 'all delays positive');
+  for (let i = 1; i < d.length; i++) {
+    assert.ok(d[i] > d[i - 1], 'delays strictly increase');
+  }
+  assert.ok(d[0] < 1000, 'first nudge lands inside Twitch init window');
+  assert.ok(d[d.length - 1] <= 60000, 'schedule stays bounded — no unlimited loop');
+});
+
+/* --- Read-only iframe cell diagnostics (Edge/Windows bug-report path) --- */
+
+function makeDiagCell({ player, playingFlag, iframe } = {}) {
+  return {
+    dataset: { channelKey: 't:somechan' },
+    getBoundingClientRect: () => ({ width: 640, height: 360 }),
+    querySelector: () => iframe || null,
+    _twitchPlayer: player || null,
+    _twitchPlaying: playingFlag,
+  };
+}
+
+test('twitchIframeCellDiagnostics: full player state reported read-only', () => {
+  const calls = [];
+  const player = {
+    getMuted: () => { calls.push('getMuted'); return true; },
+    isPaused: () => { calls.push('isPaused'); return false; },
+    getEnded: () => { calls.push('getEnded'); return false; },
+    getQualities: () => [{}, {}, {}],
+  };
+  const iframe = {
+    getBoundingClientRect: () => ({ width: 640, height: 360 }),
+    getAttribute: (n) => (n === 'allow' ? 'autoplay; fullscreen' : null),
+  };
+  const cell = makeDiagCell({ player, playingFlag: true, iframe });
+  cell._twitchReadyAt = 111;
+  cell._twitchPlayingAt = 222;
+  const d = TwitchPlayback.twitchIframeCellDiagnostics(cell);
+  assert.equal(d.channel, 'somechan');
+  assert.equal(d.cellSize.w, 640);
+  assert.equal(d.iframe.allowAutoplay, true);
+  assert.equal(d.player.muted, true);
+  assert.equal(d.player.paused, false);
+  assert.equal(d.player.qualities, 3);
+  assert.equal(d.player.readyAt, 111);
+  assert.equal(d.player.playingConfirmed, true);
+  assert.equal(d.player.playingAt, 222);
+  assert.equal(cell._twitchPlaying, true, 'diagnostics must not mutate cell state');
+  assert.equal(typeof cell._twitchPlayer, 'object', 'player untouched');
+});
+
+test('twitchIframeCellDiagnostics: missing player methods yield null, never throw', () => {
+  const cell = makeDiagCell({ player: {} });
+  const d = TwitchPlayback.twitchIframeCellDiagnostics(cell);
+  assert.equal(d.player.exists, true);
+  assert.equal(d.player.muted, null);
+  assert.equal(d.player.paused, null);
+  assert.equal(d.player.ended, null);
+  assert.equal(d.player.qualities, null);
+  assert.equal(d.player.retryCount, 0);
+});
+
+test('twitchIframeCellDiagnostics: throwing getters → null, still no throw', () => {
+  const cell = makeDiagCell({
+    player: {
+      getMuted: () => { throw new Error('dead embed'); },
+      isPaused: () => { throw new Error('dead embed'); },
+    },
+    playingFlag: false,
+  });
+  const d = TwitchPlayback.twitchIframeCellDiagnostics(cell);
+  assert.equal(d.player.muted, null);
+  assert.equal(d.player.paused, null);
+  assert.equal(d.player.playingConfirmed, false);
+});
+
+test('twitchIframeCellDiagnostics: no player → player null, missing cell → all null', () => {
+  const d1 = TwitchPlayback.twitchIframeCellDiagnostics(makeDiagCell());
+  assert.equal(d1.player, null);
+  assert.equal(d1.channel, 'somechan');
+  const d2 = TwitchPlayback.twitchIframeCellDiagnostics(null);
+  assert.deepEqual(d2, { channel: null, cellSize: null, iframe: null, player: null });
+});

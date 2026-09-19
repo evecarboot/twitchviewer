@@ -36,6 +36,9 @@
   let apiConfigured = false;
   /** 'hls' = Twitch via streamlink+ffmpeg on server; 'iframe' = official embed */
   let twitchPlayback = 'iframe';
+  /* Server-reported: embedded Twitch ad filtering enabled where the playback
+     mode supports it (proxy playlist swap / hls streamlink reader). */
+  let twitchFilterAds = false;
   let pollFailed = false;
   let onlineSet = new Set();
   /** @type {Map<string, number>} Twitch login (lowercase) -> current viewer count. */
@@ -689,10 +692,84 @@
    * few times — re-calling play()/setMuted() on an already-playing player is a harmless no-op —
    * and stop once PLAYING actually fires.
    */
+  /* Retry window: READY-time play() calls can silently lose a race with
+     Twitch's own postMessage handshake (observed: a tile still unstarted 45s+
+     after mount because every nudge landed inside the first 5s). Extend to
+     ~16s — still bounded, still stops the moment PLAYING fires. */
+  /* Removing a PLAYING Twitch embed pauses every sibling embed into a zombie
+     state where play() is a silent no-op (observed repeatedly in real Chrome).
+     At each teardown/remount, capture the time and which cells were
+     confirmed-playing; a PAUSE that lands on one of those cells within the
+     cascade window is that side effect, not user intent — heal the zombies by
+     remounting them. Bounded by the same per-cell remount cap. Cells already
+     paused before teardown are never healed, so a user-paused tile is never
+     force-resumed. The snapshot is passed per-call so overlapping teardowns
+     can't clobber each other's heal window. */
+  function healTwitchCascadeZombies(teardownAt, playingCells) {
+    window.setTimeout(() => {
+      if (twitchPlayback !== 'iframe') return;
+      document.querySelectorAll('.cell').forEach((cell) => {
+        const p = cell._twitchPlayer;
+        if (!p || cell._twitchPlaying) return;
+        /* Only a PAUSE that arrived after the teardown on a tile that was
+           playing at teardown time is cascade damage. */
+        if (!playingCells.has(cell)) return;
+        if (!cell._twitchPausedAt || cell._twitchPausedAt < teardownAt)
+          return;
+        if (Date.now() - cell._twitchPausedAt > 4000) return;
+        if ((cell._twitchRemounts || 0) >= 2) return;
+        try {
+          if (typeof p.isPaused === 'function' && !p.isPaused()) return;
+        } catch {
+          /* ignore — remount anyway */
+        }
+        cell._twitchRemounts = (cell._twitchRemounts || 0) + 1;
+        const login = (cell.dataset.channelKey || '?').replace(/^t:/, '');
+        if (PLAYBACK_DEBUG)
+          console.log(
+            `[twitchviewer] IFRAME ch=${login} cascade-zombie remount ${cell._twitchRemounts}/2`
+          );
+        remountTwitchIframeCell(cell);
+      });
+    }, 2000);
+  }
+
+  /**
+   * Recreate a dead Twitch.Player via the normal mount path. Some embeds land
+   * in a zombie state where play()/pause()/setChannel() are all silent no-ops
+   * (observed: isPaused()=false forever, PLAYING never fires) — only a fresh
+   * player recovers. Removing a NON-playing iframe does not pause healthy
+   * sibling embeds, so remounting dead tiles is safe; never call this on a
+   * tile that was playing (removing a playing embed pauses every sibling).
+   */
+  function remountTwitchIframeCell(cell) {
+    const login = (cell.dataset.channelKey || '').replace(/^t:/, '');
+    const wrap = cell.querySelector('.twitch-embed-host');
+    if (!login || !wrap || !cell.isConnected || !wrap.isConnected) return;
+    cell._twitchPlayer = null;
+    setTwitchCellPlaying(cell, false, 'remount');
+    queueTwitchMount(() => {
+      if (!cell.isConnected || !wrap.isConnected) return;
+      /* Mark teardown at the moment the old iframe actually detaches
+         (inside createTwitchInteractivePlayerEmbed's innerHTML='') — the
+         cascade pause on siblings lands after this point, not at call time. */
+      const teardownAt = Date.now();
+      const playingCells = new Set(
+        [...document.querySelectorAll('.cell')].filter(
+          (c) => c !== cell && c._twitchPlaying === true
+        )
+      );
+      createTwitchInteractivePlayerEmbed(cell, login, wrap);
+      healTwitchCascadeZombies(teardownAt, playingCells);
+    });
+  }
+
   function scheduleTwitchPlayRetries(player, cell) {
-    [150, 500, 1200, 2500, 5000].forEach((ms) => {
+    TwitchPlayback.TWITCH_IFRAME_PLAY_RETRY_DELAYS.forEach((ms) => {
       window.setTimeout(() => {
         if (!cell.isConnected || player._twitchPlaybackStarted) return;
+        cell._twitchRetries = (cell._twitchRetries || 0) + 1;
+        cell._twitchLastRetryAt = Date.now();
         try {
           /* Re-assert muted ONLY when the player is still muted — an explicit
              user unmute is an audio choice, and automation must never undo it. */
@@ -708,7 +785,78 @@
         }
       }, ms);
     });
+    /* Final bounded check after the nudge window: if the channel came ONLINE
+       but the embed never reached PLAYING, it's in the dead-embed state where
+       play() is a silent no-op — only recreating the player recovers. Guarded
+       by cell._twitchPlayer === player so stale schedules from earlier mounts
+       can't remount a healthy newer player. At most 2 remounts per cell. */
+    const delays = TwitchPlayback.TWITCH_IFRAME_PLAY_RETRY_DELAYS;
+    window.setTimeout(() => {
+      if (!cell.isConnected || !state.autoplay) return;
+      if (cell._twitchPlayer !== player) return;
+      if (player._twitchPlaybackStarted || cell._twitchPlaying) return;
+      if (!cell._twitchOnlineAt) return;
+      if ((cell._twitchRemounts || 0) >= 2) return;
+      cell._twitchRemounts = (cell._twitchRemounts || 0) + 1;
+      const login = (cell.dataset.channelKey || '').replace(/^t:/, '');
+      if (PLAYBACK_DEBUG)
+        console.log(
+          `[twitchviewer] IFRAME ch=${login} dead-embed remount ${cell._twitchRemounts}/2 (ONLINE but never PLAYING)`
+        );
+      remountTwitchIframeCell(cell);
+    }, delays[delays.length - 1] + 5000);
   }
+
+  let pointsPlayingSyncTimer = null;
+  /** Coalesce bursts of Twitch.Player state events into one /api/points/playing
+      sync — PLAYING/PAUSE/OFFLINE transitions can arrive in clusters. */
+  function schedulePointsPlayingSync() {
+    if (!pointsLinked || pointsPlayingSyncTimer) return;
+    pointsPlayingSyncTimer = window.setTimeout(() => {
+      pointsPlayingSyncTimer = null;
+      syncPointsPlaying();
+    }, 800);
+  }
+
+  /** Event-confirmed "actually playing" flag for Twitch.Player iframe tiles.
+      Only the PLAYING event sets it true — iframe presence, READY, PLAY and
+      ONLINE are all pre-play states and must never count as playing. */
+  function setTwitchCellPlaying(cell, playing, reason) {
+    if (cell._twitchPlaying === playing && cell._twitchPlayingReason === reason) return;
+    cell._twitchPlaying = playing;
+    cell._twitchPlayingReason = reason || null;
+    if (PLAYBACK_DEBUG) {
+      console.log(
+        `[twitchviewer] IFRAME ch=${(cell.dataset.channelKey || '?').replace(/^t:/, '')} ` +
+          `playing=${playing} reason=${reason || '?'}`
+      );
+    }
+    schedulePointsPlayingSync();
+  }
+
+  /* Twitch embeds pause themselves when the tab goes hidden and never resume
+     on their own — the tile sits frozen until clicked. A PAUSE delivered while
+     document.hidden is a platform pause, never a user gesture, so flag it and
+     nudge playback back when the tab becomes visible again. Manual pauses
+     (visible tab) keep _twitchBgPaused false and stay paused, as intended. */
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible' || twitchPlayback !== 'iframe')
+      return;
+    document.querySelectorAll('.cell').forEach((cell) => {
+      const p = cell._twitchPlayer;
+      if (!p || !cell._twitchBgPaused) return;
+      cell._twitchBgPaused = false;
+      /* Same pattern as ONLINE recovery: clear the started flag so the bounded
+         retry schedule actually nudges this player again. */
+      p._twitchPlaybackStarted = false;
+      try {
+        if (typeof p.play === 'function') p.play();
+      } catch {
+        /* ignore */
+      }
+      scheduleTwitchPlayRetries(p, cell);
+    });
+  });
 
   function syncTwitchInteractiveQualities() {
     if (twitchPlayback !== 'iframe') return;
@@ -929,23 +1077,51 @@
           return;
         }
         cell._twitchPlayer = player;
+        cell._twitchPlaying = false;
+        /* Fresh mount — reset per-attempt diagnostics. _twitchRemounts persists
+           so dead-embed recovery stays bounded across remounts. */
+        cell._twitchReadyAt = null;
+        cell._twitchOnlineAt = null;
+        cell._twitchOfflineAt = null;
+        cell._twitchPlayingAt = null;
+        cell._twitchPlayingReason = null;
+        cell._twitchBlockedCount = 0;
+        cell._twitchRetries = 0;
+        cell._twitchLastRetryAt = null;
+        cell._twitchBgPaused = false;
+        cell._twitchPausedAt = null;
+
+        /* Twitch.Player's own iframe doesn't always set `allow="autoplay"` — without it,
+           some Chromium builds (Edge included) treat autoplay as a delegated permission
+           that's missing on this cross-origin frame and silently block even muted play(),
+           leaving the tile on its paused thumbnail until manually clicked. Chrome
+           snapshots the iframe's permission delegation around document init, so apply it
+           the moment Twitch inserts the iframe — not 400ms later at READY. */
+        const wantedAllow =
+          'autoplay; fullscreen; picture-in-picture; clipboard-write; encrypted-media; web-share';
+        const applyTwitchIframeAllow = (iframe) => {
+          if (iframe.getAttribute('allow') !== wantedAllow) {
+            iframe.setAttribute('allow', wantedAllow);
+          }
+        };
+        const allowMo = new MutationObserver(() => {
+          const iframe = wrap.querySelector('iframe');
+          if (!iframe) return;
+          applyTwitchIframeAllow(iframe);
+          allowMo.disconnect();
+        });
+        allowMo.observe(wrap, { childList: true, subtree: true });
 
         const wireInnerIframeOnce = () => {
           const iframe = wrap.querySelector('iframe');
           if (!iframe) return;
-          /* Twitch.Player's own iframe doesn't always set `allow="autoplay"` — without it,
-             some Chromium builds (Edge included) treat autoplay as a delegated permission
-             that's missing on this cross-origin frame and silently block even muted play(),
-             leaving the tile on its paused thumbnail until manually clicked. */
-          const wantedAllow =
-            'autoplay; fullscreen; picture-in-picture; clipboard-write; encrypted-media; web-share';
-          if (iframe.getAttribute('allow') !== wantedAllow) {
-            iframe.setAttribute('allow', wantedAllow);
-          }
+          applyTwitchIframeAllow(iframe);
           wireTwitchIframeResize(wrap, iframe, cell);
         };
 
         player.addEventListener(Twitch.Player.READY, () => {
+          if (PLAYBACK_DEBUG) console.log(`[twitchviewer] IFRAME ch=${login} ev=ready`);
+          cell._twitchReadyAt = Date.now();
           wireInnerIframeOnce();
           if (state.autoplay) {
             try {
@@ -960,15 +1136,71 @@
           scheduleTwitchQualityRetries(player, cell);
         });
         /* Mark actual playback start so the play-retry loop above stops nudging it — this
-           is just a flag read, not a re-trigger, so it's fine to hook PLAYING for this. */
+           is just a flag read, not a re-trigger, so it's fine to hook PLAYING for this.
+           PLAYING is also the ONLY event that proves the tile is really playing — READY,
+           PLAY and ONLINE are all pre-play states — so it drives the per-cell confirmed
+           playing state used by channel-points tracking. */
         player.addEventListener(Twitch.Player.PLAYING, () => {
+          if (PLAYBACK_DEBUG) console.log(`[twitchviewer] IFRAME ch=${login} ev=playing`);
           player._twitchPlaybackStarted = true;
+          cell._twitchPlayingAt = Date.now();
+          cell._twitchBgPaused = false;
+          setTwitchCellPlaying(cell, true, 'playing');
+        });
+        player.addEventListener(Twitch.Player.PAUSE, () => {
+          /* Hidden-tab pause = platform throttle, not user intent — remember it
+             so the visibilitychange handler can resume on return. Only flag a
+             tile that was actually confirmed-playing: a hidden PAUSE on a tile
+             the user already paused must stay paused. */
+          const wasPlaying = cell._twitchPlaying === true;
+          cell._twitchBgPaused =
+            wasPlaying && document.visibilityState === 'hidden';
+          cell._twitchPausedAt = Date.now();
+          setTwitchCellPlaying(
+            cell,
+            false,
+            cell._twitchBgPaused ? 'pause-hidden' : 'pause'
+          );
+        });
+        player.addEventListener(Twitch.Player.ENDED, () => {
+          setTwitchCellPlaying(cell, false, 'ended');
+        });
+        player.addEventListener(Twitch.Player.OFFLINE, () => {
+          cell._twitchOfflineAt = Date.now();
+          setTwitchCellPlaying(cell, false, 'offline');
+        });
+        /* Browser autoplay policy blocked playback inside the embed. Ensure the player
+           is muted (muted autoplay is always permitted), then let the bounded retry
+           schedule nudge it again — never an unbounded setMuted/play loop. A user's
+           deliberate unmute is still respected via twitchEmbedUserUnmuted. */
+        player.addEventListener(Twitch.Player.PLAYBACK_BLOCKED, () => {
+          if (PLAYBACK_DEBUG) console.log(`[twitchviewer] IFRAME ch=${login} ev=playbackBlocked`);
+          cell._twitchBlockedCount = (cell._twitchBlockedCount || 0) + 1;
+          setTwitchCellPlaying(cell, false, 'playbackBlocked');
+          if (!state.autoplay) return;
+          player._twitchPlaybackStarted = false;
+          try {
+            if (
+              !TwitchPlayback.twitchEmbedUserUnmuted(player) &&
+              typeof player.setMuted === 'function'
+            ) {
+              player.setMuted(true);
+            }
+            if (typeof player.play === 'function') player.play();
+          } catch {
+            /* ignore */
+          }
+          scheduleTwitchPlayRetries(player, cell);
         });
         /* When a channel drops offline the embed shows its own "offline" screen; when it
            comes back the Twitch player does NOT resume playback on its own (autoplay only
            applies on initial load), so without this the tile sits on a paused thumbnail
            until someone clicks the embed's play button. Re-trigger muted play on ONLINE. */
         player.addEventListener(Twitch.Player.ONLINE, () => {
+          if (PLAYBACK_DEBUG) console.log(`[twitchviewer] IFRAME ch=${login} ev=online`);
+          cell._twitchOnlineAt = Date.now();
+          /* Online is not playback — stays not-playing until PLAYING confirms. */
+          setTwitchCellPlaying(cell, false, 'online');
           if (!state.autoplay) return;
           /* Reset so scheduleTwitchPlayRetries actually retries below — this flag was
              already set true by the PLAYING event from the stream's previous online
@@ -2088,19 +2320,25 @@
    *  telemetry for points earning — not merely online or in the grid. */
   async function syncPointsPlaying() {
     if (!pointsLinked) return;
-    /* Scan all cells for Twitch streams with active (non-paused, non-ended)
-       video elements. This identifies streams the user is actually watching. */
+    /* Scan all cells for Twitch streams that are ACTUALLY playing. Native
+       proxy/HLS tiles prove it with the video element state; Twitch.Player
+       iframe tiles are cross-origin (no same-origin video element), so they
+       prove it with the event-confirmed _twitchPlaying flag — READY, PLAY,
+       ONLINE and mere iframe presence never count. */
     const playingLogins = [];
     const cells = document.querySelectorAll('.cell');
     cells.forEach((cell) => {
-      const video = cell.querySelector('video.cell-video');
-      if (!video || video.paused || video.ended) return;
-      /* Extract the Twitch login from the cell's channel key (e.g. "t:login"). */
       const key = cell.dataset.channelKey || '';
       if (!key.startsWith('t:')) return;
       const login = key.slice(2).toLowerCase();
-      if (login) playingLogins.push(login);
+      if (!login) return;
+      if (TwitchPlayback.twitchCellIsPlaying(cell)) {
+        playingLogins.push(login);
+      }
     });
+    if (PLAYBACK_DEBUG) {
+      console.log(`[twitchviewer] POINTS playing=${playingLogins.join(',') || '(none)'}`);
+    }
     try {
       await fetch('/api/points/playing', {
         ...FETCH_OPTS,
@@ -2592,8 +2830,24 @@
         const t = cell._twitchPlayer;
         if (t instanceof HTMLIFrameElement) {
           t.remove();
-        } else if (typeof t.destroy === 'function') {
-          t.destroy();
+        } else {
+          if (typeof t.destroy === 'function') {
+            try {
+              t.destroy();
+            } catch {
+              /* ignore */
+            }
+          }
+          /* Teardown of a playing embed cascade-pauses siblings — sweep for
+             zombie siblings shortly after and remount them. */
+          healTwitchCascadeZombies(
+            Date.now(),
+            new Set(
+              [...document.querySelectorAll('.cell')].filter(
+                (c) => c !== cell && c._twitchPlaying === true
+              )
+            )
+          );
         }
       } catch {
         /* ignore */
@@ -4064,7 +4318,52 @@
     };
   }
 
+  /**
+   * Per-tile Twitch iframe diagnostics for bug reports — especially useful on
+   * browsers Devin can't run directly (e.g. Edge on Windows). Read-only: never
+   * mutates player state, never prints tokens, cookies or device IDs. Returns
+   * a plain object AND prints a JSON copy so it can be pasted back verbatim.
+   */
+  function exposeTwitchIframeDiagnostics() {
+    window.twitchviewerIframeDiagnostics = function () {
+      const grid = document.getElementById('grid');
+      const gridPri = document.getElementById('grid-priority');
+      const cells = [
+        ...(grid ? grid.querySelectorAll('.cell') : []),
+        ...(gridPri ? gridPri.querySelectorAll('.cell') : []),
+      ];
+      const ua = navigator.userActivation || {};
+      const playingLogins = [];
+      cells.forEach((cell) => {
+        const key = cell.dataset.channelKey || '';
+        if (!key.startsWith('t:')) return;
+        if (TwitchPlayback.twitchCellIsPlaying(cell)) {
+          playingLogins.push(key.slice(2).toLowerCase());
+        }
+      });
+      const report = {
+        generatedAt: new Date().toISOString(),
+        userAgent: navigator.userAgent,
+        visibilityState: document.visibilityState,
+        userActivation: {
+          isActive: ua.isActive ?? null,
+          hasBeenActive: ua.hasBeenActive ?? null,
+        },
+        twitchPlayback,
+        autoplayEnabled: state.autoplay,
+        twitchFilterAds,
+        pointsLinked,
+        wouldReportPlayingLogins: playingLogins,
+        tiles: cells.map((cell) => TwitchPlayback.twitchIframeCellDiagnostics(cell)),
+      };
+      console.log('[twitchviewer] iframe diagnostics — copy everything below this line:');
+      console.log(JSON.stringify(report, null, 2));
+      return report;
+    };
+  }
+
   exposeTwitchAutoplayHelp();
+  exposeTwitchIframeDiagnostics();
 
   (async function init() {
     const qs = new URLSearchParams(location.search);
@@ -4080,6 +4379,7 @@
       if (j.twitchPlayback === 'proxy' || j.twitchPlayback === 'hls' || j.twitchPlayback === 'iframe') {
         twitchPlayback = j.twitchPlayback;
       }
+      twitchFilterAds = Boolean(j.twitchFilterAds);
     } catch {
       apiConfigured = false;
     }
@@ -4108,7 +4408,14 @@
       pointsStatusTimer = setTimeout(pollPointsStatus, 30_000);
     }
     console.info(
-      `[twitchviewer] Twitch playback: ${twitchPlayback}. proxy = streamlink pass-through (no ffmpeg, quality per tile size); iframe = Twitch.Player (setQuality: ~480p when Priority tiles off, Auto when on); hls = legacy streamlink+ffmpeg transcode. Run twitchviewerAutoplayDiagnostics().`
+      `[twitchviewer] Twitch playback: ${twitchPlayback}. proxy = streamlink pass-through (no ffmpeg, quality per tile size); iframe = Twitch.Player (setQuality: ~480p when Priority tiles off, Auto when on); hls = legacy streamlink+ffmpeg transcode. ` +
+        `Ad filtering: ${
+          twitchFilterAds
+            ? twitchPlayback === 'iframe'
+              ? 'enabled, but unavailable in iframe mode (official embed is Twitch-controlled)'
+              : 'enabled (proxy: ad-free playlist swap; hls: streamlink reader)'
+            : 'disabled'
+        }. Run twitchviewerAutoplayDiagnostics() or twitchviewerIframeDiagnostics().`
     );
     window.addEventListener('resize', scheduleLayoutGridToViewport);
     document.addEventListener('fullscreenchange', scheduleLayoutGridToViewport);

@@ -304,10 +304,122 @@
     }
   }
 
+  /**
+   * Canonical per-cell answer to "is this Twitch tile ACTUALLY playing right
+   * now?" — mode-independent so channel-points tracking works the same for
+   * every playback mode.
+   *
+   * Native proxy/HLS tiles carry a same-origin <video class="cell-video">:
+   * playing means !paused && !ended. Twitch.Player iframe tiles are
+   * cross-origin (no reachable video element), so they prove playback with the
+   * event-confirmed _twitchPlaying flag — only the Twitch.Player PLAYING event
+   * sets it; READY, PLAY, ONLINE and mere iframe presence never count.
+   */
+  function twitchCellIsPlaying(cell) {
+    if (!cell) return false;
+    const video =
+      typeof cell.querySelector === 'function'
+        ? cell.querySelector('video.cell-video')
+        : null;
+    if (video) return !video.paused && !video.ended;
+    if (cell._twitchPlayer) return cell._twitchPlaying === true;
+    return false;
+  }
+
+  /**
+   * Bounded retry schedule for Twitch.Player autoplay nudges. READY-time
+   * play() can silently lose a race with the embed's postMessage handshake, so
+   * callers re-nudge on this schedule and stop the moment PLAYING fires —
+   * bounded, never an unlimited setMuted/play loop. The two late nudges (25s,
+   * 40s) cover slower init paths (observed on Chromium builds where the
+   * handshake settles well after READY) without turning into hammering.
+   */
+  const TWITCH_IFRAME_PLAY_RETRY_DELAYS = [150, 500, 1200, 2500, 5000, 8000, 12000, 16000, 25000, 40000];
+
+  /**
+   * Read-only per-cell diagnostics for a Twitch.Player iframe tile. Used by
+   * window.twitchviewerIframeDiagnostics() — safe to run any time: calls only
+   * documented getter APIs, guards every call, and mutates nothing. Missing
+   * methods yield null rather than throwing.
+   */
+  function twitchIframeCellDiagnostics(cell) {
+    const d = { channel: null, cellSize: null, iframe: null, player: null };
+    if (!cell) return d;
+    try {
+      const key = (cell.dataset && cell.dataset.channelKey) || '';
+      d.channel = key.replace(/^t:/, '') || null;
+    } catch {
+      /* ignore */
+    }
+    try {
+      const r = cell.getBoundingClientRect();
+      d.cellSize = { w: Math.round(r.width), h: Math.round(r.height) };
+    } catch {
+      /* ignore */
+    }
+    try {
+      const iframe =
+        typeof cell.querySelector === 'function'
+          ? cell.querySelector('iframe[src*="player.twitch.tv"]')
+          : null;
+      if (iframe) {
+        const ir = iframe.getBoundingClientRect();
+        const allow = iframe.getAttribute('allow') || '';
+        d.iframe = {
+          w: Math.round(ir.width),
+          h: Math.round(ir.height),
+          allow,
+          allowAutoplay: /\bautoplay\b/i.test(allow),
+        };
+      }
+    } catch {
+      /* ignore */
+    }
+    const p = cell._twitchPlayer;
+    if (p) {
+      const call = (fn) => {
+        try {
+          return typeof p[fn] === 'function' ? p[fn]() : null;
+        } catch {
+          return null;
+        }
+      };
+      let qualities = null;
+      try {
+        const q = typeof p.getQualities === 'function' ? p.getQualities() : null;
+        qualities = Array.isArray(q) ? q.length : null;
+      } catch {
+        /* ignore */
+      }
+      d.player = {
+        exists: true,
+        muted: call('getMuted'),
+        paused: call('isPaused'),
+        ended: call('getEnded'),
+        qualities,
+        readyAt: typeof cell._twitchReadyAt === 'number' ? cell._twitchReadyAt : null,
+        onlineAt: typeof cell._twitchOnlineAt === 'number' ? cell._twitchOnlineAt : null,
+        offlineAt: typeof cell._twitchOfflineAt === 'number' ? cell._twitchOfflineAt : null,
+        playingConfirmed: cell._twitchPlaying === true,
+        playingAt: typeof cell._twitchPlayingAt === 'number' ? cell._twitchPlayingAt : null,
+        lastStateReason: cell._twitchPlayingReason || null,
+        backgroundPaused: cell._twitchBgPaused === true,
+        playbackBlockedCount: cell._twitchBlockedCount || 0,
+        retryCount: cell._twitchRetries || 0,
+        lastRetryAt: cell._twitchLastRetryAt || null,
+        remounts: cell._twitchRemounts || 0,
+      };
+    }
+    return d;
+  }
+
   return {
     create,
     isUserGesture,
     twitchEmbedUserUnmuted,
+    twitchCellIsPlaying,
+    twitchIframeCellDiagnostics,
+    TWITCH_IFRAME_PLAY_RETRY_DELAYS,
     PAUSE_USER,
     PAUSE_AUTO,
     PAUSE_RELOAD,

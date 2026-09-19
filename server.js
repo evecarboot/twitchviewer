@@ -251,6 +251,19 @@ function currentTwitchPlayback() {
   return 'proxy';
 }
 
+/** Filter embedded Twitch ad content where the current playback mode supports it.
+ *   proxy : swap to an ad-free media playlist via alternate playerType when
+ *           stitched-ad markers are detected (pre-existing behaviour, now opt-out).
+ *   hls   : streamlink reads the stream itself — its Twitch plugin filters
+ *           embedded ad segments automatically, ffmpeg only sees real content.
+ *   iframe: cannot filter — the official embed is Twitch-controlled; the flag is
+ *           still reported via /api/status so clients can state that honestly.
+ *  TWITCH_FILTER_ADS=false|0|off disables; default enabled. */
+function twitchFilterAds() {
+  const v = String(process.env.TWITCH_FILTER_ADS ?? 'true').trim().toLowerCase();
+  return v !== 'false' && v !== '0' && v !== 'off';
+}
+
 app.get('/api/status', (req, res) => {
   const configured = Boolean(
     process.env.TWITCH_CLIENT_ID && process.env.TWITCH_CLIENT_SECRET
@@ -260,6 +273,7 @@ app.get('/api/status', (req, res) => {
     configured,
     twitchPlayback: currentTwitchPlayback(),
     twitchHlsAvailable: sl,
+    twitchFilterAds: twitchFilterAds(),
   });
 });
 
@@ -799,6 +813,14 @@ const transcodeState = new Map();
 
 function killAllTranscoders() {
   for (const [, v] of transcodeState) {
+    v.stopping = true;
+    if (v.producer && !v.producer.killed) {
+      try {
+        v.producer.kill('SIGKILL');
+      } catch {
+        /* ignore */
+      }
+    }
     if (v.proc && !v.proc.killed) {
       try {
         v.proc.kill('SIGKILL');
@@ -821,6 +843,10 @@ process.on('SIGTERM', killAllTranscoders);
  */
 function startFfmpegIfNeeded(hash, url, options) {
   const twitchMode = Boolean(options && options.twitch);
+  /* streamlinkLogin: streamlink becomes the HLS reader (its Twitch plugin
+     filters embedded ad segments automatically) and ffmpeg consumes its
+     fMP4 output on stdin instead of fetching the CDN playlist itself. */
+  const streamlinkLogin = options && options.streamlinkLogin;
   const existing = transcodeState.get(hash);
   if (existing && existing.proc && !existing.error) return;
   if (existing && existing.error) transcodeState.delete(hash);
@@ -866,6 +892,30 @@ function startFfmpegIfNeeded(hash, url, options) {
     ? ['-fflags', '+genpts', '-re']
     : ['-fflags', '+genpts'];
 
+  /* Streamlink-reader input: spawn `streamlink --stdout <url> <quality>` and
+     feed its output to ffmpeg via stdin. `-f mov` is required because a pipe
+     has no filename to probe and Twitch serves fMP4, not MPEG-TS. */
+  let producer = null;
+  let input = url;
+  const inputFormatArgs = [];
+  if (streamlinkLogin) {
+    producer = spawn(
+      streamlinkExecutable(),
+      [
+        '--stdout',
+        `https://www.twitch.tv/${streamlinkLogin}`,
+        /* Comma-separated fallback list — streamlink picks the first available
+           quality (Twitch names vary per channel: 720p60 vs 480p30 vs best). */
+        streamlinkQualityCandidates().join(','),
+      ],
+      { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }
+    );
+    input = 'pipe:0';
+    /* Twitch serves fMP4 (init segment + moof/mdat fragments), not MPEG-TS —
+       the mov demuxer handles the concatenated fragment stream on a pipe. */
+    inputFormatArgs.push('-f', 'mov');
+  }
+
   const proc = spawn(
     ffmpegExecutable(),
     [
@@ -873,8 +923,9 @@ function startFfmpegIfNeeded(hash, url, options) {
       '-loglevel',
       'warning',
       ...beforeInput,
+      ...inputFormatArgs,
       '-i',
-      url,
+      input,
       ...vfArgs,
       '-c:v',
       'libx264',
@@ -902,11 +953,34 @@ function startFfmpegIfNeeded(hash, url, options) {
       segPattern,
       playlistArg,
     ],
-    { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true }
+    { stdio: [producer ? 'pipe' : 'ignore', 'ignore', 'pipe'], windowsHide: true }
   );
 
-  const entry = { url, dir, proc };
+  const entry = { url: url || `streamlink:${streamlinkLogin}`, dir, proc, producer };
   transcodeState.set(hash, entry);
+
+  if (producer) {
+    producer.stdout.pipe(proc.stdin);
+    producer.stderr.on('data', (buf) => {
+      if (process.env.DEBUG_FFMPEG) {
+        process.stderr.write(buf);
+      }
+    });
+    producer.on('error', (err) => {
+      entry.error = `streamlink: ${err.message}`;
+    });
+    producer.on('exit', () => {
+      /* streamlink ended or died — close ffmpeg's stdin so it can finish and,
+         unless we killed it deliberately, mark the entry so the next playlist
+         request restarts the pipeline. */
+      try {
+        proc.stdin.end();
+      } catch {
+        /* ignore */
+      }
+      if (!entry.stopping) entry.error = 'streamlink exited';
+    });
+  }
 
   proc.stderr.on('data', (buf) => {
     if (process.env.DEBUG_FFMPEG) {
@@ -2760,11 +2834,11 @@ app.get('/api/twitch-live/:login/:file', async (req, res) => {
         return res.status(502).type('text').send(`Upstream playlist ${r.status}`);
       }
 
-      // Ad blocking: check the media playlist for stitched ad markers. If found,
+      // Ad filtering: check the media playlist for stitched ad markers. If found,
       // try alternate player types to get an ad-free playlist (vaft-style).
       let playlistText = r.body.toString('utf8');
       let rewriteBaseUrl = streamUrl;
-      if (twitchPlaylistHasAds(playlistText)) {
+      if (twitchFilterAds() && twitchPlaylistHasAds(playlistText)) {
         console.log(`[twitchviewer] Ad block: detected ads in playlist for ${login} (quality: ${quality})`);
         const adFree = await resolveAdFreeMediaPlaylist(login, quality, playlistText);
         if (adFree !== playlistText) {
@@ -2790,8 +2864,19 @@ app.get('/api/twitch-live/:login/:file', async (req, res) => {
   if (file === 'playlist.m3u8') {
     if (!transcodeState.has(hash)) {
       try {
-        const streamUrl = await resolveStreamlinkStreamUrl(login);
-        startFfmpegIfNeeded(hash, streamUrl, { twitch: true });
+        if (twitchFilterAds()) {
+          /* Streamlink reads the stream itself — its Twitch plugin filters
+             embedded ad segments automatically (Streamlink ≥2.x), so ffmpeg
+             only ever sees real stream content. During an ad break the input
+             simply pauses; normal content resumes afterwards. */
+          startFfmpegIfNeeded(hash, null, {
+            twitch: true,
+            streamlinkLogin: login,
+          });
+        } else {
+          const streamUrl = await resolveStreamlinkStreamUrl(login);
+          startFfmpegIfNeeded(hash, streamUrl, { twitch: true });
+        }
       } catch (e) {
         return res.status(503).type('text').send(String(e.message));
       }
