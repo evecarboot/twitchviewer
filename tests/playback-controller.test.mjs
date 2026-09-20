@@ -53,10 +53,11 @@ function makeMedia() {
 
 function makeCtl(media, cfg = {}) {
   const logs = [];
-  const env = { autoplay: true, visible: true, ...cfg };
+  const env = { autoplay: true, visible: true, now: 0, ...cfg };
   const ctl = TwitchPlayback.create(media, {
     isAutoplayEnabled: () => env.autoplay,
     isVisible: () => env.visible,
+    now: () => env.now,
     log: (l) => logs.push('LOG ' + l),
     debug: (l) => logs.push('DBG ' + l),
   });
@@ -642,4 +643,137 @@ test('twitchIframeVisibilityDiagnostics: missing elementsFromPoint → occlusion
     null
   );
   assert.equal(d.occlusion, null);
+});
+
+/* --- createRateLimiter: sliding-window budget for recovery actions --- */
+
+test('createRateLimiter: allows up to max actions within the window', () => {
+  let t = 0;
+  const allow = TwitchPlayback.createRateLimiter(3, 1000, () => t);
+  assert.equal(allow(), true);
+  assert.equal(allow(), true);
+  assert.equal(allow(), true);
+  assert.equal(allow(), false, 'fourth action within the window is denied');
+  assert.equal(allow(), false, 'denial does not consume budget');
+});
+
+test('createRateLimiter: window self-heals — full budget after quiet period', () => {
+  let t = 0;
+  const allow = TwitchPlayback.createRateLimiter(2, 1000, () => t);
+  allow();
+  allow();
+  assert.equal(allow(), false);
+  t = 1001;
+  assert.equal(allow(), true, 'budget replenishes once entries age out');
+  assert.equal(allow(), true);
+  assert.equal(allow(), false);
+});
+
+test('createRateLimiter: sliding window expires oldest entries first', () => {
+  let t = 0;
+  const allow = TwitchPlayback.createRateLimiter(2, 1000, () => t);
+  allow(); // t=0
+  t = 900;
+  allow(); // t=900 — window holds [0, 900]
+  assert.equal(allow(), false);
+  t = 1100; // t=0 aged out; window holds [900]
+  assert.equal(allow(), true);
+});
+
+test('createRateLimiter: a recovery loop is bounded — repeated requests stop', () => {
+  // Simulates the 'ended'→loadSource loop: each reload schedules the next
+  // 'ended' if the playlist keeps ending. The limiter must turn an infinite
+  // loop into a bounded burst.
+  let t = 0;
+  const allow = TwitchPlayback.createRateLimiter(3, 120000, () => t);
+  let reloads = 0;
+  for (let i = 0; i < 20; i++) {
+    if (allow()) reloads++;
+    t += 2000; // each cycle is ~2s — stays well inside the window
+  }
+  assert.equal(reloads, 3, 'no more than max reloads inside the window');
+});
+
+/* --- Chromium unmute-pause intervention (PAUSE_UNMUTE) ---
+   On builds/configs where the unmute gesture does not satisfy autoplay
+   policy, Chromium pauses the element right after the user's unmute
+   ("Unmuting failed and the element was paused instead"). That pause must
+   not latch userPaused — the user's intent was to keep watching audibly.
+   The controller replays it while the click's activation is still live. */
+
+test('unmute gesture then pause → unmute intervention, not user pause; controller replays', async () => {
+  const media = makeMedia();
+  media.paused = false; // playing muted
+  const { ctl } = makeCtl(media);
+  // user clicks the native unmute control → volumechange(unmuted, gesture)
+  media.muted = false;
+  ctl.onVolumeChange(true);
+  assert.equal(ctl.userMuted, false);
+  // Chromium's intervention then pauses the element (still inside the gesture)
+  media.paused = true;
+  const kind = ctl.onPause(true);
+  assert.equal(kind, TwitchPlayback.PAUSE_UNMUTE);
+  assert.equal(ctl.userPaused, false, 'unmute-pause must not latch userPaused');
+  // reconcile should have issued a play() to resume (audible play allowed —
+  // the click's activation is still active)
+  assert.equal(media.count('play'), 1);
+  media.resolveNextPlay();
+  await tick();
+  assert.equal(media.paused, false);
+});
+
+test('user pause long after unmute → still a real user pause', async () => {
+  const media = makeMedia();
+  media.paused = false;
+  const { ctl, env } = makeCtl(media);
+  media.muted = false;
+  ctl.onVolumeChange(true);
+  env.now = 5000; // well past the unmute window
+  media.paused = true;
+  const kind = ctl.onPause(true);
+  assert.equal(kind, TwitchPlayback.PAUSE_USER);
+  assert.equal(ctl.userPaused, true);
+  assert.equal(media.count('play'), 0, 'a real user pause is never auto-resumed');
+});
+
+test('pause with gesture but no preceding unmute → user pause', () => {
+  const media = makeMedia();
+  media.paused = false;
+  const { ctl } = makeCtl(media);
+  media.paused = true;
+  assert.equal(ctl.onPause(true), TwitchPlayback.PAUSE_USER);
+  assert.equal(ctl.userPaused, true);
+});
+
+test('unmute gesture then pause while MUTED (re-muted in between) → user pause', () => {
+  const media = makeMedia();
+  media.paused = false;
+  const { ctl } = makeCtl(media);
+  media.muted = false;
+  ctl.onVolumeChange(true);
+  media.muted = true; // user re-muted before the pause
+  media.paused = true;
+  assert.equal(ctl.onPause(true), TwitchPlayback.PAUSE_USER);
+});
+
+test('unmute-pause replay is bounded: rejected audible play re-mutes once, no loop', async () => {
+  const media = makeMedia();
+  media.paused = false;
+  const { ctl } = makeCtl(media);
+  media.muted = false;
+  ctl.onVolumeChange(true);
+  media.paused = true;
+  ctl.onPause(true);
+  assert.equal(media.count('play'), 1);
+  // audible play rejected (no activation) → controller re-mutes and replays muted
+  media.rejectNextPlay('NotAllowedError', 'play() failed because the user didn\'t interact');
+  await tick();
+  assert.ok(media.calls.includes('setMuted:true'), 're-mutes to recover');
+  assert.equal(media.count('play'), 2, 'one muted retry');
+  media.resolveNextPlay();
+  await tick();
+  assert.equal(media.paused, false);
+  // volumechange from the programmatic re-mute has no gesture → intent preserved
+  ctl.onVolumeChange(false);
+  assert.equal(ctl.userMuted, false, 'programmatic re-mute does not overwrite user audio intent');
 });

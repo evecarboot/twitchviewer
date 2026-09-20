@@ -34,8 +34,12 @@
 
   let state = loadState();
   let apiConfigured = false;
-  /** 'hls' = Twitch via streamlink+ffmpeg on server; 'iframe' = official embed */
-  let twitchPlayback = 'iframe';
+  /** 'proxy' = same-origin HLS via server proxy (server default); 'iframe' =
+      official embed; 'hls' = streamlink+ffmpeg. The real mode is set from
+      /api/status during init() — the 'proxy' fallback matches the server's
+      default so a failed status fetch can't run iframe players against a
+      proxy server. */
+  let twitchPlayback = 'proxy';
   /* Dev-only isolation control (?debugIframeLimit=N): cap how many official
      Twitch embeds may be mounted at once — used for the Edge/Windows
      multi-embed initialization tests. Never persisted; a plain reload
@@ -925,6 +929,24 @@
   // rapid 360→480→360 cycles when the grid is still settling after a resize/reorder.
   const TWITCH_QUALITY_COOLDOWN_MS = 5000;
 
+  /* Recovery budgets — every automatic source reload / restart must be bounded.
+     An 'ended' on a live stream means the playlist ran out (stale CDN URL,
+     ad-swap session churn, channel flapping); reloading usually fixes it, but a
+     playlist that keeps ending must not reload forever — that is the visible
+     "stream keeps refreshing" loop, and each reload can also re-mute a tile the
+     user unmuted. The window self-heals after a quiet period. */
+  const TWITCH_ENDED_MAX_RECOVERIES = 3;
+  const TWITCH_ENDED_RECOVERY_WINDOW_MS = 120000;
+  /* Fatal network errors already mean hls.js exhausted its internal retries;
+     each startLoad() below restarts a full retry cycle against the proxy.
+     Bounded so an offline/flapping channel can't re-request the playlist
+     forever. */
+  const TWITCH_NET_ERROR_MAX_RECOVERIES = 8;
+  /* recoverMediaError() detaches+reattaches the media element — a persistent
+     decode/SourceBuffer failure would otherwise re-arm forever. */
+  const TWITCH_MEDIA_ERROR_MAX_RECOVERIES = 3;
+  const TWITCH_MEDIA_ERROR_RECOVERY_WINDOW_MS = 120000;
+
   function twitchQualityForCell(w, h, currentQuality) {
     const px = Math.max(0, w | 0) * Math.max(0, h | 0);
     // No current quality (initial mount) — use baseline thresholds for a stable first pick.
@@ -974,7 +996,7 @@
         video._twitchQuality = want;
         video._twitchQualityChangedAt = now;
         video._twitchGen = (video._twitchGen || 0) + 1;
-        console.log(`[twitchviewer] SOURCE ch=${login} gen=${video._twitchGen} q=${want}`);
+        console.log(`[twitchviewer] SOURCE ch=${login} gen=${video._twitchGen} q=${want} (quality refresh)`);
         try {
           if (video._pb) video._pb.noteSourceReload();
           video._hls.loadSource(twitchProxyPlaybackUrl(login, want));
@@ -3382,6 +3404,13 @@
         // so the decision is centralized and consistent with the observer.
         reconcilePlayback(cell, video, 'manifest-parsed');
       });
+      /* A playlist loaded successfully — the network is healthy again, so the
+         fatal-network-error restart budget resets. Without this, a long-lived
+         stream that hits occasional transient fatals would eventually exhaust
+         the budget and never recover. */
+      hls.on(Hls.Events.LEVEL_LOADED, () => {
+        video._netErrRecoveries = 0;
+      });
       // Log pause events for diagnostics — the user reports random pauses with no
       // console errors, so we need to see what state the video/hls is in when it pauses.
       if (twitchHls) {
@@ -3412,15 +3441,30 @@
          * reload the source with a fresh proxy URL instead of leaving the tile
          * dead on a paused thumbnail. Uses generation tracking so a quality change
          * that happened during the backoff doesn't cause a stale reload. */
+        video._endedRecoveryBudget = TwitchPlayback.createRateLimiter(
+          TWITCH_ENDED_MAX_RECOVERIES,
+          TWITCH_ENDED_RECOVERY_WINDOW_MS
+        );
         video.addEventListener('ended', () => {
           if (!twitchHls) return;
           const login = video._twitchLogin || '?';
           const gen = video._twitchGen || 0;
-          console.log(`[twitchviewer] ENDED ch=${login} gen=${gen} — scheduling source reload`);
+          if (!video._endedRecoveryBudget()) {
+            console.warn(
+              `[twitchviewer] ENDED ch=${login} gen=${gen} — recovery skipped: ` +
+                `budget exhausted (${TWITCH_ENDED_MAX_RECOVERIES}/${TWITCH_ENDED_RECOVERY_WINDOW_MS}ms)`
+            );
+            return;
+          }
+          console.log(
+            `[twitchviewer] ENDED ch=${login} gen=${gen} — recovery requested: playlist ended`
+          );
           setTimeout(() => {
             if (!video.isConnected) return;
             if ((video._twitchGen || 0) !== gen) return; // quality changed since
             if (!video._hls) return;
+            if (!video.paused || !video.ended) return; // recovered on its own
+            if (!isCellVisible(cell)) return; // offscreen — observer owns it
             const quality = video._twitchQuality || '360p30';
             video._twitchGen = (video._twitchGen || 0) + 1;
             console.log(`[twitchviewer] SOURCE ch=${login} gen=${video._twitchGen} q=${quality} (ended recovery)`);
@@ -3471,12 +3515,50 @@
              observer-visible path calls startLoad() again when the tile
              returns, so skipping it now loses nothing. */
           try {
-            if (video.isConnected && isCellVisible(cell)) hls.startLoad();
+            if (!video.isConnected || !isCellVisible(cell)) return;
+            /* Bounded: a persistently failing proxy (offline/flapping channel)
+               would otherwise restart a full retry cycle forever — a network-
+               level reconnect loop. The counter resets on any successful
+               playlist load (LEVEL_LOADED below). */
+            video._netErrRecoveries = (video._netErrRecoveries || 0) + 1;
+            if (video._netErrRecoveries > TWITCH_NET_ERROR_MAX_RECOVERIES) {
+              fail(
+                twitchHls
+                  ? 'Twitch HLS: playlist keeps failing — stream may be offline. It will retry when the channel list refreshes.'
+                  : 'Playlist keeps failing — the stream may be offline.'
+              );
+              return;
+            }
+            if (twitchHls) {
+              console.warn(
+                `[twitchviewer] RECOVERY ch=${video._twitchLogin || '?'} gen=${video._twitchGen || 0} ` +
+                  `restart ${video._netErrRecoveries}/${TWITCH_NET_ERROR_MAX_RECOVERIES} reason=network-fatal`
+              );
+            }
+            hls.startLoad();
           } catch { /* ignore */ }
           return;
         }
         if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
           try {
+            /* Bounded: a persistent decode/SourceBuffer failure would
+               otherwise detach+reattach forever — each reattach pauses and
+               replays the element (and can re-mute an unmuted tile), which
+               looks like a reload loop. */
+            video._mediaErrBudget =
+              video._mediaErrBudget ||
+              TwitchPlayback.createRateLimiter(
+                TWITCH_MEDIA_ERROR_MAX_RECOVERIES,
+                TWITCH_MEDIA_ERROR_RECOVERY_WINDOW_MS
+              );
+            if (!video._mediaErrBudget()) {
+              fail(
+                twitchHls
+                  ? 'Twitch HLS: media error persists after recovery attempts — the stream may be undecodable in this browser.'
+                  : 'Playback media error persists after recovery attempts.'
+              );
+              return;
+            }
             /* recoverMediaError detaches+reattaches the media element — the
                resulting pause is app-caused, not user intent. */
             if (video._pb) video._pb.noteSourceReload();

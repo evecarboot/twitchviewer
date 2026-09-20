@@ -42,6 +42,21 @@
   const PAUSE_RELOAD = 'reload';
   const PAUSE_ENDED = 'ended';
   const PAUSE_EXTERNAL = 'external';
+  /* Chromium's "Unmuting failed and the element was paused instead"
+     intervention: on builds/configurations where the unmute does not itself
+     satisfy autoplay policy, the browser pauses the element right after the
+     user's unmute gesture. That pause is not an intent to pause — the user
+     asked to keep watching, audibly — so it is classified separately and
+     replayed rather than latching userPaused. */
+  const PAUSE_UNMUTE = 'unmute';
+  /* Chromium calls pause() synchronously inside the mute/volume setter, so the
+     intervention 'pause' event is queued immediately after 'volumechange' —
+     measured ~3.6ms in Chrome 150. The window is a main-thread-jank buffer
+     (~80x headroom), not a semantic guess: even a heavily stalled event queue
+     stays far below it, while a deliberate second user action (a real pause
+     click) is slower than this. A rare false positive self-corrects — the
+     user's next pause click simply latches again. */
+  const UNMUTE_PAUSE_WINDOW_MS = 300;
 
   const PLAY_AUTO = 'auto';
   const PLAY_USER = 'user';
@@ -68,6 +83,7 @@
     const isVisible = (hooks && hooks.isVisible) || (() => true);
     const log = (hooks && hooks.log) || (() => {});
     const debug = (hooks && hooks.debug) || (() => {});
+    const now = (hooks && hooks.now) || (() => Date.now());
 
     const ctl = {
       media,
@@ -85,6 +101,9 @@
       reloadPausePending: false,
       /** Consecutive play() rejections — bounded retries, reset on success. */
       rejectedPlays: 0,
+      /** Timestamp of the last user-gesture unmute/audible-volume change —
+       *  lets classifyPause recognize Chromium's unmute-pause intervention. */
+      lastUserUnmuteAt: -Infinity,
       desiredPlaying,
       reconcile,
       onPause,
@@ -198,7 +217,15 @@
       if (ctl.autoPausePending > 0) return PAUSE_AUTO;
       if (ctl.reloadPausePending) return PAUSE_RELOAD;
       if (media.ended) return PAUSE_ENDED;
-      if (gesture) return PAUSE_USER;
+      if (gesture) {
+        /* A pause landing right after the user's unmute gesture while the
+           element is unmuted is Chromium's unmute-pause intervention — the
+           browser blocked audible autoplay and paused instead. The user's
+           intent was "keep watching, audible", so this is NOT a user pause. */
+        if (!media.muted && now() - ctl.lastUserUnmuteAt < UNMUTE_PAUSE_WINDOW_MS)
+          return PAUSE_UNMUTE;
+        return PAUSE_USER;
+      }
       return PAUSE_EXTERNAL;
     }
 
@@ -236,9 +263,13 @@
     }
 
     /** volumechange. Audio state is intentionally separate from playback
-     *  state — this only records explicit user audio intent. */
+     *  state — this only records explicit user audio intent. The timestamp of
+     *  a user unmute also arms the unmute-pause classifier (see classifyPause). */
     function onVolumeChange(gesture) {
-      if (gesture) ctl.userMuted = media.muted;
+      if (gesture) {
+        ctl.userMuted = media.muted;
+        if (!media.muted) ctl.lastUserUnmuteAt = now();
+      }
       debug(`volumechange muted=${media.muted} gesture=${!!gesture}`);
     }
 
@@ -630,8 +661,35 @@
     return d;
   }
 
+  /**
+   * Sliding-window budget for recovery actions (source reloads, network
+   * restarts). Every recovery path must pass through a limiter so that a
+   * persistent failure condition (a playlist that keeps ending, a proxy that
+   * keeps 503ing) degrades to "give up" instead of looping reloads forever.
+   * The window self-heals: after `windowMs` of quiet, the full budget is
+   * available again — transient storms are tolerated, infinite loops are not.
+   *
+   * @param {number} max — max allowed actions within the window
+   * @param {number} windowMs — sliding window length
+   * @param {() => number} [now] — clock (injectable for tests)
+   * @returns {() => boolean} — call before each recovery action; true = allowed
+   *   (and consumed), false = budget exhausted
+   */
+  function createRateLimiter(max, windowMs, now) {
+    const clock = typeof now === 'function' ? now : () => Date.now();
+    const times = [];
+    return function tryAcquire() {
+      const t = clock();
+      while (times.length && t - times[0] >= windowMs) times.shift();
+      if (times.length >= max) return false;
+      times.push(t);
+      return true;
+    };
+  }
+
   return {
     create,
+    createRateLimiter,
     isUserGesture,
     twitchEmbedUserUnmuted,
     twitchCellIsPlaying,
@@ -648,6 +706,7 @@
     PAUSE_RELOAD,
     PAUSE_ENDED,
     PAUSE_EXTERNAL,
+    PAUSE_UNMUTE,
     PLAY_AUTO,
     PLAY_USER,
     PLAY_EXTERNAL,

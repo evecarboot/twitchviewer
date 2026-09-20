@@ -833,8 +833,14 @@ function killAllTranscoders() {
 }
 
 process.on('exit', killAllTranscoders);
-process.on('SIGINT', killAllTranscoders);
-process.on('SIGTERM', killAllTranscoders);
+process.on('SIGINT', () => {
+  killAllTranscoders();
+  process.exit(130);
+});
+process.on('SIGTERM', () => {
+  killAllTranscoders();
+  process.exit(143);
+});
 
 /**
  * @param {string} hash
@@ -3050,6 +3056,7 @@ async function createTlsOptions() {
  * @param {{ source: 'custom' | 'selfsigned', label?: string } | undefined} [tlsInfo]
  */
 function printStartupTips(scheme, tlsInfo) {
+  console.log(`Twitch playback mode: ${currentTwitchPlayback()} (TWITCH_PLAYBACK env; default proxy)`);
   console.log(`Session database: ${sessionSqlitePath}`);
   console.log(
     `OAuth redirect URLs to register in Twitch (must match scheme ${scheme}://):`
