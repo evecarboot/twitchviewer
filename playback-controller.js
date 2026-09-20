@@ -678,18 +678,53 @@
   function createRateLimiter(max, windowMs, now) {
     const clock = typeof now === 'function' ? now : () => Date.now();
     const times = [];
-    return function tryAcquire() {
+    function tryAcquire() {
       const t = clock();
       while (times.length && t - times[0] >= windowMs) times.shift();
       if (times.length >= max) return false;
       times.push(t);
       return true;
+    }
+    /* Introspection for diagnostic snapshots — how much of the budget is
+       currently consumed within the window. */
+    tryAcquire.used = () => {
+      const t = clock();
+      while (times.length && t - times[0] >= windowMs) times.shift();
+      return times.length;
+    };
+    return tryAcquire;
+  }
+
+  /**
+   * Consecutive-failure budget: allowed while the failure streak is <= max;
+   * reset() clears the streak (call it on any success — e.g. a playlist that
+   * loaded). Unlike the sliding-window limiter this does not self-heal on
+   * time alone: N failures in a row means the condition is persistent, not
+   * transient, so we stop and surface an error instead of retrying forever.
+   *
+   * @param {number} max — max consecutive failures tolerated
+   * @returns {{ tryAcquire(): boolean, reset(): void, count: number }}
+   */
+  function createConsecutiveLimiter(max) {
+    let n = 0;
+    return {
+      tryAcquire() {
+        n += 1;
+        return n <= max;
+      },
+      reset() {
+        n = 0;
+      },
+      get count() {
+        return n;
+      },
     };
   }
 
   return {
     create,
     createRateLimiter,
+    createConsecutiveLimiter,
     isUserGesture,
     twitchEmbedUserUnmuted,
     twitchCellIsPlaying,

@@ -777,3 +777,48 @@ test('unmute-pause replay is bounded: rejected audible play re-mutes once, no lo
   ctl.onVolumeChange(false);
   assert.equal(ctl.userMuted, false, 'programmatic re-mute does not overwrite user audio intent');
 });
+
+/* --- createConsecutiveLimiter: fatal NETWORK_ERROR restart budget ---
+   Semantics: each failure consumes one slot; a success (LEVEL_LOADED) resets
+   the streak so occasional transient errors never accumulate into a false
+   "persistent failure". */
+
+test('createConsecutiveLimiter: allows max consecutive, then denies', () => {
+  const lim = TwitchPlayback.createConsecutiveLimiter(8);
+  for (let i = 0; i < 8; i++) assert.equal(lim.tryAcquire(), true);
+  assert.equal(lim.tryAcquire(), false, '9th consecutive failure is denied');
+  assert.equal(lim.count, 9, 'count reflects attempts');
+});
+
+test('createConsecutiveLimiter: success reset clears the streak (fatal,fatal,loaded,fatal → count 1)', () => {
+  const lim = TwitchPlayback.createConsecutiveLimiter(3);
+  lim.tryAcquire(); // fatal 1
+  lim.tryAcquire(); // fatal 2
+  lim.reset(); // LEVEL_LOADED — stream is healthy again
+  assert.equal(lim.count, 0);
+  lim.tryAcquire(); // fatal 3 — a NEW streak, not exhaustion
+  assert.equal(lim.tryAcquire(), true, 'second of the new streak allowed');
+  lim.tryAcquire();
+  assert.equal(lim.tryAcquire(), false, 'only now is the budget exhausted');
+});
+
+test('createConsecutiveLimiter: occasional fatals never falsely exhaust', () => {
+  const lim = TwitchPlayback.createConsecutiveLimiter(8);
+  // 50 fatal errors spread over a long stream, each followed by a successful
+  // playlist load — must never hit the limit.
+  for (let i = 0; i < 50; i++) {
+    assert.equal(lim.tryAcquire(), true);
+    lim.reset();
+  }
+});
+
+test('createRateLimiter: used() introspection reflects consumed budget', () => {
+  let t = 0;
+  const allow = TwitchPlayback.createRateLimiter(3, 1000, () => t);
+  assert.equal(allow.used(), 0);
+  allow();
+  allow();
+  assert.equal(allow.used(), 2, 'two slots consumed');
+  t = 1500;
+  assert.equal(allow.used(), 0, 'expired entries no longer count');
+});

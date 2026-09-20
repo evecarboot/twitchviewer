@@ -993,10 +993,12 @@
         if (video._twitchQualityChangedAt && (now - video._twitchQualityChangedAt) < TWITCH_QUALITY_COOLDOWN_MS) continue;
         const login = video._twitchLogin;
         if (!login) continue;
+        const prevGen = video._twitchGen || 0;
         video._twitchQuality = want;
         video._twitchQualityChangedAt = now;
-        video._twitchGen = (video._twitchGen || 0) + 1;
-        console.log(`[twitchviewer] SOURCE ch=${login} gen=${video._twitchGen} q=${want} (quality refresh)`);
+        video._twitchGen = prevGen + 1;
+        tvTrace(login, `SOURCE loadSource reason=quality-tier-change gen=${prevGen}→${video._twitchGen} q=${want}`);
+        console.log(`[twitchviewer] SOURCE ch=${login} gen=${prevGen}→${video._twitchGen} q=${want} reason=quality-tier-change`);
         try {
           if (video._pb) video._pb.noteSourceReload();
           video._hls.loadSource(twitchProxyPlaybackUrl(login, want));
@@ -3133,15 +3135,86 @@
     return r.bottom > 0 && r.top < window.innerHeight && r.right > 0 && r.left < window.innerWidth;
   }
 
-  /** Verbose per-event playback diagnostics: localStorage.playback_debug = '1'.
-   *  Off by default — media events are frequent and the trace is for debugging. */
+  /** Verbose per-event playback diagnostics. Enable via the URL
+   *  (?playback_debug=1 — easiest when reporting a bug) or persistently via
+   *  localStorage.playback_debug = '1'. Off by default — media events are
+   *  frequent and the trace is for debugging. */
   const PLAYBACK_DEBUG = (() => {
     try {
+      if (new URLSearchParams(location.search).get('playback_debug') === '1')
+        return true;
       return localStorage.getItem('playback_debug') === '1';
     } catch {
       return false;
     }
   })();
+
+  /* Ring buffer of significant per-tile lifecycle events (pauses with their
+     classification, play results, volume changes, source reloads, recoveries,
+     fatal HLS errors). Deliberately excludes per-segment/network chatter.
+     When playback debugging is on, the user can dump it from the console with
+     tvPlaybackHistory() — a bug report becomes "paste this" instead of
+     "describe what flickered". */
+  const TV_HISTORY_MAX = 200;
+  const tvHistory = [];
+  /** @param {string} ch @param {string} msg */
+  function tvTrace(ch, msg) {
+    const d = new Date();
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mm = String(d.getMinutes()).padStart(2, '0');
+    const ss = String(d.getSeconds()).padStart(2, '0');
+    const ms = String(d.getMilliseconds()).padStart(3, '0');
+    tvHistory.push(`${hh}:${mm}:${ss}.${ms} ${ch || '-'} ${msg}`);
+    if (tvHistory.length > TV_HISTORY_MAX) tvHistory.shift();
+  }
+
+  /** Compact per-tile playback state — the answer to "what did the player do
+      when I unmuted?". Call tvPlaybackSnapshot() in the console. */
+  function tvPlaybackSnapshot() {
+    const lines = [`Twitch Playback Snapshot  mode=${twitchPlayback}`];
+    document.querySelectorAll('.cell').forEach((cell) => {
+      const video = cell.querySelector('video.cell-video');
+      const login = cell.dataset.twitchLogin || video?._twitchLogin || '(non-twitch)';
+      if (!video) {
+        lines.push(`${login}: iframe/no-video`);
+        return;
+      }
+      const pb = video._pb;
+      const gen = video._twitchGen || 0;
+      const src = (video.currentSrc || '').split('/').pop().slice(0, 24);
+      lines.push(
+        `${login}\n` +
+          `  state=${video.paused ? (video.ended ? 'ended' : 'paused') : 'playing'} muted=${video.muted} volume=${video.volume.toFixed(2)}\n` +
+          `  currentTime=${video.currentTime.toFixed(1)} paused=${video.paused} ended=${video.ended}\n` +
+          `  readyState=${video.readyState} networkState=${video.networkState}\n` +
+          `  userPaused=${pb ? pb.userPaused : 'n/a'} desired=${pb ? (pb.desiredPlaying() ? 'playing' : 'paused') : 'n/a'} generation=${gen} src=…${src}\n` +
+          `  recovery ended=${video._endedRecoveryBudget ? video._endedRecoveryBudget.used() : 0}/${TWITCH_ENDED_MAX_RECOVERIES}` +
+          ` network=${video._netErrLimiter ? video._netErrLimiter.count : 0}/${TWITCH_NET_ERROR_MAX_RECOVERIES}` +
+          ` media=${video._mediaErrBudget ? video._mediaErrBudget.used() : 0}/${TWITCH_MEDIA_ERROR_MAX_RECOVERIES}`
+      );
+    });
+    return lines.join('\n');
+  }
+
+  if (typeof window !== 'undefined') {
+    window.tvPlaybackSnapshot = () => {
+      const s = tvPlaybackSnapshot();
+      console.log(s);
+      return s;
+    };
+    window.tvPlaybackHistory = () => {
+      const h = tvHistory.join('\n');
+      console.log(h || '(no events yet)');
+      return h;
+    };
+  }
+
+  if (PLAYBACK_DEBUG) {
+    console.log(
+      '[twitchviewer] playback_debug ON (?playback_debug=1 or localStorage.playback_debug=1). ' +
+        'Diagnostics: tvPlaybackSnapshot() = per-tile state, tvPlaybackHistory() = lifecycle event log.'
+    );
+  }
 
   /** Most recent keydown anywhere in the document — keyboard media control
    *  (space/k or hardware play/pause keys) doesn't move focus to the video. */
@@ -3249,6 +3322,7 @@
             `[twitchviewer] PLAYBACK ch=${video._twitchLogin || cell.dataset.twitchLogin || '?'} ${line}`
           ),
         debug: (line) => {
+          tvTrace(video._twitchLogin || cell.dataset.twitchLogin || '?', line);
           if (PLAYBACK_DEBUG) {
             console.log(
               `[twitchviewer] PB ch=${video._twitchLogin || cell.dataset.twitchLogin || '?'} ${line}`
@@ -3300,6 +3374,7 @@
     });
 
     const fail = (msg) => {
+      tvTrace(video._twitchLogin || cell.dataset.twitchLogin || '?', `FAIL ${msg}`);
       if (cell.querySelector('.cell-hls-error')) return;
       const errEl = document.createElement('div');
       errEl.className = 'cell-hls-error';
@@ -3393,6 +3468,12 @@
             })()
           : {}),
       });
+      /* Source-generation counter: increments only when this element's media
+         source is replaced (initial mount counts as generation 0). Mute,
+         unmute, volume, playlist polls, and level loads never touch it — so
+         a rising gen means a real source/player restart, not routine churn. */
+      video._twitchGen = 0;
+      tvTrace(video._twitchLogin || cell.dataset.twitchLogin || '?', `SOURCE mount gen=0 url=${String(playbackUrl).split('/').pop().slice(0, 40)}`);
       hls.loadSource(playbackUrl);
       hls.attachMedia(video);
       video._hls = hls;
@@ -3409,7 +3490,7 @@
          stream that hits occasional transient fatals would eventually exhaust
          the budget and never recover. */
       hls.on(Hls.Events.LEVEL_LOADED, () => {
-        video._netErrRecoveries = 0;
+        if (video._netErrLimiter) video._netErrLimiter.reset();
       });
       // Log pause events for diagnostics — the user reports random pauses with no
       // console errors, so we need to see what state the video/hls is in when it pauses.
@@ -3450,12 +3531,14 @@
           const login = video._twitchLogin || '?';
           const gen = video._twitchGen || 0;
           if (!video._endedRecoveryBudget()) {
+            tvTrace(login, `ENDED gen=${gen} recovery-skipped budget-exhausted`);
             console.warn(
               `[twitchviewer] ENDED ch=${login} gen=${gen} — recovery skipped: ` +
                 `budget exhausted (${TWITCH_ENDED_MAX_RECOVERIES}/${TWITCH_ENDED_RECOVERY_WINDOW_MS}ms)`
             );
             return;
           }
+          tvTrace(login, `ENDED gen=${gen} recovery-requested reason=playlist-ended`);
           console.log(
             `[twitchviewer] ENDED ch=${login} gen=${gen} — recovery requested: playlist ended`
           );
@@ -3466,8 +3549,10 @@
             if (!video.paused || !video.ended) return; // recovered on its own
             if (!isCellVisible(cell)) return; // offscreen — observer owns it
             const quality = video._twitchQuality || '360p30';
-            video._twitchGen = (video._twitchGen || 0) + 1;
-            console.log(`[twitchviewer] SOURCE ch=${login} gen=${video._twitchGen} q=${quality} (ended recovery)`);
+            const prevGen = video._twitchGen || 0;
+            video._twitchGen = prevGen + 1;
+            tvTrace(login, `SOURCE loadSource reason=ended-recovery gen=${prevGen}→${video._twitchGen} q=${quality}`);
+            console.log(`[twitchviewer] SOURCE ch=${login} gen=${prevGen}→${video._twitchGen} q=${quality} reason=ended-recovery`);
             try {
               if (video._pb) video._pb.noteSourceReload();
               video._hls.loadSource(twitchProxyPlaybackUrl(login, quality));
@@ -3481,6 +3566,10 @@
         // Log ALL errors (fatal and non-fatal) for Twitch streams so we can see what's
         // happening before the video pauses.
         if (twitchHls) {
+          tvTrace(
+            video._twitchLogin || '?',
+            `HLS-ERROR fatal=${data.fatal} type=${data.type} details=${data.details} gen=${video._twitchGen || 0}`
+          );
           console.log(
             `[twitchviewer] HLS ERROR ch=${video._twitchLogin || '?'} gen=${video._twitchGen || 0} ` +
             `fatal=${data.fatal} type=${data.type} details=${data.details}`
@@ -3520,8 +3609,14 @@
                would otherwise restart a full retry cycle forever — a network-
                level reconnect loop. The counter resets on any successful
                playlist load (LEVEL_LOADED below). */
-            video._netErrRecoveries = (video._netErrRecoveries || 0) + 1;
-            if (video._netErrRecoveries > TWITCH_NET_ERROR_MAX_RECOVERIES) {
+            video._netErrLimiter =
+              video._netErrLimiter ||
+              TwitchPlayback.createConsecutiveLimiter(TWITCH_NET_ERROR_MAX_RECOVERIES);
+            if (!video._netErrLimiter.tryAcquire()) {
+              tvTrace(
+                video._twitchLogin || '?',
+                `RECOVERY-STOP reason=network-fatal exhausted ${video._netErrLimiter.count}/${TWITCH_NET_ERROR_MAX_RECOVERIES}`
+              );
               fail(
                 twitchHls
                   ? 'Twitch HLS: playlist keeps failing — stream may be offline. It will retry when the channel list refreshes.'
@@ -3530,9 +3625,13 @@
               return;
             }
             if (twitchHls) {
+              tvTrace(
+                video._twitchLogin || '?',
+                `RECOVERY restart=${video._netErrLimiter.count}/${TWITCH_NET_ERROR_MAX_RECOVERIES} reason=network-fatal`
+              );
               console.warn(
                 `[twitchviewer] RECOVERY ch=${video._twitchLogin || '?'} gen=${video._twitchGen || 0} ` +
-                  `restart ${video._netErrRecoveries}/${TWITCH_NET_ERROR_MAX_RECOVERIES} reason=network-fatal`
+                  `restart ${video._netErrLimiter.count}/${TWITCH_NET_ERROR_MAX_RECOVERIES} reason=network-fatal`
               );
             }
             hls.startLoad();
@@ -3552,6 +3651,10 @@
                 TWITCH_MEDIA_ERROR_RECOVERY_WINDOW_MS
               );
             if (!video._mediaErrBudget()) {
+              tvTrace(
+                video._twitchLogin || '?',
+                `RECOVERY-STOP reason=media-fatal exhausted ${TWITCH_MEDIA_ERROR_MAX_RECOVERIES}/${TWITCH_MEDIA_ERROR_RECOVERY_WINDOW_MS}ms`
+              );
               fail(
                 twitchHls
                   ? 'Twitch HLS: media error persists after recovery attempts — the stream may be undecodable in this browser.'
@@ -3559,6 +3662,10 @@
               );
               return;
             }
+            tvTrace(
+              video._twitchLogin || '?',
+              `RECOVERY recoverMediaError used=${video._mediaErrBudget.used()}/${TWITCH_MEDIA_ERROR_MAX_RECOVERIES} reason=media-fatal`
+            );
             /* recoverMediaError detaches+reattaches the media element — the
                resulting pause is app-caused, not user intent. */
             if (video._pb) video._pb.noteSourceReload();

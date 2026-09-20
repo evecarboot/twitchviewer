@@ -20,6 +20,12 @@ echo The browser will open automatically in a few seconds.
 echo Close this window to stop the server.
 start "" "https://127.0.0.1:3000/"
 node server.js
+if errorlevel 1 (
+  echo.
+  echo The viewer stopped unexpectedly. The error above explains why.
+  echo If it says the port is already in use, another copy may still be running.
+  pause
+)
 
 :EnsureNode
 where node >nul 2>nul

@@ -3056,6 +3056,7 @@ async function createTlsOptions() {
  * @param {{ source: 'custom' | 'selfsigned', label?: string } | undefined} [tlsInfo]
  */
 function printStartupTips(scheme, tlsInfo) {
+  console.log(`PID: ${process.pid}   Port: ${port}`);
   console.log(`Twitch playback mode: ${currentTwitchPlayback()} (TWITCH_PLAYBACK env; default proxy)`);
   console.log(`Session database: ${sessionSqlitePath}`);
   console.log(
@@ -3105,9 +3106,28 @@ function printStartupTips(scheme, tlsInfo) {
   );
 }
 
+/* A swallowed stack trace here is how stale "invisible" instances caused real
+   confusion — say plainly what happened and exit nonzero so launchers can tell
+   startup failed. Never kill the port's owner automatically: it might not be
+   a TwitchViewer at all. */
+function onServerListenError(err) {
+  if (err && err.code === 'EADDRINUSE') {
+    console.error(
+      `\nTwitchViewer could not start.\n\nPort ${port} is already in use.\n\n` +
+        'Another TwitchViewer instance may already be running.\n' +
+        'Check the existing window/process before starting another copy.\n'
+    );
+    process.exit(1);
+  }
+  console.error(err);
+  process.exit(1);
+}
+
 async function startServer() {
   if (useHttpOnly()) {
-    http.createServer(app).listen(port, () => {
+    const server = http.createServer(app);
+    server.on('error', onServerListenError);
+    server.listen(port, () => {
       console.log(`Twitch viewer (HTTP): http://localhost:${port}`);
       printStartupTips('http');
     });
@@ -3115,12 +3135,12 @@ async function startServer() {
   }
 
   const tls = await createTlsOptions();
-  https
-    .createServer({ key: tls.key, cert: tls.cert }, app)
-    .listen(port, () => {
-      console.log(`Twitch viewer (HTTPS): https://localhost:${port}`);
-      printStartupTips('https', tls);
-    });
+  const server = https.createServer({ key: tls.key, cert: tls.cert }, app);
+  server.on('error', onServerListenError);
+  server.listen(port, () => {
+    console.log(`Twitch viewer (HTTPS): https://localhost:${port}`);
+    printStartupTips('https', tls);
+  });
 }
 
 startServer().catch((err) => {
