@@ -3157,15 +3157,49 @@
      "describe what flickered". */
   const TV_HISTORY_MAX = 200;
   const tvHistory = [];
-  /** @param {string} ch @param {string} msg */
-  function tvTrace(ch, msg) {
+  /* Observation-only anomaly detection: counts the event patterns that define
+     a "refresh loop" (repeated source loads or recovery requests for the same
+     tile) inside a 10 s sliding window and inserts an ANOMALY entry when a
+     threshold is crossed. Runs inside tvTrace — event-driven, no timers, and
+     has zero influence on playback decisions. */
+  const TV_ANOMALY_WINDOW_MS = 10000;
+  const TV_ANOMALY_THRESHOLD = 3;
+  const tvAnomalySeen = new Map(); /* `${kind}|${ch}` -> number[] (ms timestamps) */
+  const tvAnomalyFiredAt = new Map(); /* same key -> last ANOMALY time */
+  function tvNoteAnomaly(ch, msg) {
+    const kind = msg.startsWith('SOURCE ')
+      ? 'repeated-source-change'
+      : msg.includes('recovery-requested')
+        ? 'repeated-recovery'
+        : null;
+    if (!kind) return;
+    const key = `${kind}|${ch || '-'}`;
+    const nowMs = Date.now();
+    const seen = (tvAnomalySeen.get(key) || []).filter((t) => nowMs - t < TV_ANOMALY_WINDOW_MS);
+    seen.push(nowMs);
+    tvAnomalySeen.set(key, seen);
+    if (seen.length >= TV_ANOMALY_THRESHOLD) {
+      const last = tvAnomalyFiredAt.get(key) || -Infinity;
+      if (nowMs - last >= TV_ANOMALY_WINDOW_MS) {
+        tvAnomalyFiredAt.set(key, nowMs);
+        tvHistory.push(`${tvStamp()} ${ch || '-'} ANOMALY ${kind} count=${seen.length} window=${TV_ANOMALY_WINDOW_MS}ms`);
+        if (tvHistory.length > TV_HISTORY_MAX) tvHistory.shift();
+      }
+    }
+  }
+  function tvStamp() {
     const d = new Date();
     const hh = String(d.getHours()).padStart(2, '0');
     const mm = String(d.getMinutes()).padStart(2, '0');
     const ss = String(d.getSeconds()).padStart(2, '0');
     const ms = String(d.getMilliseconds()).padStart(3, '0');
-    tvHistory.push(`${hh}:${mm}:${ss}.${ms} ${ch || '-'} ${msg}`);
+    return `${hh}:${mm}:${ss}.${ms}`;
+  }
+  /** @param {string} ch @param {string} msg */
+  function tvTrace(ch, msg) {
+    tvHistory.push(`${tvStamp()} ${ch || '-'} ${msg}`);
     if (tvHistory.length > TV_HISTORY_MAX) tvHistory.shift();
+    tvNoteAnomaly(ch, msg);
   }
 
   /** Compact per-tile playback state — the answer to "what did the player do
@@ -3209,11 +3243,223 @@
     };
   }
 
+  /* ---- Diagnostic export -------------------------------------------------
+     One-click bug report for the "unmute → refresh loop" class of problems.
+     The user reproduces the issue, clicks "Mark Playback Problem", then
+     "Export Playback Diagnostics" — no DevTools required. The exported JSON
+     is assembled by playback-diagnostics.js, which sanitizes every string
+     (URLs lose query strings, bearer/secret material is redacted) so Twitch
+     tokens/signatures can never leak into the file. */
+
+  /** Set by tvMarkPlaybackProblem() — lands in the next export verbatim. */
+  let tvMarkedProblem = null;
+
+  /** Insert an unmistakable marker into the ring buffer so the events that
+      matter are the ones immediately before it. Captures a compact snapshot
+      of every tile at mark time. Diagnostic only — never touches playback. */
+  function tvMarkPlaybackProblem() {
+    const mark = {
+      at: new Date().toISOString(),
+      note: 'user marked playback problem',
+      snapshot: tvPlaybackSnapshot(),
+    };
+    tvMarkedProblem = mark;
+    tvTrace('-', '========== USER MARKED PLAYBACK PROBLEM HERE ==========');
+    tvTrace('-', `mark at=${mark.at} tiles=${document.querySelectorAll('.cell').length}`);
+    return mark;
+  }
+
+  /** Structured per-tile data for the export (same underlying state as
+      tvPlaybackSnapshot, but fielded instead of formatted). */
+  function tvCollectTiles() {
+    const tiles = [];
+    document.querySelectorAll('.cell').forEach((cell) => {
+      const video = cell.querySelector('video.cell-video');
+      const login = cell.dataset.twitchLogin || video?._twitchLogin || '(non-twitch)';
+      if (!video) {
+        tiles.push({ channel: login, playerKind: 'iframe' });
+        return;
+      }
+      const pb = video._pb;
+      tiles.push({
+        channel: login,
+        playerKind: 'video',
+        generation: video._twitchGen || 0,
+        currentSrc: video.currentSrc || '',
+        state: video.paused ? (video.ended ? 'ended' : 'paused') : 'playing',
+        muted: video.muted,
+        volume: video.volume,
+        currentTime: video.currentTime,
+        paused: video.paused,
+        ended: video.ended,
+        readyState: video.readyState,
+        networkState: video.networkState,
+        userPaused: pb ? pb.userPaused : null,
+        desiredPlaying: pb ? pb.desiredPlaying() : null,
+        recovery: {
+          ended: video._endedRecoveryBudget ? video._endedRecoveryBudget.used() : null,
+          network: video._netErrLimiter ? video._netErrLimiter.count : null,
+          media: video._mediaErrBudget ? video._mediaErrBudget.used() : null,
+        },
+      });
+    });
+    return tiles;
+  }
+
+  /** Assemble the full diagnostic payload. Fetches /api/status so the export
+      proves which backend process/mode this browser was actually talking to
+      (a stale server was a real source of confusion during debugging). */
+  async function tvCollectDiagnostics() {
+    let server = null;
+    try {
+      const r = await fetch('/api/status', { cache: 'no-store' });
+      if (r.ok) server = await r.json();
+    } catch {
+      /* export still works offline-ish — server section stays null */
+    }
+    const ua = navigator.userActivation;
+    return TwitchDiagnostics.buildDiagnosticExport({
+      markedProblem: tvMarkedProblem,
+      application: {
+        twitchPlayback,
+        autoplay: state.autoplay,
+        hideOffline: state.hideOffline,
+        priorityTiles: state.priorityTiles,
+        sortByViews: state.sortByViews,
+        tileCount: document.querySelectorAll('.cell').length,
+        playbackDebugEnabled: PLAYBACK_DEBUG,
+      },
+      browser: {
+        userAgent: navigator.userAgent,
+        platform: navigator.platform,
+        language: navigator.language,
+      },
+      server,
+      page: {
+        origin: location.origin,
+        path: location.pathname,
+        visibilityState: document.visibilityState,
+        viewport: `${window.innerWidth}x${window.innerHeight}`,
+        userActivation: ua
+          ? { isActive: ua.isActive, hasBeenActive: ua.hasBeenActive }
+          : null,
+      },
+      tiles: tvCollectTiles(),
+      history: tvHistory.slice(),
+    });
+  }
+
+  function tvDiagnosticsFilename() {
+    const d = new Date();
+    const p = (n) => String(n).padStart(2, '0');
+    return (
+      `twitchviewer-playback-diagnostics-${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}` +
+      `-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}.json`
+    );
+  }
+
+  /** Download the diagnostic JSON via a temporary object URL (standard
+      Blob/<a download> — works in Chrome and Edge, no dependencies). */
+  async function tvExportDiagnostics() {
+    const data = await tvCollectDiagnostics();
+    const blob = new Blob([JSON.stringify(data, null, 2)], {
+      type: 'application/json',
+    });
+    const url = URL.createObjectURL(blob);
+    try {
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = tvDiagnosticsFilename();
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } finally {
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+    }
+    return data;
+  }
+
+  /** Clipboard fallback for environments where downloads are blocked. */
+  async function tvCopyDiagnostics() {
+    const data = await tvCollectDiagnostics();
+    const text = JSON.stringify(data, null, 2);
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+    throw new Error('Clipboard API unavailable in this browser/context');
+  }
+
+  /* Console access stays — the export and these helpers read the same
+     underlying buffers, so the file and the console can never disagree. */
+  if (typeof window !== 'undefined') {
+    window.tvMarkPlaybackProblem = tvMarkPlaybackProblem;
+    window.tvExportDiagnostics = tvExportDiagnostics;
+    window.tvCopyDiagnostics = tvCopyDiagnostics;
+  }
+
+  /* Small debug-only chip (bottom-left corner). Exists only while
+     playback_debug is on; normal viewing is completely unchanged. */
+  function tvMountDebugChip() {
+    if (document.getElementById('tv-playback-debug-chip')) return;
+    const chip = document.createElement('div');
+    chip.id = 'tv-playback-debug-chip';
+    const label = document.createElement('span');
+    label.textContent = 'playback debug';
+    const markBtn = document.createElement('button');
+    markBtn.type = 'button';
+    markBtn.textContent = 'Mark Playback Problem';
+    const exportBtn = document.createElement('button');
+    exportBtn.type = 'button';
+    exportBtn.textContent = 'Export Playback Diagnostics';
+    const copyBtn = document.createElement('button');
+    copyBtn.type = 'button';
+    copyBtn.textContent = 'Copy';
+    const status = document.createElement('span');
+    status.className = 'tv-debug-status';
+    const setStatus = (msg) => {
+      status.textContent = msg;
+      setTimeout(() => {
+        if (status.textContent === msg) status.textContent = '';
+      }, 4000);
+    };
+    markBtn.addEventListener('click', () => {
+      tvMarkPlaybackProblem();
+      setStatus('problem marked');
+    });
+    exportBtn.addEventListener('click', () => {
+      exportBtn.disabled = true;
+      tvExportDiagnostics()
+        .then(() => setStatus('exported'))
+        .catch((e) => setStatus(`export failed: ${e && e.message}`))
+        .finally(() => {
+          exportBtn.disabled = false;
+        });
+    });
+    copyBtn.addEventListener('click', () => {
+      copyBtn.disabled = true;
+      tvCopyDiagnostics()
+        .then(() => setStatus('copied'))
+        .catch((e) => setStatus(`copy failed: ${e && e.message}`))
+        .finally(() => {
+          copyBtn.disabled = false;
+        });
+    });
+    chip.append(label, markBtn, exportBtn, copyBtn, status);
+    document.body.appendChild(chip);
+  }
+
   if (PLAYBACK_DEBUG) {
     console.log(
       '[twitchviewer] playback_debug ON (?playback_debug=1 or localStorage.playback_debug=1). ' +
-        'Diagnostics: tvPlaybackSnapshot() = per-tile state, tvPlaybackHistory() = lifecycle event log.'
+        'Diagnostics: tvPlaybackSnapshot() = per-tile state, tvPlaybackHistory() = lifecycle event log, ' +
+        'tvExportDiagnostics() = one-file export.'
     );
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', tvMountDebugChip, { once: true });
+    } else {
+      tvMountDebugChip();
+    }
   }
 
   /** Most recent keydown anywhere in the document — keyboard media control
@@ -3336,7 +3582,15 @@
     /* Classify every pause/play by provenance so that browser autoplay-policy
        pauses (e.g. Chromium pausing an unmuted-muted-autoplay element), buffer
        underrun pauses, and app-issued pauses are never mistaken for user intent. */
-    video.addEventListener('pause', () => {
+    video.addEventListener('pause', (ev) => {
+      /* Raw-event provenance for the diagnostic export — distinguishes a real
+         user click (isTrusted + userActivation) from programmatic/browser
+         state changes. Observation only; classification stays in pb.onPause. */
+      const ua = navigator.userActivation;
+      tvTrace(
+        video._twitchLogin || cell.dataset.twitchLogin || '?',
+        `event=pause trusted=${ev.isTrusted} ua=${ua ? `${ua.isActive}/${ua.hasBeenActive}` : 'n/a'}`
+      );
       const kind = pb.onPause(playbackUserGesture(video));
       if (PLAYBACK_DEBUG) {
         console.log(
@@ -3356,7 +3610,13 @@
     });
     /* Audio intent: a user-gesture mute/unmute is recorded as an audio choice;
        it never feeds back into the play/pause decision. */
-    video.addEventListener('volumechange', () => {
+    video.addEventListener('volumechange', (ev) => {
+      const ua = navigator.userActivation;
+      tvTrace(
+        video._twitchLogin || cell.dataset.twitchLogin || '?',
+        `event=volumechange muted=${video.muted} trusted=${ev.isTrusted} ` +
+          `ua=${ua ? `${ua.isActive}/${ua.hasBeenActive}` : 'n/a'}`
+      );
       pb.onVolumeChange(playbackUserGesture(video));
     });
     video.addEventListener('ended', () => {

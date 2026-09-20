@@ -264,6 +264,23 @@ function twitchFilterAds() {
   return v !== 'false' && v !== '0' && v !== 'off';
 }
 
+/* Resolved once at startup — diagnostic exports need to know exactly which
+   build produced a bug report. 'unknown' when not running from a git checkout
+   or when git is unavailable; never fatal. */
+const buildCommit = (() => {
+  try {
+    const { execSync } = require('child_process');
+    const out = execSync('git rev-parse --short HEAD', {
+      cwd: __dirname,
+      timeout: 3000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    return String(out).trim() || 'unknown';
+  } catch {
+    return 'unknown';
+  }
+})();
+
 app.get('/api/status', (req, res) => {
   const configured = Boolean(
     process.env.TWITCH_CLIENT_ID && process.env.TWITCH_CLIENT_SECRET
@@ -274,6 +291,11 @@ app.get('/api/status', (req, res) => {
     twitchPlayback: currentTwitchPlayback(),
     twitchHlsAvailable: sl,
     twitchFilterAds: twitchFilterAds(),
+    /* Safe server identity for diagnostics — lets a bug report prove which
+       process/mode the browser was actually talking to. */
+    pid: process.pid,
+    port,
+    buildCommit,
   });
 });
 
@@ -2939,6 +2961,10 @@ app.get('/app.js', (_req, res) => {
 app.get('/playback-controller.js', (_req, res) => {
   res.type('application/javascript');
   res.sendFile(path.join(root, 'playback-controller.js'));
+});
+app.get('/playback-diagnostics.js', (_req, res) => {
+  res.type('application/javascript');
+  res.sendFile(path.join(root, 'playback-diagnostics.js'));
 });
 app.get('/hls.min.js', (_req, res) => {
   res.type('application/javascript');

@@ -71,3 +71,34 @@ test('startup log identifies PID, port, and playback mode', async () => {
     a.child.kill('SIGKILL');
   }
 });
+
+/* Diagnostic exports prove which backend the browser was talking to — the
+   /api/status payload must carry safe server identity (pid, port, build,
+   actual playback mode) without ever leaking env vars or paths. */
+test('/api/status exposes safe server identity for diagnostics', async () => {
+  const port = TEST_PORT + 2;
+  const child = spawn(process.execPath, ['server.js'], {
+    cwd: ROOT,
+    env: { ...process.env, PORT: String(port), USE_HTTP: 'true', TWITCH_PLAYBACK: 'proxy' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let out = '';
+  child.stdout.on('data', (d) => (out += d));
+  child.stderr.on('data', (d) => (out += d));
+  try {
+    await waitFor((o) => o.includes('Twitch viewer ('), () => out);
+    const res = await fetch(`http://127.0.0.1:${port}/api/status`);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.twitchPlayback, 'proxy', 'must report the actual mode');
+    assert.equal(body.pid, child.pid, 'pid must match the spawned process');
+    assert.equal(body.port, port, 'port must match the listening port');
+    assert.equal(typeof body.buildCommit, 'string');
+    assert.ok(body.buildCommit.length > 0, 'buildCommit resolves or reports unknown');
+    const text = JSON.stringify(body);
+    assert.doesNotMatch(text, /TWITCH_CLIENT_SECRET|SECRET|PASSWORD/i, 'no secret material');
+    assert.doesNotMatch(text, /[A-Z]:\\\\|\/Users\//i, 'no filesystem paths');
+  } finally {
+    child.kill('SIGKILL');
+  }
+});
